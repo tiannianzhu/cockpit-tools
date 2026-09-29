@@ -72,7 +72,6 @@ pub mod codex_session_visibility;
 pub(crate) mod codex_history_projection_repair;
 pub mod codex_speed;
 pub(crate) mod codex_native_speed_catalog;
-pub mod codex_ssh;
 pub mod codex_thread_sync;
 pub mod codex_wakeup;
 pub mod codex_wakeup_scheduler;

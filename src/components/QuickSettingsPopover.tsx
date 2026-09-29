@@ -2106,7 +2106,7 @@ export function QuickSettingsPopover({ type }: QuickSettingsPopoverProps) {
                     )}
                   </>
                 )}
-                <CodexSshSyncSettingsControl variant="quick" />
+                <CodexSshSyncSettingsControl variant="quick" onNavigate={() => setIsOpen(false)} />
                 <CodexContextManagementControl variant="quick" active={isOpen && type === 'codex'} />
                 <div className="qs-row" style={{ marginTop: 8 }}>
                   <div className="qs-row-label">
