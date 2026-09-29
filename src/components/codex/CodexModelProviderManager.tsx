@@ -89,12 +89,13 @@ import {
   CODEX_API_KEY_USAGE_REFRESHED_EVENT,
   readCodexApiKeyUsageCache,
 } from "../../services/codexApiKeyUsageRefreshService";
-import { formatModelProviderUsageMoney } from "../../services/modelProviderUsageService";
+import { listModelProviderModels, formatModelProviderUsageMoney } from "../../services/modelProviderUsageService";
 import { useSponsorStore } from "../../stores/useSponsorStore";
 import { useCodexAccountStore } from "../../stores/useCodexAccountStore";
 import type { Sponsor } from "../../types/sponsor";
 import {
   CODEX_API_PROVIDER_CUSTOM_ID,
+  DEEPSEEK_API_PROVIDER_ID,
   findCodexApiProviderPresetById,
   resolveCodexApiProviderPresetId,
 } from "../../utils/codexProviderPresets";
@@ -131,8 +132,18 @@ import {
 } from "../../utils/codexModelProviderAccountName";
 import { resolveCodexModelProviderForApiKey } from "../../utils/codexModelProviderKeyConfig";
 import { buildCodexModelProviderAccountSnapshot, findCodexAccountsReferencingModelProvider } from "../../utils/codexModelProviderAccountSync";
-import { buildProviderModelVisionCapabilities } from "../../utils/codexModelProviderVision";
 import { isImageGenerationModelId, selectProviderBatchTestModelId } from "../../utils/codexTestModel";
+import {
+  buildProviderModelVisionCapabilities,
+  resolveProviderModelVisionState,
+} from "../../utils/codexModelProviderVision";
+import {
+  deriveCodexProviderCatalogFields,
+  buildCodexProviderCatalogDefinition,
+  patchCodexProviderModel,
+  buildUpstreamModelDefinitions,
+  type CodexProviderCatalogDefinition,
+} from "../../utils/codexProviderCatalogDefinition";
 import { CodexModelProviderManagerView } from "./CodexModelProviderManagerView";
 
 
@@ -384,6 +395,7 @@ interface ProviderFormState {
   name: string;
   baseUrl: string;
   modelCatalogText: string;
+  modelCatalogDefinition?: CodexProviderCatalogDefinition;
   modelContextWindowsDraft: Record<string, string>;
   supportsVision: boolean;
   visionModelText: string;
@@ -577,6 +589,8 @@ export function useCodexModelProviderManagerController({
   const [showModal, setShowModal] = useState(false);
   const [showQuickConfigModal, setShowQuickConfigModal] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [fetchingProviderModels, setFetchingProviderModels] = useState(false);
+  const modelFetchGeneration = useRef(0);
   const [enablingProviderId, setEnablingProviderId] = useState<string | null>(
     null,
   );
@@ -1637,6 +1651,7 @@ export function useCodexModelProviderManagerController({
       name: provider.name,
       baseUrl: provider.baseUrl,
       modelCatalogText: (provider.modelCatalog ?? []).join("\n"),
+      modelCatalogDefinition: provider.modelCatalogDefinition,
       modelContextWindowsDraft: contextWindowDraftsFromRecord(
         provider.modelContextWindows,
         provider.modelCatalog ?? [],
@@ -1667,6 +1682,8 @@ export function useCodexModelProviderManagerController({
 
   const closeModal = useCallback(() => {
     if (saving) return;
+    modelFetchGeneration.current += 1;
+    setFetchingProviderModels(false);
     setEditingApiKey(null);
     setShowModal(false);
     setFormError(null);
@@ -1677,6 +1694,12 @@ export function useCodexModelProviderManagerController({
   const mutateForm = useCallback((patch: Partial<ProviderFormState>) => {
     setFormError(null);
     setForm((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const patchModelDefinition = useCallback((model: string, patch: Record<string, unknown>) => {
+    setForm((previous) => ({ ...previous,
+      modelCatalogDefinition: patchCodexProviderModel(previous.modelCatalogDefinition, model, patch),
+    }));
   }, []);
 
   useEffect(() => {
@@ -1699,6 +1722,7 @@ export function useCodexModelProviderManagerController({
         name: preset.name,
         baseUrl: preset.baseUrls[0] ?? "",
         modelCatalogText: (preset.modelCatalog ?? []).join("\n"),
+        modelCatalogDefinition: undefined,
         modelContextWindowsDraft: contextWindowDraftsFromRecord(
           undefined,
           preset.modelCatalog ?? [],
@@ -1738,6 +1762,7 @@ export function useCodexModelProviderManagerController({
         name: template.name,
         baseUrl: template.baseUrl,
         modelCatalogText: template.modelCatalog.join("\n"),
+        modelCatalogDefinition: undefined,
         modelContextWindowsDraft: contextWindowDraftsFromRecord(
           undefined,
           template.modelCatalog,
@@ -1795,6 +1820,36 @@ export function useCodexModelProviderManagerController({
     },
     [t],
   );
+
+  const providerModelsApiKey = form.newApiKey.trim() || currentEditingProvider?.apiKeys[0]?.apiKey || '';
+  const fetchProviderModels = useCallback(async () => {
+    if (fetchingProviderModels || !providerModelsApiKey || !form.baseUrl.trim()) return;
+    const generation = ++modelFetchGeneration.current;
+    setFetchingProviderModels(true);
+    setFormError(null);
+    try {
+      const result = await listModelProviderModels({ baseUrl: form.baseUrl.trim(), apiKey: providerModelsApiKey });
+      if (modelFetchGeneration.current !== generation) return;
+      // Fetch replaces all model metadata, including fields absent upstream.
+      // Validate outside the state updater so failures reach this request's catch.
+      const definition = buildUpstreamModelDefinitions(result.models);
+      const fields = deriveCodexProviderCatalogFields(definition);
+      const visionStates = Object.fromEntries(Object.entries(fields.modelCapabilities)
+        .map(([slug, value]) => [slug, value.supportsVision]));
+      setForm((previous) => {
+        if (previous.baseUrl.trim() !== form.baseUrl.trim()) return previous;
+        return { ...previous, modelCatalogText: fields.modelCatalog.join('\n'), modelCatalogDefinition: definition,
+          modelContextWindowsDraft: contextWindowDraftsFromRecord(fields.modelContextWindows, fields.modelCatalog),
+          visionModelStates: visionStates,
+          visionModelText: Object.entries(visionStates).filter(([, enabled]) => enabled).map(([slug]) => slug).join('\n'),
+        };
+      });
+    } catch (error) {
+      if (modelFetchGeneration.current === generation) setFormError(parseServiceError(error));
+    } finally {
+      if (modelFetchGeneration.current === generation) setFetchingProviderModels(false);
+    }
+  }, [fetchingProviderModels, providerModelsApiKey, form.baseUrl, parseServiceError, t]);
 
   const formatProviderTestFailure = useCallback(
     (failure: CodexLocalAccessTestFailure): string => {
@@ -2218,6 +2273,39 @@ export function useCodexModelProviderManagerController({
       form.visionModelText,
       form.visionModelStates,
     );
+    let modelCatalogDefinition: CodexProviderCatalogDefinition | null = null;
+    if (
+      form.modelCatalogDefinition ||
+      (form.wireApi === "responses" &&
+        selectedPresetId !== "openai_official" &&
+        selectedPresetId !== DEEPSEEK_API_PROVIDER_ID)
+    ) {
+      try {
+        // The catalog drives Codex's image UI, so resolve provider defaults there
+        // while keeping modelCapabilities limited to explicit provider overrides.
+        const catalogCapabilities = Object.fromEntries(
+          modelCatalog.map((model) => [
+            model.toLowerCase(),
+            {
+              supportsVision: resolveProviderModelVisionState(
+                model,
+                form.visionModelStates,
+                form.supportsVision,
+              ),
+            },
+          ]),
+        );
+        modelCatalogDefinition = buildCodexProviderCatalogDefinition(
+          modelCatalog,
+          parsedWindows.windows,
+          catalogCapabilities,
+          form.modelCatalogDefinition,
+        ) ?? null;
+      } catch (error) {
+        setFormError(error instanceof Error ? error.message : String(error));
+        return;
+      }
+    }
     const visionRoutingModel = form.visionRoutingModel.trim();
     const isCreate = !form.providerId;
     const existingKeyCount = currentEditingProvider?.apiKeys.length ?? 0;
@@ -2269,6 +2357,7 @@ export function useCodexModelProviderManagerController({
           baseUrl,
           sourceTag: selectedSponsorTemplate?.id,
           modelCatalog,
+          modelCatalogDefinition: modelCatalogDefinition ?? undefined,
           modelContextWindows: parsedWindows.windows,
           supportsVision: form.supportsVision,
           modelCapabilities,
@@ -2288,6 +2377,7 @@ export function useCodexModelProviderManagerController({
           baseUrl,
           sourceTag: selectedSponsorTemplate?.id ?? null,
           modelCatalog,
+          modelCatalogDefinition,
           modelContextWindows: parsedWindows.windows,
           supportsVision: form.supportsVision,
           modelCapabilities,
@@ -2388,6 +2478,7 @@ export function useCodexModelProviderManagerController({
     reloadProviders,
     saving,
     selectedSponsorTemplate?.id,
+    selectedPresetId,
     t,
   ]);
 
@@ -3596,6 +3687,10 @@ export function useCodexModelProviderManagerController({
     handleRenameApiKey,
     handleSaveApiKeyEdit,
     handleSaveProvider,
+    patchModelDefinition,
+    fetchProviderModels,
+    fetchingProviderModels,
+    canFetchProviderModels: Boolean(providerModelsApiKey && form.baseUrl.trim()),
     handleSelectPresetEndpoint,
     handleSelectProviderPreset,
     handleSelectSponsorTemplate,

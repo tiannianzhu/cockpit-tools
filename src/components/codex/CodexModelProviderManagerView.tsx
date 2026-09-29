@@ -6,12 +6,14 @@ import { SingleSelectDropdown } from "../SingleSelectDropdown";
 import { AccountTagFilterDropdown } from "../AccountTagFilterDropdown";
 import { PaginationControls } from "../PaginationControls";
 import { CodexModelContextWindowTable } from "./CodexModelContextWindowTable";
+import { CodexProviderModelsEditor } from "./CodexProviderModelsEditor";
 import { resolveNewApiQuotaSnapshot } from "../../services/modelProviderUsageService";
 import { CODEX_API_PROVIDER_CUSTOM_ID, CODEX_API_PROVIDER_PRESETS, DEEPSEEK_API_PROVIDER_ID, resolveCodexApiProviderPresetId } from "../../utils/codexProviderPresets";
 import { resolveCodexModelProviderForApiKey } from "../../utils/codexModelProviderKeyConfig";
 import { normalizeApiKeyFunOfficialUrl } from "../../utils/apikeyFunLinks";
 import { getCodexSubscriptionPresentation } from "../../types/codex";
 import { canConfigureCodexProviderVision, resolveCodexProviderCapabilityProfile } from "../../utils/codexProviderGateway";
+import { resolveProviderModelVisionState } from "../../utils/codexModelProviderVision";
 import { CodexQuickConfigCard } from "./CodexQuickConfigCard";
 import {
   CodexServicePanelModal,
@@ -82,6 +84,10 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
     handleRenameApiKey,
     handleSaveApiKeyEdit,
     handleSaveProvider,
+    patchModelDefinition,
+    fetchProviderModels,
+    fetchingProviderModels,
+    canFetchProviderModels,
     handleSelectPresetEndpoint,
     handleSelectProviderPreset,
     handleSelectSponsorTemplate,
@@ -1879,7 +1885,28 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
                   </label>
                 </div>
               )}
-              {(canConfigureCodexProviderVision({ presetId: selectedPresetId, wireApi: form.wireApi }) ||
+              {form.wireApi === "responses" && selectedPresetId !== "openai_official" && selectedPresetId !== DEEPSEEK_API_PROVIDER_ID && (
+                <CodexProviderModelsEditor
+                  definition={form.modelCatalogDefinition}
+                  models={parseModelCatalogText(form.modelCatalogText)}
+                  contexts={form.modelContextWindowsDraft}
+                  visionStates={Object.fromEntries(
+                    parseModelCatalogText(form.modelCatalogText).map((model) => [
+                      model.toLowerCase(),
+                      resolveProviderModelVisionState(model, form.visionModelStates, form.supportsVision),
+                    ]),
+                  )}
+                  disabled={saving}
+                  fetching={fetchingProviderModels}
+                  canFetch={canFetchProviderModels}
+                  onFetch={() => void fetchProviderModels()}
+                  onModelsChange={(models) => mutateForm({ modelCatalogText: models.join("\n") })}
+                  onContextChange={(model, value) => mutateForm({ modelContextWindowsDraft: { ...form.modelContextWindowsDraft, [model]: value } })}
+                  onVisionChange={(model, value) => mutateForm({ visionModelStates: { ...form.visionModelStates, [model.toLowerCase()]: value } })}
+                  onModelPatch={patchModelDefinition}
+                />
+              )}
+              {(form.wireApi === "chat_completions" ||
                 selectedPresetId === DEEPSEEK_API_PROVIDER_ID) && (
                 <>
                   <div className="form-group">
@@ -1921,9 +1948,10 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
                       disabled={saving}
                     />
                   </div>
-                  {/* DeepSeek Responses 只保留逐模型能力；其他第三方协议均可配置默认值。 */}
-                  {canConfigureCodexProviderVision({ presetId: selectedPresetId, wireApi: form.wireApi }) && (
-                    <>
+                </>
+              )}
+              {canConfigureCodexProviderVision({ presetId: selectedPresetId, wireApi: form.wireApi }) && (
+                <>
                   <div className="form-group">
                     <label>
                       {t(
@@ -1959,15 +1987,14 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
                       </span>
                     </label>
                   </div>
-                  <div className="form-group">
-                    <label>
-                      {t(
-                        "codex.modelProviders.fields.visionModels",
-                        "支持图片的模型",
-                      )}
-                    </label>
-                    {parseModelCatalogText(form.modelCatalogText).length === 0 ? (
-                      <>
+                  {parseModelCatalogText(form.modelCatalogText).length === 0 && (
+                    <div className="form-group">
+                      <label>
+                        {t(
+                          "codex.modelProviders.fields.visionModels",
+                          "支持图片的模型",
+                        )}
+                      </label>
                         <textarea
                           className="form-input"
                           rows={3}
@@ -1984,9 +2011,8 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
                             "每行一个模型名。适合同一供应商里只有部分视觉模型支持粘贴图片的情况。",
                           )}
                         </p>
-                      </>
-                    ) : null}
-                </div>
+                    </div>
+                  )}
                 <div className="form-group">
                   <label>
                     {t(
@@ -2010,17 +2036,15 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
                     )}
                   </p>
                 </div>
-                    </>
-                  )}
-                {form.wireApi === "chat_completions" && (
-                  <p className="api-provider-hint">
-                    {t(
-                      "codex.modelProviders.gatewayHint",
-                      "第三方供应商启动时会使用本地网关隔离实例并完成协议转换；OpenAI 官方供应商保持直连。",
-                    )}
-                  </p>
-                )}
                 </>
+              )}
+              {form.wireApi === "chat_completions" && (
+                <p className="api-provider-hint">
+                  {t(
+                    "codex.modelProviders.gatewayHint",
+                    "第三方供应商启动时会使用本地网关隔离实例并完成协议转换；OpenAI 官方供应商保持直连。",
+                  )}
+                </p>
               )}
               <div className="form-group">
                 <label>

@@ -1099,39 +1099,6 @@ fn api_bundle_from_providers(account: &CodexAccount, providers: &[serde_json::Va
     }))
 }
 
-/// Import the actual catalog; no sidecar definition or remote generator is needed.
-const REMOTE_MODEL_DEFINITION_SCRIPT: &str = r#"
-import json, os, sys, tomllib
-request = json.loads(sys.stdin.buffer.readline())
-home = os.path.realpath(os.path.expanduser(request['codex_home']))
-with open(os.path.join(home, 'config.toml'), 'rb') as source:
-    config = tomllib.load(source)
-catalog = config.get('model_catalog_json')
-if not isinstance(catalog, str) or not catalog.strip(): raise ValueError('missing model catalog')
-candidate = os.path.expanduser(catalog)
-if not os.path.isabs(candidate): candidate = os.path.join(home, candidate)
-resolved = os.path.realpath(candidate)
-if os.path.commonpath([home, resolved]) != home: raise ValueError('catalog outside CODEX_HOME')
-with open(resolved, 'rb') as source: raw = source.read(10 * 1024 * 1024 + 1)
-if len(raw) > 10 * 1024 * 1024: raise ValueError('oversize catalog')
-catalog = json.loads(raw)
-models = catalog.get('models') if isinstance(catalog, dict) else None
-if not isinstance(models, list) or not models: raise ValueError('empty model catalog')
-for model in models:
-    if not isinstance(model, dict) or not isinstance(model.get('slug'), str) or not model['slug'].strip():
-        raise ValueError('invalid model entry')
-    # The destination Codex supplies its own instructions; retain model capabilities.
-    model.pop('base_instructions', None)
-    model.pop('model_messages', None)
-print(json.dumps({'models': models}))
-"#;
-
-pub async fn read_model_catalog_definition(server_id: &str) -> Result<serde_json::Value, String> {
-    let output = run_remote_python(server_id, REMOTE_MODEL_DEFINITION_SCRIPT, &serde_json::json!({})).await
-        .map_err(|_| "Cannot import remote models: requires Python 3.11 and an existing model_catalog_json inside CODEX_HOME".to_string())?;
-    serde_json::from_str(&output).map_err(|_| "Invalid remote model definition".into())
-}
-
 #[derive(Clone)]
 struct AuthSnapshot {
     account_id: String,

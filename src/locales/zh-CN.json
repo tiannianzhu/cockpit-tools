@@ -3734,7 +3734,29 @@
       "importConfigPlaceholder": "在供应商卡片上点「复制配置」后，把内容粘贴到这里",
       "importConfigAction": "导入配置",
       "importConfigFromClipboard": "一键读取剪贴板",
-      "settingsRestartHint": "供应商配置已更新。若关联的 Codex 或 API 服务正在运行，请重启后生效。"
+      "settingsRestartHint": "供应商配置已更新。若关联的 Codex 或 API 服务正在运行，请重启后生效。",
+      "modelEditor": {
+        "title": "模型列表",
+        "hint": "填写各模型的上下文、图片和推理能力，应用到远程主机时自动生成完整目录。",
+        "duplicate": "模型 ID 已存在",
+        "invalidId": "模型 ID 不能包含空格或逗号",
+        "fetching": "获取中…",
+        "fetch": "从上游获取",
+        "modelIdPlaceholder": "输入模型 ID",
+        "modelId": "模型 ID",
+        "add": "添加模型",
+        "empty": "尚未添加模型。",
+        "context": "上下文窗口",
+        "vision": "图片输入",
+        "reasoning": "推理级别",
+        "unset": "未设置",
+        "remove": "移除模型",
+        "unconfigured": "未配置",
+        "supportedLevels": "支持的级别",
+        "defaultLevel": "默认级别",
+        "noUpstreamModels": "上游未返回可用模型，可手动添加模型 ID。",
+        "displayName": "显示名称"
+      }
     },
     "quickSwitch": {
       "action": "快速切换供应商",
