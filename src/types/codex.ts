@@ -536,6 +536,7 @@ export interface CodexSessionUsageQuery {
 }
 
 export interface CodexSessionUsageReport {
+  sessionTokens?: CodexSessionTokenStats[];
   totals: CodexSessionUsageTotals;
   byModel: CodexSessionUsageBreakdownRow[];
   byInstance: CodexSessionUsageBreakdownRow[];
