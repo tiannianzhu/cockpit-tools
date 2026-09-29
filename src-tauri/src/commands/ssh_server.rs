@@ -1,4 +1,4 @@
-use crate::models::ssh_server::{SshCodexSyncResult, SshServer};
+use crate::models::ssh_server::{SshCodexSyncResult, SshRemoteAccountSummary, SshServer};
 use crate::modules::ssh_server::{self, SshServerList};
 
 #[tauri::command]
@@ -17,8 +17,8 @@ pub fn delete_ssh_server(server_id: String) -> Result<SshServerList, String> {
 }
 
 #[tauri::command]
-pub fn select_ssh_server(server_id: Option<String>) -> Result<SshServerList, String> {
-    ssh_server::select_server(server_id)
+pub fn select_ssh_servers(server_ids: Vec<String>) -> Result<SshServerList, String> {
+    ssh_server::select_servers(server_ids)
 }
 
 #[tauri::command]
@@ -28,7 +28,27 @@ pub async fn test_ssh_server_connection(server_id: String) -> Result<String, Str
 
 #[tauri::command]
 pub async fn sync_current_codex_account_to_ssh_server(
-    server_id: Option<String>,
+    server_id: String,
 ) -> Result<SshCodexSyncResult, String> {
     ssh_server::sync_current_account_to_server(server_id).await
+}
+
+#[tauri::command]
+pub async fn inspect_ssh_server_account(
+    server_id: String,
+) -> Result<SshRemoteAccountSummary, String> {
+    ssh_server::inspect_account(&server_id).await
+}
+
+#[tauri::command]
+pub async fn switch_ssh_server_account(
+    server_id: String,
+    account_id: String,
+) -> Result<SshCodexSyncResult, String> {
+    ssh_server::switch_account(&server_id, &account_id).await
+}
+
+#[tauri::command]
+pub async fn read_ssh_server_model_catalog_definition(server_id: String) -> Result<serde_json::Value, String> {
+    ssh_server::read_model_catalog_definition(&server_id).await
 }

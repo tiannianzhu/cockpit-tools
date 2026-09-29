@@ -13,9 +13,10 @@ export const CODEX_TOP_TAB_LIMIT = 5;
 export const CODEX_TOP_LAYOUT_TABS: CodexTab[] = [
   'overview',
   'providers',
-  'wakeup',
+  'hosts',
   'instances',
   'sessions',
+  'wakeup',
   'proxy',
   'top-layout',
 ];
@@ -29,7 +30,7 @@ export function normalizeCodexTopLayout(value: unknown, availableTabs: CodexTab[
     order?: unknown;
   };
   const validTabs = new Set<CodexTab>(availableTabs);
-  const order = Array.isArray(candidate.order)
+  let order = Array.isArray(candidate.order)
     ? candidate.order.filter(
         (item, index, items): item is CodexTab =>
           typeof item === 'string' &&
@@ -37,6 +38,11 @@ export function normalizeCodexTopLayout(value: unknown, availableTabs: CodexTab[
           items.indexOf(item) === index,
       )
     : [];
+  // Upgrade the released default while preserving any custom relative order.
+  const previousDefault = ['overview', 'providers', 'wakeup', 'instances', 'sessions', 'proxy', 'top-layout'];
+  if (order.join(',') === previousDefault.join(',') && availableTabs.includes('hosts')) {
+    order = [...availableTabs];
+  }
   for (const tab of availableTabs) {
     if (!order.includes(tab)) {
       order.push(tab);

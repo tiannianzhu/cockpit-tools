@@ -10,9 +10,9 @@ import {
   moveCodexTopLayoutTab,
 } from './codexTopLayoutPreferences';
 
-test('default layout preserves all released tabs in the top row', () => {
+test('default layout exposes hosts alongside accounts and sessions', () => {
   const layout = createDefaultCodexTopLayout();
-  assert.deepEqual(layout.order, ['overview', 'providers', 'wakeup', 'instances', 'sessions', 'proxy', 'top-layout']);
+  assert.deepEqual(layout.order, ['overview', 'providers', 'hosts', 'instances', 'sessions', 'wakeup', 'proxy', 'top-layout']);
   assert.ok(layout.order.slice(0, 5).every((tab) => layout.placement[tab] === 'top'));
   assert.equal(layout.placement.proxy, 'more');
   assert.equal(layout.placement['top-layout'], 'more');
@@ -56,16 +56,16 @@ test('saved layout normalizes stale tabs and survives invalid storage', () => {
 test('dragging across the fifth position and arrow moves share the same placement rule', () => {
   const original = createDefaultCodexTopLayout();
   const movedUp = moveCodexTopLayoutTab(original, 5, 4);
-  assert.deepEqual(movedUp.order.slice(4), ['proxy', 'sessions', 'top-layout']);
-  assert.equal(movedUp.placement.proxy, 'top');
+  assert.deepEqual(movedUp.order.slice(4), ['wakeup', 'sessions', 'proxy', 'top-layout']);
+  assert.equal(movedUp.placement.wakeup, 'top');
   assert.equal(movedUp.placement.sessions, 'more');
   assert.deepEqual(moveCodexTopLayoutTab(movedUp, 4, 5), original);
-  const dragged = moveCodexTopLayoutTab(original, 6, 0);
+  const dragged = moveCodexTopLayoutTab(original, 7, 0);
   assert.equal(dragged.order[0], 'top-layout');
   assert.equal(dragged.placement['top-layout'], 'top');
-  assert.deepEqual(dragged.order.filter(tab => dragged.placement[tab] === 'more'), ['sessions', 'proxy']);
+  assert.deepEqual(dragged.order.filter(tab => dragged.placement[tab] === 'more'), ['sessions', 'wakeup', 'proxy']);
   assert.deepEqual(original, createDefaultCodexTopLayout());
-  for (const [from, to] of [[0, -1], [6, 7], [-1, 0], [0, NaN], [0.5, 1], [2, 2]]) {
+  for (const [from, to] of [[0, -1], [7, 8], [-1, 0], [0, NaN], [0.5, 1], [2, 2]]) {
     assert.deepEqual(moveCodexTopLayoutTab(original, from, to), original);
   }
 });
@@ -92,4 +92,16 @@ test('restoring More tools does not reintroduce removed risk detection', () => {
     const source = readFileSync(new URL(path, import.meta.url), 'utf8');
     assert.doesNotMatch(source, /CodexAccountTurnState|turnStateCheck|renderAccountTurnStatePill/);
   }
+});
+
+
+test('host navigation migrates the old default without discarding a custom order', () => {
+  const previousDefault = ['overview', 'providers', 'wakeup', 'instances', 'sessions', 'proxy', 'top-layout'];
+  assert.deepEqual(normalizeCodexTopLayout({ order: previousDefault }), createDefaultCodexTopLayout());
+  const custom = ['sessions', 'proxy', 'overview', 'providers', 'instances', 'wakeup', 'top-layout'];
+  const migrated = normalizeCodexTopLayout({ order: custom });
+  assert.deepEqual(migrated.order.filter(tab => tab !== 'hosts'), custom);
+  assert.equal(migrated.order.filter(tab => tab === 'hosts').length, 1);
+  assert.deepEqual(migrated.order.slice(0, custom.length), custom);
+  assert.deepEqual(normalizeCodexTopLayout(migrated), migrated);
 });
