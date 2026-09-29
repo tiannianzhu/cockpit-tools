@@ -1,0 +1,63 @@
+.codex-session-host-workspace {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.codex-session-host-selector {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-secondary);
+}
+
+.codex-session-host-selector > label,
+.codex-session-host-selector > span {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.codex-session-host-selector .codex-session-host-select {
+  flex: 0 1 260px;
+  width: min(260px, 100%);
+  min-width: 160px;
+}
+
+.codex-session-host-selector .single-select-dropdown-trigger {
+  min-height: 36px;
+  border-radius: 10px;
+  box-shadow: none;
+  background: var(--bg-card);
+  font-size: 12px;
+}
+
+.codex-session-host-selector .btn {
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 10px;
+  font-size: 12px;
+}
+
+.codex-remote-sessions {
+  min-width: 0;
+}
+
+.codex-remote-session-limit {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+@media (max-width: 560px) {
+  .codex-session-host-selector .codex-session-host-select {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+}

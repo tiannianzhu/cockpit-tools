@@ -62,6 +62,8 @@ pub struct CodexSessionUsageBreakdownRow {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub request_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,6 +586,30 @@ pub fn read_token_stats_from_rollout_uncached(
     rollout_path: &Path,
     file_len: u64,
 ) -> Option<(u64, u64, u64)> {
+    if rollout::is_compressed(rollout_path) {
+        // Compressed byte offsets cannot be used to seek to JSONL records.
+        let mut reader = rollout::open_reader(rollout_path).ok()?;
+        let mut line = Vec::new();
+        let mut latest = None;
+        // Token-count records are small. Discard the rest of oversized
+        // conversation records without growing the line buffer.
+        const MAX_TOKEN_RECORD_BYTES: u64 = 1024 * 1024;
+        while reader.by_ref().take(MAX_TOKEN_RECORD_BYTES + 1).read_until(b'\n', &mut line).ok()? != 0 {
+            if line.len() as u64 > MAX_TOKEN_RECORD_BYTES {
+                if line.last() != Some(&b'\n') {
+                    reader.skip_until(b'\n').ok()?;
+                }
+                line.clear();
+                continue;
+            }
+            if let Some(stats) = parse_token_stats_line(&line) {
+                latest = Some(stats);
+            }
+            line.clear();
+        }
+        return latest;
+    }
+
     let mut file = File::open(rollout_path).ok()?;
     let mut offset = file_len;
     let mut pending_prefix = Vec::new();
@@ -635,51 +661,41 @@ fn byte_before_is_newline(file: &mut File, offset: u64) -> std::io::Result<bool>
 }
 
 fn parse_token_stats_lines(content: &[u8]) -> Option<(u64, u64, u64)> {
-    for line in content.split(|byte| *byte == b'\n').rev() {
-        let raw = String::from_utf8_lossy(line);
-        let trimmed = raw.trim();
-        if trimmed.is_empty()
-            || !trimmed.contains("\"token_count\"")
-            || !trimmed.contains("\"total_token_usage\"")
-        {
-            continue;
-        }
+    content
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find_map(parse_token_stats_line)
+}
 
-        let Ok(parsed) = serde_json::from_str::<JsonValue>(trimmed) else {
-            continue;
-        };
-        if parsed.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
-            continue;
-        }
-        let Some(payload) = parsed.get("payload") else {
-            continue;
-        };
-        if payload.get("type").and_then(|value| value.as_str()) != Some("token_count") {
-            continue;
-        }
-        let Some(usage) = payload
-            .get("info")
-            .and_then(|info| info.get("total_token_usage"))
-        else {
-            continue;
-        };
-
-        let input = usage
-            .get("input_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        let output = usage
-            .get("output_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        let total = usage
-            .get("total_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        return Some((input, output, total));
+fn parse_token_stats_line(line: &[u8]) -> Option<(u64, u64, u64)> {
+    let raw = String::from_utf8_lossy(line);
+    let trimmed = raw.trim();
+    if !trimmed.contains("\"token_count\"") || !trimmed.contains("\"total_token_usage\"") {
+        return None;
     }
 
-    None
+    let parsed: JsonValue = serde_json::from_str(trimmed).ok()?;
+    if parsed.get("type")?.as_str()? != "event_msg" {
+        return None;
+    }
+    let payload = parsed.get("payload")?;
+    if payload.get("type")?.as_str()? != "token_count" {
+        return None;
+    }
+    let usage = payload.get("info")?.get("total_token_usage")?;
+    let input = usage
+        .get("input_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let total = usage
+        .get("total_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    Some((input, output, total))
 }
 
 fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
@@ -2036,6 +2052,7 @@ fn query_breakdown(
                 output_tokens: output,
                 total_tokens: input.saturating_add(output),
                 request_count: requests,
+                estimated_cost_usd: None,
             })
         })
         .map_err(|error| format!("遍历会话用量分组失败: {error}"))?;
@@ -2091,6 +2108,7 @@ fn query_day_breakdown(
             output_tokens: totals.output_tokens,
             total_tokens: totals.total_tokens,
             request_count: totals.request_count,
+            estimated_cost_usd: None,
         })
         .collect())
 }
@@ -2120,6 +2138,26 @@ mod tests {
 
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD_ID: &str = "00000000-0000-4000-8000-000000000002";
+
+    #[test]
+    fn breakdown_transport_preserves_optional_model_cost() {
+        let payload = json!({
+            "key": "fixture-model", "label": "Fixture model",
+            "inputTokens": 100, "cachedInputTokens": 80,
+            "outputTokens": 10, "totalTokens": 110, "requestCount": 1,
+        });
+        let mut row: CodexSessionUsageBreakdownRow =
+            serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(row.estimated_cost_usd, None);
+        assert_eq!(serde_json::to_value(&row).unwrap(), payload);
+
+        row.estimated_cost_usd = Some(0.125);
+        let priced = serde_json::to_value(&row).unwrap();
+        assert_eq!(priced["estimatedCostUsd"], 0.125);
+        assert_eq!(priced["totalTokens"], 110);
+        let restored: CodexSessionUsageBreakdownRow = serde_json::from_value(priced).unwrap();
+        assert_eq!(restored.estimated_cost_usd, Some(0.125));
+    }
 
     fn write_jsonl(path: &Path, values: &[JsonValue]) {
         if let Some(parent) = path.parent() {
