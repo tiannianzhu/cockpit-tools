@@ -110,7 +110,7 @@ fn isolated_native_official_metadata_rebuild_import_delete_and_failure_recovery(
     }
     assert_eq!(std::fs::read(&rollout).unwrap(), original);
     assert!(count() > 0);
-    let project_id = isolated_native_create_project(&native, &codex, &project);
+    let project_id = isolated_native_create_project(&codex, &project);
     rebuild_imported_thread_metadata(
         &codex,
         &[(session_id.clone(), project.to_string_lossy().into_owned())],
@@ -130,18 +130,18 @@ fn isolated_native_official_metadata_rebuild_import_delete_and_failure_recovery(
     println!(
         "Actual project/create -> mapped production rebuild -> persisted project_id: {project_id}"
     );
-    let invalid = delete_threads(&codex, &["not-a-valid-thread-id".into()])
-        .expect_err("the production helper must preserve the official rejection");
-    assert!(
-        invalid.to_ascii_lowercase().contains("invalid")
-            && invalid.to_ascii_lowercase().contains("thread"),
-        "expected official invalid-thread rejection, got: {invalid}"
-    );
-    assert!(count() > 0, "a rejected delete must preserve the indexed thread");
+    let invalid = delete_threads(&codex, &["not-a-valid-thread-id".into()]).unwrap();
+    assert!(invalid.deleted.is_empty());
+    assert_eq!(invalid.failures.len(), 1);
     assert_eq!(std::fs::read(&rollout).unwrap(), original);
     rebuild_thread_metadata(&codex).expect("retry after failed delete");
     let deleted = delete_threads(&codex, &[session_id.clone(), session_id.clone()]).unwrap();
-    assert_eq!(deleted, 1, "deduplicated real thread/delete");
+    assert_eq!(
+        deleted.deleted,
+        vec![session_id.clone()],
+        "deduplicated real thread/delete"
+    );
+    assert!(deleted.failures.is_empty());
     assert!(!rollout.exists());
     assert_eq!(count(), 0);
     assert!(!codex.join("auth.json").exists());
@@ -155,49 +155,39 @@ fn isolated_native_official_metadata_rebuild_import_delete_and_failure_recovery(
     std::fs::remove_dir_all(codex).unwrap();
 }
 
-fn isolated_native_create_project(native: &Path, codex: &Path, project: &Path) -> String {
-    let mut child = build_app_server_command(native, codex).spawn().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let (sender, receiver) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let _ = sender.send(line);
-        }
+fn isolated_native_create_project(codex: &Path, project: &Path) -> String {
+    let mut server = AppServerSession::start(codex).unwrap();
+    // Parameters are taken from the signed engine's generated local JSON
+    // schema. This registers only the fixture folder, without a desktop UI.
+    let result = server.request(
+        "project/create",
+        json!({"idempotencyKey":uuid::Uuid::new_v4().to_string(),"name":"QA isolated project","roots":[{"path":project}],"metadata":{"qa":"offline"}}),
+    ).expect("actual official local project/create");
+    result["project"]["id"]
+        .as_str()
+        .expect("project/create missing id")
+        .to_owned()
+}
+
+#[test]
+fn official_fork_dependency_refusal_preserves_parent_child_and_index() {
+    let base = tempfile::tempdir().unwrap();
+    let parent = base.path().join("parent.jsonl");
+    let child = base.path().join("child.jsonl");
+    let index = base.path().join("session_index.jsonl");
+    let parent_bytes = b"parent history\n";
+    let child_bytes = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"history_base\":{\"thread_id\":\"parent\"}}}\n";
+    let index_bytes = b"{\"id\":\"parent\"}\n{\"id\":\"child\"}\n";
+    std::fs::write(&parent, parent_bytes).unwrap();
+    std::fs::write(&child, child_bytes).unwrap();
+    std::fs::write(&index, index_bytes).unwrap();
+    let result = delete_threads_with(&["parent".into()], |_| {
+        Err("cannot delete thread parent: forked history still references it".into())
     });
-    let errors = std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            println!("[isolated project/create stderr] {line}");
-        }
-    });
-    let result = (|| -> Result<String, String> {
-        send_request(
-            &mut stdin,
-            json!({
-                "method":"initialize", "id":1,
-                "params":{"clientInfo":{"name":"cockpit-tools-offline-test","version":"1"},"capabilities":{"experimentalApi":true}}
-            }),
-        )?;
-        wait_for_response(&receiver, 1)?;
-        // Parameters are taken from the signed engine's generated local JSON
-        // schema. This registers only the fixture folder, without a desktop UI.
-        send_request(
-            &mut stdin,
-            json!({
-                "method":"project/create", "id":2,
-                "params":{"idempotencyKey":uuid::Uuid::new_v4().to_string(),"name":"QA isolated project","roots":[{"path":project}],"metadata":{"qa":"offline"}}
-            }),
-        )?;
-        let response =
-            wait_for_response_value(&receiver, 2).map_err(|error| error.message().to_owned())?;
-        response["result"]["project"]["id"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| format!("project/create missing id: {response}"))
-    })();
-    finish_child(&mut child);
-    reader.join().unwrap();
-    errors.join().unwrap();
-    result.expect("actual official local project/create")
+    assert!(result.deleted.is_empty());
+    assert_eq!(result.failures.len(), 1);
+    assert!(result.failures[0].contains("forked history still references it"));
+    assert_eq!(std::fs::read(parent).unwrap(), parent_bytes);
+    assert_eq!(std::fs::read(child).unwrap(), child_bytes);
+    assert_eq!(std::fs::read(index).unwrap(), index_bytes);
 }

@@ -3562,10 +3562,6 @@
         "repairVisibilitySkippedOnly": "Yazılabilir provider farkı bulunamadı; geçersiz veya bozuk {{count}} state_5.sqlite dosyası atlandı. Bu SQLite kayıtları onarılmadan önce Codex bu dosyaları yeniden oluşturmalıdır.",
         "repairVisibilitySkippedWithBase": "{{message}}; geçersiz veya bozuk {{count}} state_5.sqlite dosyası atlandı. Bu SQLite kayıtları onarılmadan önce Codex bu dosyaları yeniden oluşturmalıdır.",
         "trashSummary": "{{count}} sohbet çöp kutusuna taşındı ve resmi Codex'te silindi",
-        "trashSummaryFallback": "{{count}} sohbet çöp kutusuna taşındı ve resmi Codex oturum dizini yeniden oluşturma başlatıldı",
-        "trashSummaryRunningHint": "Çalışan örneklerde değişikliğin görünmesi için yenileme veya yeniden başlatma gerekebilir",
-        "trashSummaryFallbackHint": "{{count}} örnekte resmi silme tamamlanmadı; dosyalar doğrudan kaldırıldı ve Codex yeniden başlatıldığında eşitlenecek",
-        "trashSummaryRebuildFailedHint": "{{count}} örnekte resmi kenar çubuğu dizini yeniden oluşturulamadı; Codex yeniden başlatıldığında tekrar yükleyecek",
         "trashSummaryEmpty": "Seçilen sohbetler mevcut örnek kümesinde yok, yapılacak bir şey yok"
       },
       "groupCount": "{{count}} oturum",
@@ -3780,6 +3776,20 @@
         "hint": "Bu oturum birden fazla örnekte var. Dosya konumunun açılacağı örneği seçin:",
         "rolloutHint": "Bu oturum birden fazla örnekte var. Oturum dosyasının açılacağı örneği seçin:",
         "running": "Çalışıyor"
+      },
+      "archive": {
+        "active": "Arşivlenmemiş",
+        "all": "Tüm arşiv durumları",
+        "archived": "Arşivlendi",
+        "label": "Arşiv durumu"
+      },
+      "childAgents": "Alt ajanlar ({{count}})",
+      "selectConversation": "Konuşmayı seç: {{title}}",
+      "shared": {
+        "emptied": "Çöp kutusu boşaltıldı",
+        "purged": "{{count}} konuşmanın ve alt ajanlarının yedekleri kalıcı olarak silindi",
+        "restored": "{{count}} konuşma ve alt ajanları geri yüklendi",
+        "trashed": "{{count}} konuşma ve alt ajanları Çöp Kutusu'na taşındı"
       }
     },
     "sessionUsage": {
@@ -3809,8 +3819,8 @@
         "scanning": "Oturum günlükleri taranıyor…",
         "ready": "{{files}} dosya, {{requests}} istek",
         "lastSynced": "Son senkron {{time}}",
-        "deferred": "{{count}} çatal ebeveyni bekliyor",
-        "errors": "{{count}} dosya okunamadı"
+        "errors": "{{count}} dosya okunamadı",
+        "unprocessed": "{{count}} oturum dosyası henüz sayılmadı"
       },
       "cards": {
         "input": "Giriş token",
@@ -6118,6 +6128,38 @@
       "title": "Uzak sunucular",
       "updated": "Güncellendi",
       "useLocalAccount": "Geçerli yerel hesabı kullan"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Farklı bir başlık, dizin veya kimlikle aramayı deneyin.",
+      "assistant": "Asistan",
+      "back": "Oturumlara dön",
+      "chooseHost": "Seçili sunucu kullanılamıyor. Başka bir sunucu seçin.",
+      "confirmTrash": "“{{title}}” ve tüm alt ajan konuşmaları {{host}} üzerindeki çöp kutusuna taşınsın mı?",
+      "count": "{{count}} oturum",
+      "empty": "Oturum bulunamadı",
+      "emptyHint": "Bu sunucuda yönetilecek oturum yok.",
+      "emptyTrash": "Çöp kutusu boş",
+      "exported": "Bu bilgisayara dışa aktarıldı",
+      "host": "Oturum sunucusu",
+      "limit": "{{total}} oturumdan {{shown}} tanesi gösteriliyor. Sonuçları daraltmak için arayın.",
+      "loadError": "Uzak oturum işlemi başarısız oldu. Sunucu bağlantısını kontrol edip yeniden deneyin.",
+      "local": "Yerel",
+      "manageHosts": "Sunucuları yönet",
+      "moveToTrash": "Çöp kutusuna taşı",
+      "noMatches": "Eşleşen oturum yok",
+      "noReadableMessages": "Konuşma mesajları çıkarılamadı. Ham kaydı görüntüleyebilirsiniz.",
+      "raw": "Ham döküm (JSONL)",
+      "scope": "Sunucu: {{host}}. Çöp kutusuna taşıma ve geri yükleme uzakta yapılır; dışa aktarımlar yerel olarak kaydedilir.",
+      "search": "Uzak oturumlarda ara",
+      "searchLabel": "Oturumlarda ara",
+      "searchPlaceholder": "Başlık, dizin veya kimlik ara",
+      "title": "Uzak oturumlar",
+      "transcript": "Oturum dökümü",
+      "trash": "Uzak çöp kutusu",
+      "truncated": "Önizleme kesildi. Dökümün tamamını kaydetmek için dışa aktarın.",
+      "unavailable": "Sunucu kaldırılmış veya kullanılamıyor",
+      "user": "Kullanıcı",
+      "view": "Görüntüle"
     }
   },
   "githubCopilot": {

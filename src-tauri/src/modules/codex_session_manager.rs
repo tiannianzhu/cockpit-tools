@@ -6,6 +6,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
+use cockpit_session_usage::rollout;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
@@ -23,8 +24,6 @@ const SESSION_TRASH_ROOT_DIR: &str = "cockpit-tools-codex-session-trash";
 const SESSION_EXPORT_KIND: &str = "codex-session-export";
 const SESSION_EXPORT_VERSION: u32 = 1;
 pub const SESSION_TRANSFER_PROGRESS_EVENT: &str = "codex:session-transfer-progress";
-const SESSION_INDEX_ACTIVITY_DRIFT_SECONDS: i64 = 3_600;
-const TOKEN_STATS_READ_CHUNK_BYTES: usize = 64 * 1024;
 const ROLLOUT_ACTIVITY_READ_CHUNK_BYTES: usize = 64 * 1024;
 const ROLLOUT_ACTIVITY_MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 const CONTENT_SEARCH_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -46,6 +45,7 @@ pub struct CodexSessionLocation {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSessionRecord {
+    pub archived: bool,
     pub session_id: String,
     pub title: String,
     pub cwd: String,
@@ -57,38 +57,61 @@ pub struct CodexSessionRecord {
     /// conversation | external | subagent — vertical slice of #1510
     #[serde(default = "default_session_kind")]
     pub session_kind: String,
+    pub parent_thread_id: Option<String>,
 }
 
 fn default_session_kind() -> String {
     "conversation".to_string()
 }
 
-/// Classify session for UI filters (conversation / external / subagent).
-/// Empty title defaults to conversation so the default conversation filter
-/// does not hide real chats that have not received a title yet.
-pub fn classify_session_kind(title: &str, cwd: &str) -> String {
-    let title_l = title.trim().to_ascii_lowercase();
-    let cwd_l = cwd.trim().to_ascii_lowercase();
-    if title_l.contains("subagent")
-        || title_l.contains("sub-agent")
-        || title_l.contains("agent run")
-        || cwd_l.contains("/subagent")
-        || cwd_l.contains("\\subagent")
-        || cwd_l.contains("subagent/")
-        || cwd_l.contains("subagent\\")
+/// Classify from Codex session metadata, never from user-authored titles or paths.
+fn classify_session_kind(meta: &JsonValue) -> String {
+    let payload = meta.get("payload").unwrap_or(meta);
+    let source = payload.get("source");
+    if source
+        .and_then(|value| value.get("subAgent").or_else(|| value.get("subagent")))
+        .is_some()
+        || source.and_then(JsonValue::as_str) == Some("subagent")
     {
         return "subagent".to_string();
     }
-    if title_l.contains("external")
-        || title_l.contains("imported")
-        || title_l.contains("cli run")
-        || cwd_l.contains("imported")
-        || cwd_l.contains("/external")
-        || cwd_l.contains("\\external")
-    {
+    if source.and_then(JsonValue::as_str) == Some("exec") {
         return "external".to_string();
     }
     "conversation".to_string()
+}
+
+/// Only the official thread relation is authoritative; names and fork history are not parents.
+fn parent_thread_id(meta: &JsonValue) -> Option<String> {
+    let payload = meta.get("payload").unwrap_or(meta);
+    let direct = payload.get("parentThreadId")
+        .or_else(|| payload.get("parent_thread_id"))
+        .and_then(JsonValue::as_str);
+    let nested = payload
+        .get("source")
+        .and_then(|source| {
+            source
+                .get("subAgent")
+                .filter(|value| value.is_object())
+                .or_else(|| source.get("subagent"))
+        })
+        .and_then(|agent| {
+            agent
+                .get("thread_spawn")
+                .or_else(|| agent.get("threadSpawn"))
+        })
+        .and_then(|spawn| {
+            spawn
+                .get("parent_thread_id")
+                .or_else(|| spawn.get("parentThreadId"))
+        })
+        .and_then(JsonValue::as_str);
+    direct
+        .filter(|id| !id.trim().is_empty())
+        .or(nested)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,11 +131,8 @@ pub struct CodexSessionTrashSummary {
     pub trashed_instance_count: usize,
     /// 运行中、删除后可能需要在客户端刷新才可见的实例数。
     pub running_instance_count: usize,
-    /// 官方 `thread/delete` 未完成、已回退到文件方式删除的实例数。
-    pub official_delete_fallback_instance_count: usize,
-    /// 官方侧边栏索引重建失败的实例数。
-    pub metadata_rebuild_failed_instance_count: usize,
     pub trash_dirs: Vec<String>,
+    pub failures: Vec<String>,
     /// 后端兜底文案：前端用翻译键组装提示，键不可用时回退到该文案。
     pub message: String,
 }
@@ -134,6 +154,8 @@ pub struct CodexTrashedSessionRecord {
     pub size_bytes: u64,
     pub location_count: usize,
     pub locations: Vec<CodexTrashedSessionLocation>,
+    pub parent_thread_id: Option<String>,
+    pub session_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,7 +259,21 @@ pub struct CodexSessionTransferProgress {
     pub running: bool,
 }
 
-type SessionTransferProgressReporter<'a> = &'a (dyn Fn(CodexSessionTransferProgress) + Send + Sync);
+pub(crate) type SessionTransferProgressReporter<'a> =
+    &'a (dyn Fn(CodexSessionTransferProgress) + Send + Sync);
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionPackageSource {
+    pub session_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub updated_at: Option<i64>,
+    pub relative_rollout_path: String,
+    pub rollout_path: PathBuf,
+    pub session_index_entry: JsonValue,
+    pub source_instance_id: String,
+    pub source_instance_name: String,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CodexSessionSearchFilter {
@@ -255,7 +291,10 @@ struct CodexSyncInstance {
 
 #[derive(Debug, Clone)]
 struct ThreadSnapshot {
+    archived: bool,
     id: String,
+    session_kind: String,
+    parent_thread_id: Option<String>,
     title: String,
     cwd: String,
     /// 官方客户端可重命名的项目名（工作目录所属项目），缺失时由前端回退到目录名。
@@ -268,33 +307,33 @@ struct ThreadSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionExportManifest {
-    kind: String,
-    package_version: u32,
-    exported_at: String,
-    sessions: Vec<SessionExportManifestItem>,
+pub(crate) struct SessionExportManifest {
+    pub(crate) kind: String,
+    pub(crate) package_version: u32,
+    pub(crate) exported_at: String,
+    pub(crate) sessions: Vec<SessionExportManifestItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionExportManifestItem {
-    session_id: String,
-    title: String,
-    cwd: String,
-    updated_at: Option<i64>,
-    relative_rollout_path: String,
-    file_entry: String,
-    size_bytes: u64,
-    sha256: String,
-    session_index_entry: JsonValue,
-    source_instance: SessionExportInstance,
+pub(crate) struct SessionExportManifestItem {
+    pub(crate) session_id: String,
+    pub(crate) title: String,
+    pub(crate) cwd: String,
+    pub(crate) updated_at: Option<i64>,
+    pub(crate) relative_rollout_path: String,
+    pub(crate) file_entry: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
+    pub(crate) session_index_entry: JsonValue,
+    pub(crate) source_instance: SessionExportInstance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionExportInstance {
-    id: String,
-    name: String,
+pub(crate) struct SessionExportInstance {
+    pub(crate) id: String,
+    pub(crate) name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -310,6 +349,10 @@ struct TrashedSessionManifest {
     relative_rollout_path: String,
     session_index_entry: JsonValue,
     deleted_at: Option<String>,
+    #[serde(default)]
+    parent_thread_id: Option<String>,
+    #[serde(default)]
+    session_kind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -323,18 +366,6 @@ struct TrashedSessionEntry {
 struct TrashRoot {
     path: PathBuf,
     optional: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct RestoreTrashedSessionOutcome {
-    metadata_rebuild_failed: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct TrashSnapshotsOutcome {
-    metadata_rebuild_failed: bool,
-    /// 官方 app-server 的 `thread/delete` 未完成（不可用或部分失败），已回退到文件方式删除。
-    official_delete_failed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -386,47 +417,11 @@ fn read_token_stats_from_rollout(rollout_path: &Path) -> Option<(u64, u64, u64)>
     stats
 }
 
-fn read_token_stats_from_rollout_uncached(
+pub(crate) fn read_token_stats_from_rollout_uncached(
     rollout_path: &Path,
     file_len: u64,
 ) -> Option<(u64, u64, u64)> {
-    let mut file = File::open(rollout_path).ok()?;
-    let mut offset = file_len;
-    let mut pending_prefix = Vec::new();
-
-    while offset > 0 {
-        let chunk_len = TOKEN_STATS_READ_CHUNK_BYTES.min(offset as usize);
-        offset -= chunk_len as u64;
-
-        file.seek(SeekFrom::Start(offset)).ok()?;
-        let mut chunk = vec![0u8; chunk_len];
-        file.read_exact(&mut chunk).ok()?;
-
-        let starts_on_line_boundary =
-            offset == 0 || byte_before_is_newline(&mut file, offset).ok()?;
-        chunk.extend_from_slice(&pending_prefix);
-
-        let parse_from_index = if starts_on_line_boundary {
-            pending_prefix.clear();
-            0
-        } else if let Some(newline_index) = chunk.iter().position(|byte| *byte == b'\n') {
-            pending_prefix = chunk[..newline_index].to_vec();
-            newline_index + 1
-        } else {
-            pending_prefix = chunk;
-            continue;
-        };
-
-        if let Some(stats) = parse_token_stats_lines(&chunk[parse_from_index..]) {
-            return Some(stats);
-        }
-    }
-
-    if pending_prefix.is_empty() {
-        None
-    } else {
-        parse_token_stats_lines(&pending_prefix)
-    }
+    cockpit_session_usage::read_token_stats_from_rollout_uncached(rollout_path, file_len)
 }
 
 fn byte_before_is_newline(file: &mut File, offset: u64) -> std::io::Result<bool> {
@@ -438,54 +433,6 @@ fn byte_before_is_newline(file: &mut File, offset: u64) -> std::io::Result<bool>
     let mut byte = [0u8; 1];
     file.read_exact(&mut byte)?;
     Ok(byte[0] == b'\n')
-}
-
-fn parse_token_stats_lines(content: &[u8]) -> Option<(u64, u64, u64)> {
-    for line in content.split(|byte| *byte == b'\n').rev() {
-        let raw = String::from_utf8_lossy(line);
-        let trimmed = raw.trim();
-        if trimmed.is_empty()
-            || !trimmed.contains("\"token_count\"")
-            || !trimmed.contains("\"total_token_usage\"")
-        {
-            continue;
-        }
-
-        let Ok(parsed) = serde_json::from_str::<JsonValue>(trimmed) else {
-            continue;
-        };
-        if parsed.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
-            continue;
-        }
-        let Some(payload) = parsed.get("payload") else {
-            continue;
-        };
-        if payload.get("type").and_then(|value| value.as_str()) != Some("token_count") {
-            continue;
-        }
-        let Some(usage) = payload
-            .get("info")
-            .and_then(|info| info.get("total_token_usage"))
-        else {
-            continue;
-        };
-
-        let input = usage
-            .get("input_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        let output = usage
-            .get("output_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        let total = usage
-            .get("total_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        return Some((input, output, total));
-    }
-
-    None
 }
 
 pub fn list_sessions_across_instances(
@@ -516,6 +463,7 @@ pub fn list_sessions_across_instances(
                 session_map
                     .entry(snapshot.id.clone())
                     .or_insert_with(|| CodexSessionRecord {
+                        archived: snapshot.archived,
                         session_id: snapshot.id.clone(),
                         title: snapshot.title.clone(),
                         cwd: snapshot.cwd.clone(),
@@ -523,9 +471,12 @@ pub fn list_sessions_across_instances(
                         updated_at: snapshot.updated_at,
                         location_count: 0,
                         locations: Vec::new(),
-                        session_kind: classify_session_kind(&snapshot.title, &snapshot.cwd),
+                        session_kind: snapshot.session_kind.clone(),
+                        parent_thread_id: snapshot.parent_thread_id.clone(),
                     });
 
+            // A session is archived only when every registered copy is archived.
+            entry.archived &= snapshot.archived;
             if entry.updated_at.is_none() {
                 entry.updated_at = snapshot.updated_at;
             }
@@ -537,6 +488,9 @@ pub fn list_sessions_across_instances(
             }
             if entry.project_name.is_none() {
                 entry.project_name = snapshot.project_name.clone();
+            }
+            if entry.parent_thread_id.is_none() {
+                entry.parent_thread_id = snapshot.parent_thread_id.clone();
             }
 
             entry.locations.push(CodexSessionLocation {
@@ -767,99 +721,159 @@ pub fn get_session_token_stats_across_instances(
 pub fn move_sessions_to_trash_across_instances(
     session_ids: Vec<String>,
 ) -> Result<CodexSessionTrashSummary, String> {
-    let requested_ids = session_ids
-        .into_iter()
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty())
-        .collect::<HashSet<_>>();
+    let requested_ids = normalize_session_id_list(session_ids);
     if requested_ids.is_empty() {
         return Err("请至少选择一条会话".to_string());
     }
-
     let instances = collect_instances()?;
     let process_entries = modules::process::collect_codex_process_entries();
-    let trash_root = create_trash_root_dir()?;
-    let mut trashed_session_ids = HashSet::new();
-    let mut trashed_instance_count = 0usize;
-    let mut mutated_running_instance_count = 0usize;
-    let mut metadata_rebuild_failed_count = 0usize;
-    let mut official_delete_fallback_count = 0usize;
-
+    let mut plans = Vec::new();
     for instance in &instances {
-        let snapshots = load_thread_snapshots(instance)?
-            .into_iter()
-            .filter(|snapshot| requested_ids.contains(&snapshot.id))
-            .collect::<Vec<_>>();
-        if snapshots.is_empty() {
-            continue;
+        let known = load_thread_snapshots(instance)?;
+        if let Some(child) = known.iter().find(|snapshot| {
+            requested_ids.contains(&snapshot.id)
+                && (snapshot.session_kind == "subagent" || snapshot.parent_thread_id.is_some())
+        }) {
+            return Err(format!(
+                "不能单独删除子代理会话 {}；请删除其主会话",
+                child.id
+            ));
         }
-
-        if is_instance_running(instance, &process_entries) {
-            mutated_running_instance_count += 1;
+        let mut roots = Vec::new();
+        let mut snapshots = Vec::new();
+        let mut seen = HashSet::new();
+        for id in &requested_ids {
+            let Some(root) = known.iter().find(|snapshot| &snapshot.id == id) else {
+                continue;
+            };
+            roots.push(id.clone());
+            if seen.insert(root.id.clone()) {
+                snapshots.push(root.clone());
+            }
+            let mut parents = HashSet::from([id.clone()]);
+            loop {
+                let next = known
+                    .iter()
+                    .filter(|snapshot| {
+                        snapshot
+                            .parent_thread_id
+                            .as_ref()
+                            .is_some_and(|parent| parents.contains(parent))
+                            && !seen.contains(&snapshot.id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if next.is_empty() {
+                    break;
+                }
+                parents.clear();
+                for snapshot in next {
+                    parents.insert(snapshot.id.clone());
+                    seen.insert(snapshot.id.clone());
+                    snapshots.push(snapshot);
+                }
+            }
         }
-
-        let outcome = trash_snapshots_for_instance(instance, &trash_root, &snapshots)?;
-        if outcome.metadata_rebuild_failed {
-            metadata_rebuild_failed_count += 1;
-        }
-        if outcome.official_delete_failed {
-            official_delete_fallback_count += 1;
-        }
-        trashed_instance_count += 1;
-        for snapshot in snapshots {
-            trashed_session_ids.insert(snapshot.id);
+        if !roots.is_empty() {
+            plans.push((instance, roots, snapshots));
         }
     }
-
-    if trashed_instance_count == 0 {
+    if plans.is_empty() {
         return Ok(CodexSessionTrashSummary {
             requested_session_count: requested_ids.len(),
             trashed_session_count: 0,
             trashed_instance_count: 0,
             running_instance_count: 0,
-            official_delete_fallback_instance_count: 0,
-            metadata_rebuild_failed_instance_count: 0,
             trash_dirs: Vec::new(),
+            failures: Vec::new(),
             message: "所选会话在当前实例集合中不存在，无需处理".to_string(),
         });
     }
-
-    let mut message = if official_delete_fallback_count == 0 {
-        format!(
-            "已将 {} 条会话移到废纸篓，并已在官方 Codex 中删除",
-            trashed_session_ids.len()
-        )
-    } else {
-        format!(
-            "已将 {} 条会话移到废纸篓，并已触发官方 Codex 重建会话索引",
-            trashed_session_ids.len()
-        )
-    };
-    if mutated_running_instance_count > 0 {
-        message.push_str("；运行中的实例可能需要刷新或重启后显示");
+    let trash_root = create_trash_root_dir()?;
+    // Finish all recoverable copies before the first irreversible official delete.
+    for (instance, _, snapshots) in &plans {
+        for snapshot in snapshots {
+            copy_snapshot_rollout_to_trash(instance, &trash_root, snapshot)?;
+        }
     }
-    if official_delete_fallback_count > 0 {
-        message.push_str(&format!(
-            "；{} 个实例的官方删除未完成，已按文件方式移除，Codex 重启后会同步",
-            official_delete_fallback_count
-        ));
-    }
-    if metadata_rebuild_failed_count > 0 {
-        message.push_str(&format!(
-            "；{} 个实例的官方侧边栏索引重建未完成，重启 Codex 后会重新加载",
-            metadata_rebuild_failed_count
-        ));
+    let mut deleted_ids = HashSet::new();
+    let mut running = 0;
+    let mut completed_instances = 0;
+    let mut failures = Vec::new();
+    for (instance, roots, snapshots) in &plans {
+        let result =
+            match modules::codex_official_app_server::delete_threads(&instance.data_dir, roots) {
+                Ok(result) => result,
+                Err(error) => modules::codex_official_app_server::ThreadDeleteResult {
+                    deleted: Vec::new(),
+                    failures: vec![error],
+                },
+            };
+        failures.extend(
+            result
+                .failures
+                .into_iter()
+                .map(|error| format!("{}: {}", instance.name, error)),
+        );
+        if !result.deleted.is_empty() {
+            completed_instances += 1;
+            if is_instance_running(instance, &process_entries) {
+                running += 1;
+            }
+        }
+        let mut family: HashSet<String> = result.deleted.into_iter().collect();
+        loop {
+            let next: Vec<String> = snapshots
+                .iter()
+                .filter(|snapshot| {
+                    !family.contains(&snapshot.id)
+                        && snapshot
+                            .parent_thread_id
+                            .as_ref()
+                            .is_some_and(|id| family.contains(id))
+                })
+                .map(|snapshot| snapshot.id.clone())
+                .collect();
+            if next.is_empty() {
+                break;
+            }
+            family.extend(next);
+        }
+        // Internal review agents may not participate in the official spawn cascade.
+        let survivors = snapshots.iter().rev()
+            .filter(|snapshot| family.contains(&snapshot.id) && snapshot.rollout_path.exists())
+            .map(|snapshot| snapshot.id.clone()).collect::<Vec<_>>();
+        if !survivors.is_empty() {
+            match modules::codex_official_app_server::delete_threads(&instance.data_dir, &survivors) {
+                Ok(result) => failures.extend(result.failures),
+                Err(error) => failures.push(error),
+            }
+        }
+        family.retain(|id| snapshots.iter().any(|snapshot| &snapshot.id == id && !snapshot.rollout_path.exists()));
+        for snapshot in snapshots {
+            let entry = trash_root.join(format!(
+                "{}--{}",
+                sanitize_for_file_name(&instance.id),
+                sanitize_for_file_name(&snapshot.id)
+            ));
+            if let Err(error) = finish_delete_backup(&entry, family.contains(&snapshot.id)) {
+                failures.push(format!("{}: {}", snapshot.id, error));
+            }
+        }
+        deleted_ids.extend(family);
     }
 
     Ok(CodexSessionTrashSummary {
         requested_session_count: requested_ids.len(),
-        trashed_session_count: trashed_session_ids.len(),
-        trashed_instance_count,
-        running_instance_count: mutated_running_instance_count,
-        official_delete_fallback_instance_count: official_delete_fallback_count,
-        metadata_rebuild_failed_instance_count: metadata_rebuild_failed_count,
+        trashed_session_count: deleted_ids.len(),
+        trashed_instance_count: completed_instances,
+        running_instance_count: running,
         trash_dirs: vec![trash_root.to_string_lossy().to_string()],
-        message,
+        failures,
+        message: format!(
+            "已备份并通过官方 Codex 删除 {} 条会话（含子代理）",
+            deleted_ids.len()
+        ),
     })
 }
 
@@ -879,6 +893,8 @@ pub fn list_trashed_sessions_across_instances() -> Result<Vec<CodexTrashedSessio
                 size_bytes: 0,
                 location_count: 0,
                 locations: Vec::new(),
+                parent_thread_id: entry.manifest.parent_thread_id.clone(),
+                session_kind: entry.manifest.session_kind.clone(),
             });
 
         if deleted_at.unwrap_or_default() > record.deleted_at.unwrap_or_default() {
@@ -889,6 +905,12 @@ pub fn list_trashed_sessions_across_instances() -> Result<Vec<CodexTrashedSessio
         }
         if record.cwd.trim().is_empty() {
             record.cwd = entry.manifest.cwd.clone();
+        }
+        if record.parent_thread_id.is_none() {
+            record.parent_thread_id = entry.manifest.parent_thread_id.clone();
+        }
+        if record.session_kind.is_none() {
+            record.session_kind = entry.manifest.session_kind.clone();
         }
 
         record.locations.push(CodexTrashedSessionLocation {
@@ -925,10 +947,9 @@ pub fn delete_trashed_sessions_across_instances(
         return Err("请至少选择一条会话".to_string());
     }
 
-    let entries = load_trash_entries()?
-        .into_iter()
-        .filter(|entry| requested_ids.contains(&entry.manifest.session_id))
-        .collect::<Vec<_>>();
+    let all_entries = load_trash_entries()?;
+    reject_selected_trashed_children(&all_entries, &requested_ids)?;
+    let entries = select_trash_family_entries(&all_entries, &requested_ids);
 
     if entries.is_empty() {
         return Ok(CodexSessionTrashDeleteSummary {
@@ -1011,6 +1032,65 @@ pub fn empty_session_trash_across_instances() -> Result<CodexSessionTrashDeleteS
     })
 }
 
+fn reject_selected_trashed_children(
+    entries: &[TrashedSessionEntry],
+    requested_ids: &HashSet<String>,
+) -> Result<(), String> {
+    if let Some(child) = entries.iter().find(|entry| {
+        requested_ids.contains(&entry.manifest.session_id)
+            && (entry.manifest.parent_thread_id.is_some()
+                || entry.manifest.session_kind.as_deref() == Some("subagent"))
+    }) {
+        return Err(format!(
+            "不能单独操作子代理会话 {}；请选择其主会话",
+            child.manifest.session_id
+        ));
+    }
+    Ok(())
+}
+
+/// Expand a selected root only through explicit parent links in its own trash batch and instance.
+/// Older manifests have no parent metadata and remain individually restorable.
+fn select_trash_family_entries(
+    entries: &[TrashedSessionEntry],
+    requested_ids: &HashSet<String>,
+) -> Vec<TrashedSessionEntry> {
+    let mut selected = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| requested_ids.contains(&entry.manifest.session_id))
+        .map(|(index, _)| index)
+        .collect::<HashSet<_>>();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (index, candidate) in entries.iter().enumerate() {
+            if selected.contains(&index) {
+                continue;
+            }
+            let Some(parent_id) = candidate.manifest.parent_thread_id.as_deref() else {
+                continue;
+            };
+            if selected.iter().any(|parent_index| {
+                let parent = &entries[*parent_index];
+                parent.manifest.session_id == parent_id
+                    && parent.entry_dir.parent() == candidate.entry_dir.parent()
+                    && parent.manifest.instance_id == candidate.manifest.instance_id
+                    && parent.manifest.instance_root == candidate.manifest.instance_root
+            }) {
+                selected.insert(index);
+                changed = true;
+            }
+        }
+    }
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| selected.contains(index))
+        .map(|(_, entry)| entry.clone())
+        .collect()
+}
+
 pub fn restore_sessions_from_trash_across_instances(
     session_ids: Vec<String>,
 ) -> Result<CodexSessionRestoreSummary, String> {
@@ -1023,10 +1103,9 @@ pub fn restore_sessions_from_trash_across_instances(
         return Err("请至少选择一条会话".to_string());
     }
 
-    let entries = load_trash_entries()?
-        .into_iter()
-        .filter(|entry| requested_ids.contains(&entry.manifest.session_id))
-        .collect::<Vec<_>>();
+    let all_entries = load_trash_entries()?;
+    reject_selected_trashed_children(&all_entries, &requested_ids)?;
+    let mut entries = select_trash_family_entries(&all_entries, &requested_ids);
 
     if entries.is_empty() {
         return Ok(CodexSessionRestoreSummary {
@@ -1036,6 +1115,12 @@ pub fn restore_sessions_from_trash_across_instances(
             message: "所选会话在废纸篓中不存在，无需恢复".to_string(),
         });
     }
+
+    // Official archive cascades to descendants. Restore active backups last so
+    // an archived parent's registration cannot leave an active child archived.
+    entries.sort_by_key(|entry| {
+        !Path::new(&entry.manifest.relative_rollout_path).starts_with("archived_sessions")
+    });
 
     let instances = collect_instances()?;
     let process_entries = modules::process::collect_codex_process_entries();
@@ -1047,13 +1132,9 @@ pub fn restore_sessions_from_trash_across_instances(
 
     let mut restored_session_ids = HashSet::new();
     let mut restored_instance_ids = HashSet::new();
-    let mut metadata_rebuild_failed_count = 0usize;
 
     for entry in &entries {
-        let outcome = restore_trashed_session_entry(entry)?;
-        if outcome.metadata_rebuild_failed {
-            metadata_rebuild_failed_count += 1;
-        }
+        restore_trashed_session_entry(entry)?;
         restored_session_ids.insert(entry.manifest.session_id.clone());
         restored_instance_ids.insert(entry.manifest.instance_id.clone());
     }
@@ -1061,23 +1142,17 @@ pub fn restore_sessions_from_trash_across_instances(
     let restored_running_instance = restored_instance_ids
         .iter()
         .any(|instance_id| running_instance_ids.contains(instance_id));
-    let mut message = if restored_running_instance {
+    let message = if restored_running_instance {
         format!(
-            "已恢复 {} 条会话，并已触发官方 Codex 重建会话索引；运行中的实例可能需要刷新或重启后显示",
+            "已恢复 {} 条会话，并已通过官方 Codex 确认恢复；运行中的实例可能需要刷新或重启后显示",
             restored_session_ids.len()
         )
     } else {
         format!(
-            "已恢复 {} 条会话，并已触发官方 Codex 重建会话索引",
+            "已恢复 {} 条会话，并已通过官方 Codex 确认恢复",
             restored_session_ids.len()
         )
     };
-    if metadata_rebuild_failed_count > 0 {
-        message.push_str(&format!(
-            "；{} 个实例的官方侧边栏索引重建未完成，重启 Codex 后会重新加载",
-            metadata_rebuild_failed_count
-        ));
-    }
 
     Ok(CodexSessionRestoreSummary {
         requested_session_count: requested_ids.len(),
@@ -1096,29 +1171,29 @@ pub fn preview_session_export(
     }
 
     let (_export_staging, selected_entries) =
-        prepare_export_session_entries(collect_export_session_entries(&requested_ids)?)?;
+        prepare_export_session_sources(collect_export_session_sources(&requested_ids)?)?;
     let mut items = Vec::with_capacity(selected_entries.len());
     let mut total_size_bytes = 0u64;
 
-    for (instance, snapshot) in &selected_entries {
-        let size_bytes = fs::metadata(&snapshot.rollout_path)
+    for source in &selected_entries {
+        let size_bytes = fs::metadata(&source.rollout_path)
             .map_err(|error| {
                 format!(
                     "读取会话文件大小失败 ({}): {}",
-                    snapshot.rollout_path.display(),
+                    source.rollout_path.display(),
                     error
                 )
             })?
             .len();
         total_size_bytes = total_size_bytes.saturating_add(size_bytes);
         items.push(CodexSessionExportPreviewItem {
-            session_id: snapshot.id.clone(),
-            title: snapshot.title.clone(),
-            cwd: snapshot.cwd.clone(),
-            updated_at: snapshot.updated_at,
+            session_id: source.session_id.clone(),
+            title: source.title.clone(),
+            cwd: source.cwd.clone(),
+            updated_at: source.updated_at,
             size_bytes,
-            source_instance_id: instance.id.clone(),
-            source_instance_name: instance.name.clone(),
+            source_instance_id: source.source_instance_id.clone(),
+            source_instance_name: source.source_instance_name.clone(),
         });
     }
 
@@ -1141,16 +1216,34 @@ pub fn export_sessions(
     if requested_ids.is_empty() {
         return Err("请至少选择一条会话".to_string());
     }
+    let sources = collect_export_session_sources(&requested_ids)?;
+    export_session_package(
+        sources,
+        requested_ids.len(),
+        export_path,
+        transfer_id,
+        progress_reporter,
+    )
+}
+
+pub(crate) fn export_session_package(
+    sources: Vec<SessionPackageSource>,
+    requested_count: usize,
+    export_path: String,
+    transfer_id: Option<String>,
+    progress_reporter: Option<SessionTransferProgressReporter<'_>>,
+) -> Result<CodexSessionExportSummary, String> {
     emit_session_transfer_progress(
         progress_reporter,
         transfer_id.as_deref(),
         "export",
         "collect",
         0,
-        requested_ids.len(),
+        requested_count,
         None,
         true,
     );
+    let (_export_staging, sources) = prepare_export_session_sources(sources)?;
     let export_path = PathBuf::from(export_path.trim());
     if export_path.as_os_str().is_empty() {
         return Err("请选择会话导出文件".to_string());
@@ -1163,50 +1256,47 @@ pub fn export_sessions(
         }
     }
 
-    let (_export_staging, selected_entries) =
-        prepare_export_session_entries(collect_export_session_entries(&requested_ids)?)?;
-    if selected_entries.is_empty() {
+    if sources.is_empty() {
         return Ok(CodexSessionExportSummary {
-            requested_session_count: requested_ids.len(),
+            requested_session_count: requested_count,
             exported_session_count: 0,
-            skipped_session_count: requested_ids.len(),
+            skipped_session_count: requested_count,
             export_path: export_path.to_string_lossy().to_string(),
             message: "所选会话在当前实例集合中不存在，未导出任何内容".to_string(),
         });
     }
 
-    let mut manifest_items = Vec::with_capacity(selected_entries.len());
-    for (index, (instance, snapshot)) in selected_entries.iter().enumerate() {
+    let mut manifest_items = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
         emit_session_transfer_progress(
             progress_reporter,
             transfer_id.as_deref(),
             "export",
             "hash",
             index,
-            selected_entries.len(),
-            Some(snapshot.title.clone()),
+            sources.len(),
+            Some(source.title.clone()),
             true,
         );
-        let (size_bytes, sha256) = sha256_file(&snapshot.rollout_path)?;
-        let relative_rollout_path = snapshot_relative_rollout_path(snapshot);
+        let (size_bytes, sha256) = sha256_file(&source.rollout_path)?;
         let file_entry = format!(
             "files/{:04}-{}/rollout.jsonl",
             index + 1,
-            sanitize_for_file_name(&snapshot.id)
+            sanitize_for_file_name(&source.session_id)
         );
         manifest_items.push(SessionExportManifestItem {
-            session_id: snapshot.id.clone(),
-            title: snapshot.title.clone(),
-            cwd: snapshot.cwd.clone(),
-            updated_at: snapshot.updated_at,
-            relative_rollout_path,
+            session_id: source.session_id.clone(),
+            title: source.title.clone(),
+            cwd: source.cwd.clone(),
+            updated_at: source.updated_at,
+            relative_rollout_path: source.relative_rollout_path.clone(),
             file_entry,
             size_bytes,
             sha256,
-            session_index_entry: snapshot.session_index_entry.clone(),
+            session_index_entry: source.session_index_entry.clone(),
             source_instance: SessionExportInstance {
-                id: instance.id.clone(),
-                name: instance.name.clone(),
+                id: source.source_instance_id.clone(),
+                name: source.source_instance_name.clone(),
             },
         });
     }
@@ -1231,7 +1321,7 @@ pub fn export_sessions(
     write_session_export_package(
         &export_path,
         &manifest,
-        &selected_entries,
+        &sources,
         transfer_id.as_deref(),
         progress_reporter,
     )?;
@@ -1247,9 +1337,9 @@ pub fn export_sessions(
     );
 
     Ok(CodexSessionExportSummary {
-        requested_session_count: requested_ids.len(),
+        requested_session_count: requested_count,
         exported_session_count: manifest.sessions.len(),
-        skipped_session_count: requested_ids.len().saturating_sub(manifest.sessions.len()),
+        skipped_session_count: requested_count.saturating_sub(manifest.sessions.len()),
         export_path: export_path.to_string_lossy().to_string(),
         message: format!("已导出 {} 条会话", manifest.sessions.len()),
     })
@@ -1265,16 +1355,12 @@ pub fn preview_session_import(
     }
     let manifest = read_session_export_manifest_from_path(&import_file_path)?;
     let target = resolve_session_import_target(target_instance_id)?;
-    let target_snapshots = load_thread_snapshots(&target)?;
     let target_index = read_session_index_map(&target.data_dir)?;
-    let target_by_id = target_snapshots
-        .into_iter()
-        .map(|snapshot| (snapshot.id.clone(), snapshot))
-        .collect::<HashMap<_, _>>();
     let existing_instance_names = collect_existing_session_instance_names()?;
 
     let mut recovery_archive = ZipArchive::new(File::open(&import_file_path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
+    let target_by_id = load_import_target_snapshots(&target, &manifest, &mut recovery_archive, &HashMap::new())?;
     let mut items = Vec::with_capacity(manifest.sessions.len());
     for item in &manifest.sessions {
         let mut status = "ready".to_string();
@@ -1285,7 +1371,7 @@ pub fn preview_session_import(
             reason = Some("会话包条目无效".to_string());
         } else if let Some(existing) = target_by_id.get(&item.session_id) {
             let indexed = target_index.contains_key(&item.session_id);
-            let existing_hash = sha256_file(&existing.rollout_path)
+            let existing_hash = sha256_rollout(&existing.rollout_path)
                 .map(|(_, hash)| hash).unwrap_or_default();
             let recoverable = !indexed && imported_rollout_matches(
                 &mut recovery_archive, item, &existing.rollout_path,
@@ -1378,9 +1464,6 @@ pub fn import_sessions(
         .map(|item| (item.session_id.clone(), item.clone()))
         .collect::<HashMap<_, _>>();
 
-    let target_snapshots = load_thread_snapshots(&target)?.into_iter()
-        .map(|snapshot| (snapshot.id.clone(), snapshot)).collect::<HashMap<_, _>>();
-    let mut target_session_ids = target_snapshots.keys().cloned().collect::<HashSet<_>>();
     let mut imported_count = 0usize;
     let mut skipped_count = 0usize;
     let mut mapped_threads = Vec::new();
@@ -1390,6 +1473,8 @@ pub fn import_sessions(
         .map_err(|error| format!("打开会话包失败 ({}): {}", import_file_path.display(), error))?;
     let mut archive =
         ZipArchive::new(file).map_err(|error| format!("读取会话包失败: {}", error))?;
+    let target_snapshots = load_import_target_snapshots(&target, &manifest, &mut archive, &cwd_mappings)?;
+    let mut target_session_ids = target_snapshots.keys().cloned().collect::<HashSet<_>>();
 
     for (index, session_id) in requested_ids.iter().enumerate() {
         let Some(item) = manifest_by_id.get(session_id) else {
@@ -1537,7 +1622,7 @@ pub fn resolve_session_rollout_path(
             .iter()
             .find(|instance| instance.id == instance_id)
             .ok_or_else(|| "未找到所选实例".to_string())?;
-        return resolve_rollout_path_from_snapshots(load_thread_snapshots(instance)?, &session_id);
+        return resolve_rollout_path_in_instance(&instance.data_dir, &session_id);
     }
 
     let mut best_snapshot: Option<ThreadSnapshot> = None;
@@ -1563,22 +1648,13 @@ pub fn resolve_session_rollout_path(
     Ok(snapshot.rollout_path)
 }
 
-fn resolve_rollout_path_from_snapshots(
-    snapshots: Vec<ThreadSnapshot>,
-    session_id: &str,
-) -> Result<PathBuf, String> {
-    let mut matches = snapshots
-        .into_iter()
-        .filter(|snapshot| snapshot.id == session_id)
-        .map(|snapshot| snapshot.rollout_path)
-        .collect::<Vec<_>>();
-    matches.sort();
-    matches.dedup();
-    match matches.as_slice() {
-        [] => Err("未在所选实例中找到该会话文件".to_string()),
-        [path] => Ok(path.clone()),
-        _ => Err("所选实例中存在多个同 ID 会话文件，无法确定要打开哪一个".to_string()),
-    }
+fn resolve_rollout_path_in_instance(root: &Path, session_id: &str) -> Result<PathBuf, String> {
+    let thread = modules::codex_official_app_server::read_thread(root, session_id)?;
+    thread
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("官方会话未返回文件路径: {}", session_id))
 }
 
 fn collect_instances() -> Result<Vec<CodexSyncInstance>, String> {
@@ -1618,9 +1694,9 @@ fn normalize_session_id_list(session_ids: Vec<String>) -> HashSet<String> {
 
 include!("codex_session_export_staging.rs");
 
-fn collect_export_session_entries(
+fn collect_export_session_sources(
     requested_ids: &HashSet<String>,
-) -> Result<Vec<(CodexSyncInstance, ThreadSnapshot)>, String> {
+) -> Result<Vec<SessionPackageSource>, String> {
     let instances = collect_instances()?;
     let mut selected = HashMap::<String, (CodexSyncInstance, ThreadSnapshot)>::new();
     for instance in &instances {
@@ -1649,7 +1725,7 @@ fn collect_export_session_entries(
             .cmp(&left.1.updated_at.unwrap_or_default())
             .then_with(|| left.1.title.cmp(&right.1.title))
     });
-    Ok(selected_entries)
+    Ok(selected_entries.into_iter().map(|(instance, snapshot)| snapshot_export_source(instance, snapshot)).collect())
 }
 
 fn emit_session_transfer_progress(
@@ -1744,7 +1820,7 @@ fn normalize_package_entry_path(value: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-fn validate_manifest_item(item: &SessionExportManifestItem) -> Result<(), String> {
+pub(crate) fn validate_manifest_item(item: &SessionExportManifestItem) -> Result<(), String> {
     if item.session_id.trim().is_empty() {
         return Err("会话包中存在空会话 ID".to_string());
     }
@@ -1762,7 +1838,7 @@ fn validate_manifest_item(item: &SessionExportManifestItem) -> Result<(), String
 fn write_session_export_package(
     export_path: &Path,
     manifest: &SessionExportManifest,
-    selected_entries: &[(CodexSyncInstance, ThreadSnapshot)],
+    sources: &[SessionPackageSource],
     transfer_id: Option<&str>,
     progress_reporter: Option<SessionTransferProgressReporter<'_>>,
 ) -> Result<(), String> {
@@ -1785,12 +1861,7 @@ fn write_session_export_package(
     zip.write_all(&manifest_content)
         .map_err(|error| format!("写入会话包清单失败: {}", error))?;
 
-    for (index, (item, (_, snapshot))) in manifest
-        .sessions
-        .iter()
-        .zip(selected_entries.iter())
-        .enumerate()
-    {
+    for (index, (item, source)) in manifest.sessions.iter().zip(sources.iter()).enumerate() {
         emit_session_transfer_progress(
             progress_reporter,
             transfer_id,
@@ -1803,14 +1874,14 @@ fn write_session_export_package(
         );
         zip.start_file(item.file_entry.as_str(), options)
             .map_err(|error| format!("写入会话包文件失败 ({}): {}", item.file_entry, error))?;
-        let mut source = File::open(&snapshot.rollout_path).map_err(|error| {
+        let mut input = File::open(&source.rollout_path).map_err(|error| {
             format!(
                 "打开会话 rollout 文件失败 ({}): {}",
-                snapshot.rollout_path.display(),
+                source.rollout_path.display(),
                 error
             )
         })?;
-        std::io::copy(&mut source, &mut zip)
+        std::io::copy(&mut input, &mut zip)
             .map_err(|error| format!("写入会话包文件失败 ({}): {}", item.file_entry, error))?;
         emit_session_transfer_progress(
             progress_reporter,
@@ -1829,7 +1900,7 @@ fn write_session_export_package(
     Ok(())
 }
 
-fn read_session_export_manifest_from_path(
+pub(crate) fn read_session_export_manifest_from_path(
     import_file_path: &Path,
 ) -> Result<SessionExportManifest, String> {
     let file = File::open(import_file_path)
@@ -1837,6 +1908,40 @@ fn read_session_export_manifest_from_path(
     let mut archive =
         ZipArchive::new(file).map_err(|error| format!("读取会话包失败: {}", error))?;
     read_session_export_manifest(&mut archive)
+}
+
+pub(crate) fn read_session_export_entry_bytes(
+    import_file_path: &Path,
+    item: &SessionExportManifestItem,
+) -> Result<Vec<u8>, String> {
+    const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+    validate_manifest_item(item)?;
+    if item.size_bytes > MAX_ENTRY_BYTES {
+        return Err(format!("会话包文件超过 64 MiB 限制: {}", item.session_id));
+    }
+    let entry_name = normalize_package_entry_path(&item.file_entry)
+        .ok_or_else(|| format!("会话包文件路径无效: {}", item.file_entry))?;
+    let file = File::open(import_file_path)
+        .map_err(|error| format!("打开会话包失败 ({}): {}", import_file_path.display(), error))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| format!("读取会话包失败: {}", error))?;
+    let entry = archive
+        .by_name(&entry_name)
+        .map_err(|error| format!("会话包缺少会话文件 ({}): {}", entry_name, error))?;
+    let mut bytes = Vec::with_capacity(item.size_bytes as usize);
+    entry
+        .take(MAX_ENTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取会话包文件失败 ({}): {}", entry_name, error))?;
+    if bytes.len() as u64 != item.size_bytes {
+        return Err(format!("会话包文件大小校验失败: {}", item.session_id));
+    }
+    let hash = hex_lower(Sha256::digest(&bytes).as_slice());
+    if !hash.eq_ignore_ascii_case(&item.sha256) {
+        return Err(format!("会话包文件校验失败: {}", item.session_id));
+    }
+    modules::codex_session_import_paths::ensure_standalone_rollout(&bytes)?;
+    Ok(bytes)
 }
 
 fn read_session_export_manifest(
@@ -1877,10 +1982,14 @@ fn resolve_import_target_rollout_path(
     target_root: &Path,
     item: &SessionExportManifestItem,
 ) -> PathBuf {
-    let relative_path = normalize_package_entry_path(&item.relative_rollout_path)
-        .filter(|path| is_safe_rollout_relative_path(path))
-        .unwrap_or_else(|| generated_import_rollout_relative_path(&item.session_id));
+    let relative_path = package_import_relative_path(item);
     target_root.join(PathBuf::from(relative_path))
+}
+
+pub(crate) fn package_import_relative_path(item: &SessionExportManifestItem) -> String {
+    normalize_package_entry_path(&item.relative_rollout_path)
+        .filter(|path| is_safe_rollout_relative_path(path))
+        .unwrap_or_else(|| generated_import_rollout_relative_path(&item.session_id))
 }
 
 fn is_safe_rollout_relative_path(value: &str) -> bool {
@@ -2047,7 +2156,70 @@ fn imported_rollout_matches(
     let staging = tempfile::tempdir().map_err(|e| e.to_string())?;
     let expected = staging.path().join("rollout-expected.jsonl");
     write_imported_rollout_from_archive(archive, item, &expected, cwd_override)?;
-    Ok(sha256_file(&expected)? == sha256_file(rollout)?)
+    Ok(sha256_file(&expected)? == sha256_rollout(rollout)?)
+}
+
+fn load_import_target_snapshots(
+    target: &CodexSyncInstance,
+    manifest: &SessionExportManifest,
+    archive: &mut ZipArchive<File>,
+    cwd_mappings: &HashMap<String, String>,
+) -> Result<HashMap<String, ThreadSnapshot>, String> {
+    let mut snapshots = load_thread_snapshots(target)?.into_iter()
+        .map(|snapshot| (snapshot.id.clone(), snapshot)).collect::<HashMap<_, _>>();
+    for item in &manifest.sessions {
+        if snapshots.contains_key(&item.session_id) || validate_manifest_item(item).is_err() {
+            continue;
+        }
+        // A failed index publication may leave history absent from the official
+        // DB. Inspect only this package's destination and its collision names.
+        let destination = resolve_import_target_rollout_path(&target.data_dir, item);
+        let Some(parent) = destination.parent().filter(|parent| parent.is_dir()) else { continue; };
+        let stem = destination.file_stem().and_then(|name| name.to_str()).ok_or("Invalid import filename")?;
+        let prefix = format!("{stem}-import-");
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(parent).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if !entry.file_type().map_err(|error| error.to_string())?.is_file() { continue; }
+            let path = rollout::logical_path(&entry.path());
+            let collision = path.file_name().and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|name| name.strip_suffix(".jsonl"))
+                .is_some_and(|suffix| suffix.parse::<usize>().is_ok_and(|number| (1..1000).contains(&number))
+                    || Uuid::parse_str(suffix).is_ok());
+            if path == destination || collision { candidates.push(path); }
+        }
+        candidates.sort();
+        candidates.dedup();
+        let mut conflict = None;
+        for path in candidates {
+            let Some(meta) = read_rollout_session_meta(&path)? else { continue; };
+            if session_meta_id(&meta).as_deref() != Some(item.session_id.as_str()) { continue; }
+            let cwd = session_meta_cwd(&meta).unwrap_or_else(|| item.cwd.clone());
+            let mapped_cwd = resolve_import_cwd_mapping(&item.cwd, cwd_mappings)
+                .or_else(|| (cwd != item.cwd).then_some(cwd.as_str()));
+            let matches = imported_rollout_matches(archive, item, &path, mapped_cwd)?;
+            let snapshot = ThreadSnapshot {
+                archived: path.starts_with(target.data_dir.join("archived_sessions")),
+                session_kind: classify_session_kind(&meta),
+                parent_thread_id: parent_thread_id(&meta),
+                id: item.session_id.clone(), title: item.title.clone(), cwd,
+                project_name: None, updated_at: item.updated_at, rollout_path: path,
+                session_index_entry: item.session_index_entry.clone(),
+                source_root: target.data_dir.clone(),
+            };
+            if matches {
+                snapshots.insert(item.session_id.clone(), snapshot);
+                conflict = None;
+                break;
+            }
+            // Keep changed history visible to import conflict handling so a retry
+            // cannot silently publish another copy of the same session.
+            conflict.get_or_insert(snapshot);
+        }
+        if let Some(snapshot) = conflict { snapshots.insert(item.session_id.clone(), snapshot); }
+    }
+    Ok(snapshots)
 }
 
 fn repair_imported_session_index(
@@ -2128,6 +2300,17 @@ fn build_imported_session_index_entry(
     imported
 }
 
+fn sha256_rollout(path: &Path) -> Result<(u64, String), String> {
+    let path = rollout::resolve_path(path).map_err(|error| error.to_string())?;
+    if !rollout_reader::is_compressed(&path) {
+        return sha256_file(&path);
+    }
+    let staging = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let decoded = staging.path().join("rollout.jsonl");
+    rollout_reader::materialize_bounded(&path, &decoded).map_err(|error| error.to_string())?;
+    sha256_file(&decoded)
+}
+
 fn sha256_file(path: &Path) -> Result<(u64, String), String> {
     let mut file = File::open(path)
         .map_err(|error| format!("打开文件失败 ({}): {}", path.display(), error))?;
@@ -2172,100 +2355,33 @@ fn is_instance_running(
 }
 
 fn load_thread_snapshots(instance: &CodexSyncInstance) -> Result<Vec<ThreadSnapshot>, String> {
-    let session_index_map = read_session_index_map(&instance.data_dir)?;
-    let display_context = modules::codex_session_display::SessionDisplayContext::load(&instance.data_dir);
-    let mut snapshots = Vec::new();
-    for dir_name in SESSION_DIRS {
-        let root_dir = instance.data_dir.join(dir_name);
-        if !root_dir.exists() {
-            continue;
-        }
-        for rollout_path in list_rollout_files(&root_dir)? {
-            let Some(session_meta) = read_rollout_session_meta(&rollout_path)? else {
-                continue;
-            };
-            let Some(id) = session_meta_id(&session_meta) else {
-                continue;
-            };
-            let cwd = session_meta_cwd(&session_meta).unwrap_or_else(|| "未知工作目录".to_string());
-            let index_title = session_index_map
-                .get(&id)
-                .and_then(session_index_title);
-            let title = display_context
-                .resolve_title(&id, index_title.as_deref())
-                .unwrap_or_else(|| id.clone());
-            let project_name = display_context.project_name_for_cwd(&cwd);
-            let updated_at = resolve_thread_snapshot_updated_at_seconds(
-                session_index_map.get(&id),
-                &rollout_path,
-            );
-            let session_index_entry = session_index_map
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| json!({ "id": id, "thread_name": title }));
-
-            snapshots.push(ThreadSnapshot {
-                id,
-                title,
-                cwd,
-                project_name,
-                updated_at,
-                rollout_path,
-                session_index_entry,
-                source_root: instance.data_dir.clone(),
-            });
-        }
+    if !instance.data_dir.exists() {
+        return Ok(Vec::new());
     }
-
-    match rollout_reader::current_heads(&instance.data_dir) {
-        Ok(heads) => {
-            let resolved_ids = snapshots.iter().filter(|snapshot| heads.get(&snapshot.id)
-                .is_some_and(|head| rollout_reader::same_storage_path(head, &snapshot.rollout_path)))
-                .map(|snapshot| snapshot.id.clone()).collect::<HashSet<_>>();
-            snapshots.retain(|snapshot| !resolved_ids.contains(&snapshot.id) || heads.get(&snapshot.id)
-                .is_some_and(|head| rollout_reader::same_storage_path(head, &snapshot.rollout_path)));
-            // During materialization both names may coexist; the official reader prefers plain JSONL.
-            let plain_paths = snapshots.iter().filter(|snapshot| !rollout_reader::is_compressed(&snapshot.rollout_path))
-                .map(|snapshot| snapshot.rollout_path.clone()).collect::<HashSet<_>>();
-            snapshots.retain(|snapshot| !rollout_reader::is_compressed(&snapshot.rollout_path)
-                || !plain_paths.contains(&snapshot.rollout_path.with_extension("")));
+    let display = modules::codex_session_display::SessionDisplayContext::load(&instance.data_dir);
+    let mut snapshots = Vec::new();
+    for row in modules::codex_session_index::read_sessions(&instance.data_dir)? {
+        let mut metadata = json!({"source": row.source});
+        if classify_session_kind(&metadata) == "subagent" && parent_thread_id(&metadata).is_none() {
+            if let Some(meta) = read_rollout_session_meta(&row.rollout_path)? {
+                metadata["parentThreadId"] = json!(parent_thread_id(&meta));
+            }
         }
-        Err(error) => modules::logger::log_warn(&format!("[Codex Session Manager] current rollout heads unavailable: {error}")),
+        snapshots.push(ThreadSnapshot {
+            archived: row.archived,
+            session_kind: classify_session_kind(&metadata),
+            parent_thread_id: parent_thread_id(&metadata),
+            session_index_entry: json!({"id":row.id,"thread_name":row.title}),
+            project_name: display.project_name_for_cwd(&row.cwd),
+            id: row.id,
+            title: row.title,
+            cwd: row.cwd,
+            updated_at: Some(row.updated_at),
+            rollout_path: row.rollout_path,
+            source_root: instance.data_dir.clone(),
+        });
     }
     Ok(snapshots)
-}
-
-fn list_rollout_files(root_dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut result = Vec::new();
-    let entries = fs::read_dir(root_dir)
-        .map_err(|error| format!("读取目录失败 ({}): {}", root_dir.display(), error))?;
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|error| format!("读取目录项失败 ({}): {}", root_dir.display(), error))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("读取文件类型失败 ({}): {}", path.display(), error))?;
-        if file_type.is_dir() {
-            result.extend(list_rollout_files(&path)?);
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-        let file_name = path
-            .file_name()
-            .and_then(|item| item.to_str())
-            .unwrap_or_default();
-        if file_name.starts_with("rollout-")
-            && (file_name.ends_with(".jsonl") || file_name.ends_with(".jsonl.zst")) {
-            result.push(path);
-        }
-    }
-
-    result.sort();
-    Ok(result)
 }
 
 #[path = "codex_session_rollout_reader.rs"]
@@ -2302,61 +2418,6 @@ fn session_meta_cwd(meta: &JsonValue) -> Option<String> {
         .map(str::to_string)
 }
 
-fn trash_snapshots_for_instance(
-    instance: &CodexSyncInstance,
-    trash_root: &Path,
-    snapshots: &[ThreadSnapshot],
-) -> Result<TrashSnapshotsOutcome, String> {
-    trash_snapshots_for_instance_with_app_server(
-        instance,
-        trash_root,
-        snapshots,
-        |data_dir, session_ids| {
-            modules::codex_official_app_server::delete_threads(data_dir, session_ids)
-        },
-        |data_dir| modules::codex_official_app_server::rebuild_thread_metadata(data_dir),
-    )
-}
-
-fn trash_snapshots_for_instance_with_app_server<D, F>(
-    instance: &CodexSyncInstance,
-    trash_root: &Path,
-    snapshots: &[ThreadSnapshot],
-    delete_threads: D,
-    rebuild_metadata: F,
-) -> Result<TrashSnapshotsOutcome, String>
-where
-    D: FnOnce(&Path, &[String]) -> Result<usize, String>,
-    F: FnOnce(&Path) -> Result<(), String>,
-{
-    // Back up first; only the official deletion may remove live history.
-    for snapshot in snapshots {
-        copy_snapshot_rollout_to_trash(instance, trash_root, snapshot)?;
-    }
-
-    let session_ids = snapshots
-        .iter()
-        .map(|snapshot| snapshot.id.clone())
-        .collect::<Vec<_>>();
-    // Never bypass the official dependency checks: a paginated fork may still
-    // reference this rollout. A timeout is also an unknown outcome, not consent
-    // to unlink history or rewrite a concurrently appended index.
-    let deletion = delete_threads(&instance.data_dir, &session_ids).and_then(|count| {
-        if count == session_ids.len() { Ok(()) }
-        else { Err(format!("thread/delete confirmed {count}/{}", session_ids.len())) }
-    });
-    deletion.map_err(|error| modules::i18n::translate(
-        &modules::config::get_user_config().language,
-        "codex.sessionManager.messages.deleteNotConfirmed",
-        &[("error", &error)],
-    ))?;
-    let _ = rebuild_metadata; // Official deletion owns its metadata transaction.
-    Ok(TrashSnapshotsOutcome {
-        metadata_rebuild_failed: false,
-        official_delete_failed: false,
-    })
-}
-
 fn create_trash_root_dir() -> Result<PathBuf, String> {
     let root = get_session_trash_base_dir()?.join(Utc::now().format("%Y%m%d-%H%M%S").to_string());
     fs::create_dir_all(&root)
@@ -2391,20 +2452,60 @@ fn get_session_trash_roots_for_read() -> Result<Vec<TrashRoot>, String> {
 }
 
 /// 把会话文件复制进废纸篓（保留修改时间）。删除动作在官方 app-server 中执行成功时
-/// 会移除原文件；未成功时保留原件和备份，不绕过官方依赖检查。
+/// 会移除原文件；未确认删除时保留原件与备份，不绕过官方依赖检查。
+fn finish_delete_backup(entry: &Path, deleted: bool) -> Result<(), String> {
+    let path = entry.join("manifest.json");
+    let mut manifest: JsonValue =
+        serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if deleted {
+        manifest["deletionPending"] = json!(false);
+        return modules::atomic_write::write_string_atomic(&path, &manifest.to_string())
+            .map_err(|e| e.to_string());
+    }
+    let original = Path::new(
+        manifest["originalRolloutPath"]
+            .as_str()
+            .ok_or("缺少原会话路径")?,
+    );
+    let backup = entry.join("files").join(
+        manifest["relativeRolloutPath"]
+            .as_str()
+            .ok_or("缺少备份路径")?,
+    );
+    if let (Ok(original_hash), Ok(backup_hash)) = (sha256_file(original), sha256_file(&backup)) {
+        if original_hash == backup_hash {
+            return fs::remove_dir_all(entry).map_err(|e| e.to_string());
+        }
+    }
+    Err(format!(
+        "删除结果或原文件状态不确定，备份保留供排查，不进入废纸篓：{}",
+        entry.display()
+    ))
+}
+
 fn copy_snapshot_rollout_to_trash(
     instance: &CodexSyncInstance,
     trash_root: &Path,
     snapshot: &ThreadSnapshot,
 ) -> Result<(), String> {
-    if !snapshot.rollout_path.exists() {
-        return Ok(());
+    if !snapshot.rollout_path.is_file() {
+        return Err(format!(
+            "会话文件不存在，无法备份，未执行删除: {}",
+            snapshot.rollout_path.display()
+        ));
     }
 
-    let relative_path = snapshot
-        .rollout_path
-        .strip_prefix(&snapshot.source_root)
-        .unwrap_or(snapshot.rollout_path.as_path());
+    let source_root = fs::canonicalize(&snapshot.source_root)
+        .map_err(|error| format!("无法定位会话根目录: {}", error))?;
+    let source_path = fs::canonicalize(&snapshot.rollout_path)
+        .map_err(|error| format!("无法定位会话文件: {}", error))?;
+    let relative_path = source_path.strip_prefix(&source_root).map_err(|_| {
+        format!(
+            "会话路径不在实例目录中，未执行删除: {}",
+            source_path.display()
+        )
+    })?;
     let entry_dir = trash_root.join(format!(
         "{}--{}",
         sanitize_for_file_name(&instance.id),
@@ -2417,6 +2518,7 @@ fn copy_snapshot_rollout_to_trash(
     }
 
     let manifest = json!({
+        "deletionPending": true,
         "sessionId": snapshot.id,
         "title": snapshot.title,
         "cwd": snapshot.cwd,
@@ -2427,6 +2529,8 @@ fn copy_snapshot_rollout_to_trash(
         "relativeRolloutPath": relative_path.to_string_lossy(),
         "sessionIndexEntry": snapshot.session_index_entry,
         "deletedAt": Utc::now().to_rfc3339(),
+        "parentThreadId": snapshot.parent_thread_id,
+        "sessionKind": snapshot.session_kind,
     });
 
     fs::create_dir_all(&entry_dir)
@@ -2501,46 +2605,6 @@ fn sanitize_for_file_name(value: &str) -> String {
             }
         })
         .collect::<String>()
-}
-
-fn session_index_title(entry: &JsonValue) -> Option<String> {
-    ["thread_name", "threadName", "title", "name"]
-        .iter()
-        .filter_map(|key| entry.get(*key))
-        .find_map(|value| value.as_str().map(str::trim))
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn parse_session_index_updated_at_seconds(entry: &JsonValue) -> Option<i64> {
-    [
-        "updated_at",
-        "updatedAt",
-        "last_updated_at",
-        "lastUpdatedAt",
-    ]
-    .iter()
-    .filter_map(|key| entry.get(*key))
-    .find_map(parse_json_timestamp_seconds)
-}
-
-fn resolve_thread_snapshot_updated_at_seconds(
-    session_index_entry: Option<&JsonValue>,
-    rollout_path: &Path,
-) -> Option<i64> {
-    let indexed = session_index_entry.and_then(parse_session_index_updated_at_seconds);
-    let activity = rollout_file_activity_seconds(rollout_path);
-    let resolved = match (indexed, activity) {
-        (Some(indexed), Some(activity))
-            if indexed.abs_diff(activity) > SESSION_INDEX_ACTIVITY_DRIFT_SECONDS as u64 =>
-        {
-            Some(activity)
-        }
-        (Some(indexed), _) => Some(indexed),
-        (None, Some(activity)) => Some(activity),
-        (None, None) => None,
-    };
-    resolved.or_else(|| rollout_file_modified_seconds(rollout_path))
 }
 
 fn rollout_file_activity_seconds(path: &Path) -> Option<i64> {
@@ -2775,7 +2839,12 @@ fn load_trash_entries_from_root(root: &TrashRoot) -> Result<Vec<TrashedSessionEn
                     error
                 )
             })?;
-            let manifest = serde_json::from_str::<TrashedSessionManifest>(&manifest_content)
+            let raw: JsonValue = serde_json::from_str(&manifest_content)
+                .map_err(|e| format!("解析废纸篓清单失败: {e}"))?;
+            if raw.get("deletionPending").and_then(JsonValue::as_bool) == Some(true) {
+                continue;
+            }
+            let mut manifest = serde_json::from_str::<TrashedSessionManifest>(&manifest_content)
                 .map_err(|error| {
                     format!(
                         "解析会话废纸篓清单失败 ({}): {}",
@@ -2786,6 +2855,7 @@ fn load_trash_entries_from_root(root: &TrashRoot) -> Result<Vec<TrashedSessionEn
             let trashed_rollout_path = entry_path
                 .join("files")
                 .join(PathBuf::from(&manifest.relative_rollout_path));
+            hydrate_trash_relation(&mut manifest, &trashed_rollout_path)?;
             entries.push(TrashedSessionEntry {
                 entry_dir: entry_path,
                 manifest,
@@ -2795,6 +2865,25 @@ fn load_trash_entries_from_root(root: &TrashRoot) -> Result<Vec<TrashedSessionEn
     }
 
     Ok(entries)
+}
+
+fn hydrate_trash_relation(
+    manifest: &mut TrashedSessionManifest,
+    trashed_rollout_path: &Path,
+) -> Result<(), String> {
+    if (manifest.parent_thread_id.is_none() || manifest.session_kind.is_none())
+        && trashed_rollout_path.is_file()
+    {
+        if let Some(meta) = read_rollout_session_meta(trashed_rollout_path)? {
+            if manifest.parent_thread_id.is_none() {
+                manifest.parent_thread_id = parent_thread_id(&meta);
+            }
+            if manifest.session_kind.is_none() {
+                manifest.session_kind = Some(classify_session_kind(&meta));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[path = "codex_session_restore_publish.rs"]
@@ -2826,40 +2915,6 @@ fn format_session_index_updated_at(seconds: i64) -> String {
         .single()
         .unwrap_or_else(Utc::now)
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-}
-
-fn build_restored_session_index_entry(
-    entry: &TrashedSessionEntry,
-    rollout_path: &Path,
-) -> JsonValue {
-    let mut restored = entry.manifest.session_index_entry.clone();
-    if !restored.is_object() {
-        restored = json!({});
-    }
-    let Some(object) = restored.as_object_mut() else {
-        return json!({
-            "id": entry.manifest.session_id.clone(),
-            "thread_name": entry.manifest.title.clone(),
-        });
-    };
-    object.insert(
-        "id".to_string(),
-        JsonValue::String(entry.manifest.session_id.clone()),
-    );
-    if !entry.manifest.title.trim().is_empty() {
-        object
-            .entry("thread_name".to_string())
-            .or_insert_with(|| JsonValue::String(entry.manifest.title.clone()));
-    }
-    if let Some(updated_at) = rollout_file_activity_seconds(rollout_path)
-        .or_else(|| rollout_file_modified_seconds(rollout_path))
-    {
-        object.insert(
-            "updated_at".to_string(),
-            JsonValue::String(format_session_index_updated_at(updated_at)),
-        );
-    }
-    restored
 }
 
 fn merge_session_index_entry(existing: JsonValue, restored: &JsonValue) -> JsonValue {
@@ -2999,30 +3054,194 @@ mod tests {
     include!("codex_session_transfer_isolated_tests.rs");
     include!("codex_session_restore_tests.rs");
     include!("codex_session_compressed_tests.rs");
+    #[test]
+    fn delete_backup_tracks_confirmed_outcome() {
+        for outcome in ["rejected", "uncertain", "deleted"] {
+            let base = make_temp_dir("delete-backup-outcome");
+            let entry = base.join("entry");
+            let original = base.join("original.jsonl");
+            fs::create_dir_all(entry.join("files")).unwrap();
+            fs::write(&original, "original").unwrap();
+            fs::write(entry.join("files/rollout.jsonl"), "original").unwrap();
+            fs::write(
+                entry.join("manifest.json"),
+                json!({
+                    "originalRolloutPath": original,
+                    "relativeRolloutPath": "rollout.jsonl",
+                    "deletionPending": true,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            if outcome == "uncertain" {
+                fs::write(&original, "changed").unwrap();
+            }
+            let result = finish_delete_backup(&entry, outcome == "deleted");
+            if outcome == "rejected" {
+                assert!(result.is_ok());
+                assert!(!entry.exists());
+                assert_eq!(fs::read_to_string(&original).unwrap(), "original");
+            } else {
+                let manifest: JsonValue =
+                    serde_json::from_str(&fs::read_to_string(entry.join("manifest.json")).unwrap())
+                        .unwrap();
+                assert_eq!(manifest["deletionPending"], outcome == "uncertain");
+                assert_eq!(result.is_err(), outcome == "uncertain");
+            }
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
 
     #[test]
-    fn classify_session_kind_detects_subagent_and_external() {
+    fn failed_official_restore_keeps_backup_and_does_not_rewrite_index() {
+        let base = make_temp_dir("official-restore-failure");
+        let target = base.join("codex-home/sessions/rollout-fixture.jsonl");
+        let entry = make_trash_entry(&base, "fixture", target.clone());
+        fs::create_dir_all(&entry.manifest.instance_root).unwrap();
+        let index = entry.manifest.instance_root.join(SESSION_INDEX_FILE);
+        fs::write(&index, "untouched\n").unwrap();
+        let error = restore_trashed_session_entry_with_registration(&entry, |_, _, _, _, _| {
+            Err("official request rejected".into())
+        })
+        .unwrap_err();
+        assert!(error.contains("official request rejected"));
+        assert!(entry.trashed_rollout_path.exists());
+        assert_eq!(fs::read_to_string(index).unwrap(), "untouched\n");
+        // A retry can register the copied file without discarding the backup on failure.
+        restore_trashed_session_entry_with_registration(&entry, |_, _, _, _, _| Ok(())).unwrap();
+        assert!(target.exists());
+        assert!(!entry.entry_dir.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn session_kind_uses_metadata_for_agents_and_internal_reviews() {
+        for source in [
+            json!({"subagent": {"other": "guardian"}}),
+            json!({"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}}),
+            json!({"subagent": "review"}),
+            json!("subagent"),
+        ] {
+            assert_eq!(
+                classify_session_kind(&json!({"payload": {"source": source}})),
+                "subagent"
+            );
+        }
         assert_eq!(
-            super::classify_session_kind("subagent run", "/tmp"),
-            "subagent"
-        );
-        assert_eq!(
-            super::classify_session_kind("imported external", "/x"),
+            classify_session_kind(&json!({"payload": {"source": "exec"}})),
             "external"
         );
+    }
+
+    #[test]
+    fn parent_relation_uses_only_official_metadata() {
+        assert_eq!(parent_thread_id(&json!({"source":{"subagent":{"other":"guardian"}},"parent_thread_id":"root"})), Some("root".to_string()));
         assert_eq!(
-            super::classify_session_kind("My chat", "/proj"),
-            "conversation"
+            parent_thread_id(&json!({"parentThreadId":"root"})),
+            Some("root".to_string())
         );
-        // Untitled chats must remain visible under the default conversation filter.
         assert_eq!(
-            super::classify_session_kind("", "/Users/me/project"),
-            "conversation"
+            parent_thread_id(
+                &json!({"source":{"subAgent":{"thread_spawn":{"parent_thread_id":"root"}}}})
+            ),
+            Some("root".to_string())
         );
-        assert_eq!(super::classify_session_kind("   ", "/tmp"), "conversation");
         assert_eq!(
-            super::classify_session_kind("task", "/Users/me/.codex/subagent/work"),
-            "subagent"
+            parent_thread_id(
+                &json!({"payload":{"source":{"subagent":{"threadSpawn":{"parentThreadId":"root"}}}}})
+            ),
+            Some("root".to_string())
+        );
+        assert_eq!(
+            parent_thread_id(&json!({"title":"root subagent", "forked_from_id":"root"})),
+            None
+        );
+    }
+
+    #[test]
+    fn trash_family_expands_only_explicit_links_in_same_batch_and_instance() {
+        let base = make_temp_dir("trash-family");
+        let root = make_trash_entry(
+            &base,
+            "root",
+            base.join("codex-home/sessions/rollout-root.jsonl"),
+        );
+        let mut child = make_trash_entry(
+            &base,
+            "child",
+            base.join("codex-home/sessions/rollout-child.jsonl"),
+        );
+        child.manifest.parent_thread_id = Some("root".into());
+        child.manifest.session_kind = Some("subagent".into());
+        let mut grandchild = make_trash_entry(
+            &base,
+            "grandchild",
+            base.join("codex-home/sessions/rollout-grandchild.jsonl"),
+        );
+        grandchild.manifest.parent_thread_id = Some("child".into());
+        let mut other_batch = make_trash_entry(
+            &base,
+            "unrelated",
+            base.join("codex-home/sessions/rollout-unrelated.jsonl"),
+        );
+        other_batch.manifest.parent_thread_id = Some("root".into());
+        other_batch.entry_dir = base.join("other-batch/unrelated");
+        let entries = vec![root, child, grandchild, other_batch];
+        let selected = HashSet::from(["root".to_string()]);
+        let family = select_trash_family_entries(&entries, &selected);
+        assert_eq!(
+            family
+                .iter()
+                .map(|entry| entry.manifest.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root", "child", "grandchild"]
+        );
+        assert!(
+            reject_selected_trashed_children(&entries, &HashSet::from(["child".to_string()]))
+                .is_err()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_trash_relation_comes_from_backed_up_rollout() {
+        let base = make_temp_dir("legacy-trash-relation");
+        let target = base.join("codex-home/sessions/rollout-child.jsonl");
+        let mut entry = make_trash_entry(&base, "child", target);
+        fs::write(
+            &entry.trashed_rollout_path,
+            json!({"type": "session_meta", "payload": {"id": "child", "source": {
+                "subagent": {"thread_spawn": {"parent_thread_id": "root"}}
+            }}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        hydrate_trash_relation(&mut entry.manifest, &entry.trashed_rollout_path).unwrap();
+        assert_eq!(entry.manifest.parent_thread_id.as_deref(), Some("root"));
+        assert_eq!(entry.manifest.session_kind.as_deref(), Some("subagent"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn conversation_titles_paths_and_forks_do_not_make_them_subagents() {
+        for source in [
+            json!("vscode"),
+            json!("cli"),
+            json!("app-server"),
+            JsonValue::Null,
+        ] {
+            assert_eq!(
+                classify_session_kind(&json!({"payload": {
+                    "source": source, "title": "Approval review subagent imported",
+                    "cwd": "/project/subagent/external", "forked_from_id": "parent"
+                }})),
+                "conversation"
+            );
+        }
+        assert_eq!(
+            classify_session_kind(&json!({"payload": {}})),
+            "conversation"
         );
     }
     use super::*;
@@ -3054,44 +3273,6 @@ mod tests {
             ),
         )
         .expect("write rollout");
-    }
-
-    #[test]
-    fn resolve_thread_snapshot_updated_at_prefers_rollout_activity_when_index_is_stale() {
-        let base_dir = make_temp_dir("codex-session-updated-at-drift-test");
-        let rollout_path = base_dir.join("rollout-session-1.jsonl");
-        write_rollout(&rollout_path, "session-1", "activity");
-        let stale_index = json!({
-            "id": "session-1",
-            "thread_name": "Old index",
-            "updated_at": "2024-01-01T00:00:00.000000Z",
-        });
-
-        assert_eq!(
-            resolve_thread_snapshot_updated_at_seconds(Some(&stale_index), &rollout_path),
-            Some(1_780_362_123)
-        );
-
-        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
-    }
-
-    #[test]
-    fn resolve_thread_snapshot_updated_at_keeps_index_when_close_to_rollout_activity() {
-        let base_dir = make_temp_dir("codex-session-updated-at-index-test");
-        let rollout_path = base_dir.join("rollout-session-1.jsonl");
-        write_rollout(&rollout_path, "session-1", "activity");
-        let current_index = json!({
-            "id": "session-1",
-            "thread_name": "Current index",
-            "updated_at": "2026-06-02T01:30:00.000000Z",
-        });
-
-        assert_eq!(
-            resolve_thread_snapshot_updated_at_seconds(Some(&current_index), &rollout_path),
-            Some(1_780_363_800)
-        );
-
-        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
     }
 
     #[test]
@@ -3193,159 +3374,6 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].manifest.session_id, session_id);
-
-        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
-    }
-
-    #[test]
-    fn move_to_trash_preserves_history_when_official_delete_is_not_confirmed() {
-        let base_dir = make_temp_dir("codex-session-trash-rebuild-failure-test");
-        let instance_root = base_dir.join("codex-home");
-        let session_id = "session-1";
-        let other_session_id = "session-2";
-        let rollout_path = instance_root
-            .join("sessions")
-            .join("2026")
-            .join("06")
-            .join("02")
-            .join(format!("rollout-{}.jsonl", session_id));
-        write_rollout(&rollout_path, session_id, "active");
-        fs::write(
-            instance_root.join(SESSION_INDEX_FILE),
-            format!(
-                "{{\"id\":\"{}\",\"thread_name\":\"Deleted title\"}}\n{{\"id\":\"{}\",\"thread_name\":\"Kept title\"}}\n",
-                session_id, other_session_id
-            ),
-        )
-        .expect("write session index");
-
-        let instance = CodexSyncInstance {
-            id: DEFAULT_INSTANCE_ID.to_string(),
-            name: DEFAULT_INSTANCE_NAME.to_string(),
-            data_dir: instance_root.clone(),
-            last_pid: None,
-        };
-        let snapshot = ThreadSnapshot {
-            id: session_id.to_string(),
-            title: "Deleted title".to_string(),
-            cwd: "/tmp/project".to_string(),
-            project_name: Some("项目名".to_string()),
-            updated_at: Some(1_780_362_123),
-            rollout_path: rollout_path.clone(),
-            session_index_entry: json!({
-                "id": session_id,
-                "thread_name": "Deleted title",
-            }),
-            source_root: instance_root.clone(),
-        };
-        let trash_root = base_dir
-            .join(".Trash")
-            .join(SESSION_TRASH_ROOT_DIR)
-            .join("20260613-000000");
-
-        let result = trash_snapshots_for_instance_with_app_server(
-            &instance,
-            &trash_root,
-            &[snapshot],
-            |_, _| Ok(0),
-            |_| panic!("no fallback rebuild after unconfirmed deletion"),
-        );
-        assert!(result.is_err());
-        assert!(rollout_path.exists());
-        assert!(trash_root
-            .join(format!("{}--{}", DEFAULT_INSTANCE_ID, session_id))
-            .join("files")
-            .join("sessions")
-            .join("2026")
-            .join("06")
-            .join("02")
-            .join(format!("rollout-{}.jsonl", session_id))
-            .exists());
-        let index_map = read_session_index_map(&instance_root).expect("read index map");
-        assert!(index_map.contains_key(session_id));
-        assert!(index_map.contains_key(other_session_id));
-
-        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
-    }
-
-    #[test]
-    fn move_to_trash_uses_official_delete_and_skips_metadata_rebuild() {
-        let base_dir = make_temp_dir("codex-session-trash-official-delete-test");
-        let instance_root = base_dir.join("codex-home");
-        let session_id = "session-official";
-        let other_session_id = "session-kept";
-        let rollout_path = instance_root
-            .join("sessions")
-            .join("2026")
-            .join("06")
-            .join("02")
-            .join(format!("rollout-{}.jsonl", session_id));
-        write_rollout(&rollout_path, session_id, "active");
-        fs::write(
-            instance_root.join(SESSION_INDEX_FILE),
-            format!(
-                "{{\"id\":\"{}\",\"thread_name\":\"Official title\"}}\n{{\"id\":\"{}\",\"thread_name\":\"Kept title\"}}\n",
-                session_id, other_session_id
-            ),
-        )
-        .expect("write session index");
-
-        let instance = CodexSyncInstance {
-            id: DEFAULT_INSTANCE_ID.to_string(),
-            name: DEFAULT_INSTANCE_NAME.to_string(),
-            data_dir: instance_root.clone(),
-            last_pid: None,
-        };
-        let snapshot = ThreadSnapshot {
-            id: session_id.to_string(),
-            title: "Official title".to_string(),
-            cwd: "/tmp/project".to_string(),
-            project_name: None,
-            updated_at: Some(1_780_362_123),
-            rollout_path: rollout_path.clone(),
-            session_index_entry: json!({
-                "id": session_id,
-                "thread_name": "Official title",
-            }),
-            source_root: instance_root.clone(),
-        };
-        let trash_root = base_dir
-            .join(".Trash")
-            .join(SESSION_TRASH_ROOT_DIR)
-            .join("20260613-000000");
-
-        let mut requested_ids = Vec::new();
-        let outcome = trash_snapshots_for_instance_with_app_server(
-            &instance,
-            &trash_root,
-            &[snapshot],
-            |_, session_ids| {
-                requested_ids.extend(session_ids.iter().cloned());
-                fs::remove_file(&rollout_path).unwrap();
-                // The fixture simulates official deletion; the host must not rewrite this index.
-                Ok(session_ids.len())
-            },
-            |_| Err("rebuild should not run when official delete succeeds".to_string()),
-        )
-        .expect("trash should succeed via official delete");
-
-        assert_eq!(requested_ids, vec![session_id.to_string()]);
-        assert!(!outcome.official_delete_failed);
-        assert!(!outcome.metadata_rebuild_failed);
-        // 官方删除会移除原始会话文件；废纸篓副本必须保留以便恢复。
-        assert!(!rollout_path.exists());
-        assert!(trash_root
-            .join(format!("{}--{}", DEFAULT_INSTANCE_ID, session_id))
-            .join("files")
-            .join("sessions")
-            .join("2026")
-            .join("06")
-            .join("02")
-            .join(format!("rollout-{}.jsonl", session_id))
-            .exists());
-        let index_map = read_session_index_map(&instance_root).expect("read index map");
-        assert!(index_map.contains_key(session_id));
-        assert!(index_map.contains_key(other_session_id));
 
         fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
     }
@@ -3471,7 +3499,7 @@ mod tests {
         );
         assert_eq!(entry.get("pinned").and_then(JsonValue::as_bool), Some(true));
         assert_eq!(
-            parse_session_index_updated_at_seconds(&entry),
+            entry.get("updated_at").and_then(parse_json_timestamp_seconds),
             Some(1_780_362_123)
         );
 
@@ -3516,6 +3544,8 @@ mod tests {
                     "source": "trash",
                 }),
                 deleted_at: Some("2026-06-13T00:00:00Z".to_string()),
+                parent_thread_id: None,
+                session_kind: None,
             },
             trashed_rollout_path,
         }
@@ -3560,7 +3590,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_allows_existing_same_rollout_and_upserts_index() {
+    fn restore_allows_existing_same_rollout_and_registers_officially() {
         let base_dir = make_temp_dir("codex-session-restore-idempotent-test");
         let instance_root = base_dir.join("codex-home");
         let session_id = "session-1";
@@ -3583,32 +3613,30 @@ mod tests {
         .expect("write session index");
         let entry = make_trash_entry(&base_dir, session_id, target_rollout_path.clone());
 
-        let outcome = restore_trashed_session_entry_with_metadata_rebuild(&entry, false)
-            .expect("restore idempotently");
-
-        assert!(!outcome.metadata_rebuild_failed);
+        restore_trashed_session_entry_with_registration(
+            &entry,
+            |root, id, path, archived, title| {
+                assert_eq!(root, instance_root);
+                assert_eq!(id, session_id);
+                assert_eq!(path, target_rollout_path);
+                assert!(!archived);
+                assert_eq!(title, "Restored title");
+                Ok(())
+            },
+        )
+        .expect("restore idempotently");
         assert_eq!(
             fs::read_to_string(&target_rollout_path).expect("read target rollout after restore"),
             original_target_content
         );
         let index_map = read_session_index_map(&instance_root).expect("read index map");
-        let restored = index_map.get(session_id).expect("restored index entry");
+        // Append the restored entry after official confirmation, preserving unrelated fields.
+        let restored = index_map.get(session_id).unwrap();
         assert_eq!(
             restored.get("thread_name").and_then(JsonValue::as_str),
             Some("Restored title")
         );
-        assert_eq!(
-            restored.get("pinned").and_then(JsonValue::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            restored.get("source").and_then(JsonValue::as_str),
-            Some("trash")
-        );
-        assert_eq!(
-            parse_session_index_updated_at_seconds(restored),
-            Some(1_780_362_123)
-        );
+        assert_eq!(restored["pinned"], true);
         assert!(!entry.entry_dir.exists());
 
         fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
@@ -3628,13 +3656,55 @@ mod tests {
         write_rollout(&target_rollout_path, "other-session", "existing");
         let entry = make_trash_entry(&base_dir, session_id, target_rollout_path.clone());
 
-        let error = restore_trashed_session_entry_with_metadata_rebuild(&entry, false)
-            .expect_err("different existing rollout should be rejected");
+        let error = restore_trashed_session_entry_with_registration(&entry, |_, _, _, _, _| {
+            panic!("must not register conflicting file")
+        })
+        .expect_err("different existing rollout should be rejected");
 
         assert!(error.contains("不同会话文件"));
         assert!(target_rollout_path.exists());
         assert!(entry.entry_dir.exists());
 
         fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn package_core_accepts_external_rollout_source_and_verifies_entry() {
+        let base = make_temp_dir("codex-package-source-test");
+        let session_id = Uuid::new_v4().to_string();
+        let rollout = base.join(format!("rollout-{}.jsonl", session_id));
+        let content = format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":session_id,"cwd":"/remote"}})
+        );
+        fs::write(&rollout, content.as_bytes()).unwrap();
+        let archive = base.join("export.zip");
+        let source = SessionPackageSource {
+            session_id: session_id.clone(),
+            title: "Remote title".into(),
+            cwd: "/remote".into(),
+            updated_at: Some(100),
+            relative_rollout_path: format!("sessions/2026/09/28/rollout-{}.jsonl", session_id),
+            rollout_path: rollout,
+            session_index_entry: json!({"id":session_id}),
+            source_instance_id: "remote-host".into(),
+            source_instance_name: "Remote host".into(),
+        };
+        let summary = export_session_package(
+            vec![source],
+            1,
+            archive.to_string_lossy().to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.exported_session_count, 1);
+        let manifest = read_session_export_manifest_from_path(&archive).unwrap();
+        assert_eq!(manifest.sessions[0].source_instance.id, "remote-host");
+        assert_eq!(
+            read_session_export_entry_bytes(&archive, &manifest.sessions[0]).unwrap(),
+            content.as_bytes()
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 }

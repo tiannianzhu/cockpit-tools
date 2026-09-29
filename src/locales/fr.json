@@ -3562,10 +3562,6 @@
         "repairVisibilitySkippedOnly": "Aucune différence de fournisseur inscriptible n’a été trouvée ; {{count}} fichier(s) state_5.sqlite invalides ou corrompus ont été ignorés. Codex doit les régénérer avant que leurs enregistrements SQLite puissent être réparés.",
         "repairVisibilitySkippedWithBase": "{{message}} ; {{count}} fichier(s) state_5.sqlite invalides ou corrompus ont été ignorés. Codex doit les régénérer avant que leurs enregistrements SQLite puissent être réparés.",
         "trashSummary": "{{count}} conversations déplacées dans la corbeille et supprimées dans Codex officiel",
-        "trashSummaryFallback": "{{count}} conversations déplacées dans la corbeille et reconstruction de l'index des sessions de Codex officiel déclenchée",
-        "trashSummaryRunningHint": "Les instances en cours d'exécution peuvent nécessiter un rafraîchissement ou un redémarrage",
-        "trashSummaryFallbackHint": "La suppression officielle n'a pas abouti pour {{count}} instances ; les fichiers ont été supprimés directement et Codex se synchronisera après un redémarrage",
-        "trashSummaryRebuildFailedHint": "La reconstruction de l'index officiel de la barre latérale n'a pas abouti pour {{count}} instances ; Codex le rechargera après un redémarrage",
         "trashSummaryEmpty": "Les conversations sélectionnées n'existent pas dans les instances actuelles, rien à faire"
       },
       "groupCount": "{{count}} sessions​",
@@ -3780,6 +3776,20 @@
         "hint": "Cette session existe sur plusieurs instances. Choisissez l’instance dont ouvrir l’emplacement du fichier :",
         "rolloutHint": "Cette session existe sur plusieurs instances. Choisissez l’instance dont ouvrir le fichier de session :",
         "running": "En cours"
+      },
+      "archive": {
+        "active": "Non archivées",
+        "all": "Tous les états d’archivage",
+        "archived": "Archivées",
+        "label": "État d’archivage"
+      },
+      "childAgents": "Sous-agents ({{count}})",
+      "selectConversation": "Sélectionner la conversation : {{title}}",
+      "shared": {
+        "emptied": "Corbeille vidée",
+        "purged": "Sauvegardes de {{count}} conversations et de leurs sous-agents supprimées définitivement",
+        "restored": "{{count}} conversations et leurs sous-agents restaurés",
+        "trashed": "{{count}} conversations et leurs sous-agents déplacés dans la corbeille"
       }
     },
     "sessionUsage": {
@@ -3809,8 +3819,8 @@
         "scanning": "Analyse des journaux…",
         "ready": "{{files}} fichiers, {{requests}} requêtes",
         "lastSynced": "Dernière sync {{time}}",
-        "deferred": "{{count}} forks en attente du parent",
-        "errors": "{{count}} fichiers illisibles"
+        "errors": "{{count}} fichiers illisibles",
+        "unprocessed": "{{count}} fichiers de session n’ont pas encore pu être comptabilisés"
       },
       "cards": {
         "input": "Jetons d’entrée",
@@ -6118,6 +6128,38 @@
       "title": "Hôtes distants",
       "updated": "Mis à jour",
       "useLocalAccount": "Utiliser le compte local actuel"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Essayez un autre titre, dossier ou ID.",
+      "assistant": "Assistant",
+      "back": "Retour aux sessions",
+      "chooseHost": "L’hôte sélectionné est indisponible. Choisissez-en un autre.",
+      "confirmTrash": "Déplacer « {{title}} » et toutes les conversations de ses sous-agents dans la corbeille de {{host}} ?",
+      "count": "{{count}} sessions",
+      "empty": "Aucune session trouvée",
+      "emptyHint": "Aucune session à gérer sur cet hôte.",
+      "emptyTrash": "La corbeille est vide",
+      "exported": "Exporté sur cet ordinateur",
+      "host": "Hôte de la session",
+      "limit": "{{shown}} sur {{total}} affichées. Recherchez pour affiner les résultats.",
+      "loadError": "L’opération sur la session distante a échoué. Vérifiez la connexion à l’hôte et réessayez.",
+      "local": "Cet ordinateur",
+      "manageHosts": "Gérer les hôtes",
+      "moveToTrash": "Déplacer vers la corbeille",
+      "noMatches": "Aucune session correspondante",
+      "noReadableMessages": "Aucun message de la conversation n’a pu être extrait. Vous pouvez consulter l’enregistrement brut.",
+      "raw": "Transcription brute (JSONL)",
+      "scope": "Hôte : {{host}}. La corbeille et la restauration s’effectuent à distance ; les exports sont enregistrés localement.",
+      "search": "Rechercher des sessions distantes",
+      "searchLabel": "Rechercher des sessions",
+      "searchPlaceholder": "Rechercher un titre, un dossier ou un ID",
+      "title": "Sessions distantes",
+      "transcript": "Transcription de la session",
+      "trash": "Corbeille distante",
+      "truncated": "Aperçu tronqué. Exportez pour enregistrer la transcription complète.",
+      "unavailable": "Hôte supprimé ou indisponible",
+      "user": "Utilisateur",
+      "view": "Afficher"
     }
   },
   "githubCopilot": {

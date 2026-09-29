@@ -1,26 +1,36 @@
-// Keep compressed source history intact. Packages always contain verified plain
-// JSONL with size/hash calculated after decompression, never compressed bytes
-// hidden behind a .jsonl entry name.
-fn prepare_export_session_entries(
-    mut entries: Vec<(CodexSyncInstance, ThreadSnapshot)>,
-) -> Result<(tempfile::TempDir, Vec<(CodexSyncInstance, ThreadSnapshot)>), String> {
+// Stage decoded standalone history once for both local and remote packages.
+fn snapshot_export_source(instance: CodexSyncInstance, snapshot: ThreadSnapshot) -> SessionPackageSource {
+    SessionPackageSource {
+        session_id: snapshot.id.clone(),
+        title: snapshot.title.clone(),
+        cwd: snapshot.cwd.clone(),
+        updated_at: snapshot.updated_at,
+        relative_rollout_path: snapshot_relative_rollout_path(&snapshot),
+        rollout_path: snapshot.rollout_path,
+        session_index_entry: snapshot.session_index_entry,
+        source_instance_id: instance.id,
+        source_instance_name: instance.name,
+    }
+}
+
+fn prepare_export_session_sources(
+    mut sources: Vec<SessionPackageSource>,
+) -> Result<(tempfile::TempDir, Vec<SessionPackageSource>), String> {
     let staging = tempfile::tempdir().map_err(|error| history_read_error(&error.to_string()))?;
-    for (number, (_, snapshot)) in entries.iter_mut().enumerate() {
-        if rollout_reader::is_compressed(&snapshot.rollout_path) {
-            let root = staging.path().join(number.to_string());
-            let relative = snapshot_relative_rollout_path(snapshot);
-            let relative = PathBuf::from(relative).with_extension("");
-            let path = root.join(relative);
-            fs::create_dir_all(path.parent().ok_or("export staging has no parent")?)
+    for (number, source) in sources.iter_mut().enumerate() {
+        source.rollout_path = cockpit_session_usage::rollout::resolve_path(&source.rollout_path)
+            .map_err(|error| history_read_error(&error.to_string()))?;
+        source.relative_rollout_path = source.relative_rollout_path.strip_suffix(".zst")
+            .unwrap_or(&source.relative_rollout_path).to_owned();
+        if rollout_reader::is_compressed(&source.rollout_path) {
+            let path = staging.path().join(format!("{number}.jsonl"));
+            rollout_reader::materialize_bounded(&source.rollout_path, &path)
                 .map_err(|error| history_read_error(&error.to_string()))?;
-            rollout_reader::materialize_bounded(&snapshot.rollout_path, &path)
-                .map_err(|error| history_read_error(&error.to_string()))?;
-            snapshot.rollout_path = path;
-            snapshot.source_root = root;
+            source.rollout_path = path;
         }
         modules::codex_session_import_paths::ensure_standalone_rollout_reader(BufReader::new(
-            File::open(&snapshot.rollout_path).map_err(|error| error.to_string())?,
+            File::open(&source.rollout_path).map_err(|error| error.to_string())?,
         ))?;
     }
-    Ok((staging, entries))
+    Ok((staging, sources))
 }

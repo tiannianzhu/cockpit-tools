@@ -3562,10 +3562,6 @@
         "repairVisibilitySkippedOnly": "Nebyly nalezeny žádné zapisovatelné rozdíly provideru; přeskočeno {{count}} neplatných nebo poškozených souborů state_5.sqlite. Codex je musí znovu vygenerovat, než bude možné opravit jejich záznamy SQLite.",
         "repairVisibilitySkippedWithBase": "{{message}}; přeskočeno {{count}} neplatných nebo poškozených souborů state_5.sqlite. Codex je musí znovu vygenerovat, než bude možné opravit jejich záznamy SQLite.",
         "trashSummary": "{{count}} konverzací přesunuto do koše a smazáno v oficiálním Codex",
-        "trashSummaryFallback": "{{count}} konverzací přesunuto do koše a spuštěno přegenerování indexu relací oficiálního Codex",
-        "trashSummaryRunningHint": "Spuštěné instance mohou vyžadovat obnovení nebo restart, aby se změna zobrazila",
-        "trashSummaryFallbackHint": "Oficiální smazání se nedokončilo u {{count}} instancí; soubory byly odstraněny přímo a Codex se synchronizuje po restartu",
-        "trashSummaryRebuildFailedHint": "Přegenerování oficiálního indexu postranního panelu se nedokončilo u {{count}} instancí; Codex jej po restartu načte znovu",
         "trashSummaryEmpty": "Vybrané konverzace v aktuální sadě instancí neexistují, není co dělat"
       },
       "groupCount": "{{count}} relací",
@@ -3780,6 +3776,20 @@
         "hint": "Tato relace je na více instancích. Vyberte instanci, ve které otevřít umístění souboru:",
         "rolloutHint": "Tato relace je na více instancích. Vyberte instanci, ve které otevřít soubor relace:",
         "running": "Běží"
+      },
+      "archive": {
+        "active": "Nearchivované",
+        "all": "Všechny stavy archivace",
+        "archived": "Archivované",
+        "label": "Stav archivace"
+      },
+      "childAgents": "Subagenti ({{count}})",
+      "selectConversation": "Vybrat konverzaci: {{title}}",
+      "shared": {
+        "emptied": "Koš byl vyprázdněn",
+        "purged": "Zálohy {{count}} konverzací a jejich subagentů byly trvale smazány",
+        "restored": "Obnoveno konverzací: {{count}} včetně jejich subagentů",
+        "trashed": "Do koše přesunuto konverzací: {{count}} včetně jejich subagentů"
       }
     },
     "sessionUsage": {
@@ -3809,8 +3819,8 @@
         "scanning": "Skenování protokolů…",
         "ready": "{{files}} souborů, {{requests}} požadavků",
         "lastSynced": "Poslední sync {{time}}",
-        "deferred": "{{count}} forky čekají na rodiče",
-        "errors": "{{count}} souborů nelze číst"
+        "errors": "{{count}} souborů nelze číst",
+        "unprocessed": "Zatím nelze započítat soubory relací: {{count}}"
       },
       "cards": {
         "input": "Vstupní tokeny",
@@ -6118,6 +6128,38 @@
       "title": "Vzdálení hostitelé",
       "updated": "Aktualizováno",
       "useLocalAccount": "Použít aktuální místní účet"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Zkuste jiný název, složku nebo ID.",
+      "assistant": "Asistent",
+      "back": "Zpět na relace",
+      "chooseHost": "Vybraný hostitel není dostupný. Vyberte jiného.",
+      "confirmTrash": "Přesunout „{{title}}“ a všechny konverzace jeho subagentů do koše na {{host}}?",
+      "count": "Relací: {{count}}",
+      "empty": "Nebyly nalezeny žádné relace",
+      "emptyHint": "Na tomto hostiteli nejsou žádné relace ke správě.",
+      "emptyTrash": "Koš je prázdný",
+      "exported": "Exportováno do tohoto počítače",
+      "host": "Hostitel relace",
+      "limit": "Zobrazeno {{shown}} z {{total}}. Zúžením hledání omezíte výsledky.",
+      "loadError": "Operace vzdálené relace selhala. Zkontrolujte připojení hostitele a zkuste to znovu.",
+      "local": "Místní",
+      "manageHosts": "Spravovat hostitele",
+      "moveToTrash": "Přesunout do koše",
+      "noMatches": "Žádné odpovídající relace",
+      "noReadableMessages": "Z konverzace se nepodařilo extrahovat žádné zprávy. Můžete zobrazit nezpracovaný záznam.",
+      "raw": "Surový přepis (JSONL)",
+      "scope": "Hostitel: {{host}}. Koš a obnovení se provádějí vzdáleně; exporty se ukládají místně.",
+      "search": "Hledat vzdálené relace",
+      "searchLabel": "Hledat relace",
+      "searchPlaceholder": "Hledat název, složku nebo ID",
+      "title": "Vzdálené relace",
+      "transcript": "Přepis relace",
+      "trash": "Vzdálený koš",
+      "truncated": "Náhled je zkrácen. Exportujte jej a uložte celý přepis.",
+      "unavailable": "Hostitel byl odebrán nebo není dostupný",
+      "user": "Uživatel",
+      "view": "Zobrazit"
     }
   },
   "githubCopilot": {

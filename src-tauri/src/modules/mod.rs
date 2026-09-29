@@ -185,3 +185,6 @@ pub mod codex_proxy_subscription_parser;
 
 pub mod codex_client_proxy;
 pub mod codex_proxy_targets;
+pub mod remote_codex_sessions;
+
+pub(crate) mod codex_session_index;

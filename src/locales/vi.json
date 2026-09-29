@@ -3562,10 +3562,6 @@
         "repairVisibilitySkippedOnly": "Không tìm thấy khác biệt provider có thể ghi; đã bỏ qua {{count}} tệp state_5.sqlite không hợp lệ hoặc bị hỏng. Codex phải tạo lại chúng trước khi có thể sửa các bản ghi SQLite bên trong.",
         "repairVisibilitySkippedWithBase": "{{message}}; đã bỏ qua {{count}} tệp state_5.sqlite không hợp lệ hoặc bị hỏng. Codex phải tạo lại chúng trước khi có thể sửa các bản ghi SQLite bên trong.",
         "trashSummary": "Đã chuyển {{count}} cuộc trò chuyện vào thùng rác và xóa trong Codex chính thức",
-        "trashSummaryFallback": "Đã chuyển {{count}} cuộc trò chuyện vào thùng rác và kích hoạt dựng lại chỉ mục phiên của Codex chính thức",
-        "trashSummaryRunningHint": "Các phiên bản đang chạy có thể cần làm mới hoặc khởi động lại để hiển thị thay đổi",
-        "trashSummaryFallbackHint": "Việc xóa chính thức chưa hoàn tất ở {{count}} phiên bản; tệp đã được xóa trực tiếp và Codex sẽ đồng bộ sau khi khởi động lại",
-        "trashSummaryRebuildFailedHint": "Việc dựng lại chỉ mục thanh bên chính thức chưa hoàn tất ở {{count}} phiên bản; Codex sẽ tải lại sau khi khởi động lại",
         "trashSummaryEmpty": "Các cuộc trò chuyện đã chọn không tồn tại trong tập hợp phiên bản hiện tại, không cần xử lý"
       },
       "groupCount": "{{count}} phiên",
@@ -3780,6 +3776,20 @@
         "hint": "Phiên này tồn tại trên nhiều instance. Chọn instance để mở vị trí tệp:",
         "rolloutHint": "Phiên này tồn tại trên nhiều instance. Chọn instance để mở tệp phiên:",
         "running": "Đang chạy"
+      },
+      "archive": {
+        "active": "Chưa lưu trữ",
+        "all": "Tất cả trạng thái lưu trữ",
+        "archived": "Đã lưu trữ",
+        "label": "Trạng thái lưu trữ"
+      },
+      "childAgents": "Tác tử phụ ({{count}})",
+      "selectConversation": "Chọn cuộc trò chuyện: {{title}}",
+      "shared": {
+        "emptied": "Đã làm trống thùng rác",
+        "purged": "Đã xóa vĩnh viễn bản sao lưu của {{count}} cuộc trò chuyện và các tác tử phụ",
+        "restored": "Đã khôi phục {{count}} cuộc trò chuyện và các tác tử phụ",
+        "trashed": "Đã chuyển {{count}} cuộc trò chuyện và các tác tử phụ vào Thùng rác"
       }
     },
     "sessionUsage": {
@@ -3809,8 +3819,8 @@
         "scanning": "Đang quét nhật ký…",
         "ready": "{{files}} tệp, {{requests}} yêu cầu",
         "lastSynced": "Đồng bộ lần cuối {{time}}",
-        "deferred": "{{count}} nhánh đang chờ phiên cha",
-        "errors": "{{count}} tệp không đọc được"
+        "errors": "{{count}} tệp không đọc được",
+        "unprocessed": "Chưa thể tính {{count}} tệp phiên"
       },
       "cards": {
         "input": "Token vào",
@@ -6118,6 +6128,38 @@
       "title": "Máy chủ từ xa",
       "updated": "Đã cập nhật",
       "useLocalAccount": "Dùng tài khoản cục bộ hiện tại"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Hãy thử tiêu đề, thư mục hoặc ID khác.",
+      "assistant": "Trợ lý",
+      "back": "Quay lại danh sách phiên",
+      "chooseHost": "Máy chủ đã chọn không khả dụng. Hãy chọn máy chủ khác.",
+      "confirmTrash": "Chuyển “{{title}}” và toàn bộ cuộc trò chuyện của tác tử phụ vào thùng rác trên {{host}}?",
+      "count": "{{count}} phiên",
+      "empty": "Không tìm thấy phiên nào",
+      "emptyHint": "Không có phiên nào cần quản lý trên máy chủ này.",
+      "emptyTrash": "Thùng rác trống",
+      "exported": "Đã xuất ra máy tính này",
+      "host": "Máy chủ của phiên",
+      "limit": "Đang hiển thị {{shown}}/{{total}}. Tìm kiếm để thu hẹp kết quả.",
+      "loadError": "Thao tác với phiên từ xa thất bại. Hãy kiểm tra kết nối máy chủ rồi thử lại.",
+      "local": "Cục bộ",
+      "manageHosts": "Quản lý máy chủ",
+      "moveToTrash": "Chuyển vào thùng rác",
+      "noMatches": "Không có phiên phù hợp",
+      "noReadableMessages": "Không trích xuất được tin nhắn trong cuộc trò chuyện. Bạn có thể xem bản ghi thô.",
+      "raw": "Bản ghi hội thoại thô (JSONL)",
+      "scope": "Máy chủ: {{host}}. Thao tác với thùng rác và khôi phục chạy từ xa; bản xuất được lưu cục bộ.",
+      "search": "Tìm phiên từ xa",
+      "searchLabel": "Tìm phiên",
+      "searchPlaceholder": "Tìm tiêu đề, thư mục hoặc ID",
+      "title": "Phiên từ xa",
+      "transcript": "Bản ghi hội thoại của phiên",
+      "trash": "Thùng rác từ xa",
+      "truncated": "Bản xem trước đã bị rút gọn. Hãy xuất để lưu toàn bộ bản ghi hội thoại.",
+      "unavailable": "Máy chủ đã bị xóa hoặc không khả dụng",
+      "user": "Người dùng",
+      "view": "Xem"
     }
   },
   "githubCopilot": {
