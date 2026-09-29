@@ -23,6 +23,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # Inspect reqwest's typed HTTP/2 keepalive failures without parsing error text.
 hyper = { version = "1", features = ["client", "http2"] }
 tempfile = "3"
+cockpit-session-usage = { path = "../crates/cockpit-session-usage" }
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png", "unstable"] }
 # Reuse Tauri's web engine without its IPC bridge for untrusted generated HTML.
 wry = { version = "0.54", default-features = false, features = ["os-webview"] }

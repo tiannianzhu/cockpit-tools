@@ -1003,6 +1003,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-session-usage"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
 name = "cockpit-tools"
 version = "1.4.2"
 dependencies = [
@@ -1016,6 +1028,7 @@ dependencies = [
  "brotli",
  "cbc",
  "chrono",
+ "cockpit-session-usage",
  "crypto_box",
  "dirs 5.0.1",
  "dotenvy",
