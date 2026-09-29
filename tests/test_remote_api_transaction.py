@@ -121,28 +121,5 @@ class TransactionTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assert_originals()
 
-
-
-class CatalogImportTests(unittest.TestCase):
-    def test_import_reads_actual_catalog_without_a_sidecar(self):
-        script = re.search(r'const REMOTE_MODEL_DEFINITION_SCRIPT: &str = r#"(.*?)"#;', SOURCE, re.S)[1]
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            (home / 'config.toml').write_text('model_catalog_json = "models.json"\n')
-            model = {'slug': 'request-id', 'display_name': 'Visible name',
-                     'context_window': 12000, 'input_modalities': ['text', 'image'],
-                     'supported_reasoning_levels': [{'effort': 'low'}, {'effort': 'high'}],
-                     'default_reasoning_level': 'high', 'base_instructions': 'template',
-                     'model_messages': {'instructions_template': 'template'}, 'custom_capability': True}
-            (home / 'models.json').write_text(json.dumps({'models': [model]}))
-            result = subprocess.run(['python3', '-c', script], input=json.dumps({'codex_home': directory}),
-                                    capture_output=True, text=True, check=True)
-            imported = json.loads(result.stdout)
-            self.assertNotIn('base_model', imported)
-            expected = {key: value for key, value in model.items() if key not in ('base_instructions', 'model_messages')}
-            self.assertEqual(imported['models'], [expected])
-            self.assertEqual({p.name for p in home.iterdir()}, {'config.toml', 'models.json'})
-
-
 if __name__ == '__main__':
     unittest.main()

@@ -3670,7 +3670,29 @@
       "importConfigPlaceholder": "Use Copy config on a provider card, then paste the content here",
       "importConfigAction": "Import config",
       "importConfigFromClipboard": "Read clipboard",
-      "settingsRestartHint": "Provider settings updated. Restart any running Codex instance or API Service using this provider to apply them."
+      "settingsRestartHint": "Provider settings updated. Restart any running Codex instance or API Service using this provider to apply them.",
+      "modelEditor": {
+        "title": "Models",
+        "hint": "Set context, image and reasoning capabilities per model. The full catalog is generated when applied to a remote host.",
+        "duplicate": "Model ID already exists",
+        "invalidId": "Model IDs cannot contain whitespace or commas",
+        "fetching": "Fetching…",
+        "fetch": "Fetch models",
+        "modelIdPlaceholder": "Enter model ID",
+        "modelId": "Model ID",
+        "add": "Add model",
+        "empty": "No models added yet.",
+        "context": "Context window",
+        "vision": "Image input",
+        "reasoning": "Reasoning levels",
+        "unset": "Not set",
+        "remove": "Remove model",
+        "unconfigured": "Not configured",
+        "supportedLevels": "Supported levels",
+        "defaultLevel": "Default level",
+        "noUpstreamModels": "The provider returned no available models. Add a model ID manually.",
+        "displayName": "Display name"
+      }
     },
     "quickSwitch": {
       "action": "Quick Switch Provider",

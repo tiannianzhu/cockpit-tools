@@ -3973,7 +3973,29 @@
       "importConfigPlaceholder": "カードの「設定をコピー」を使い、内容をここに貼り付けます",
       "importConfigAction": "設定を読み込む",
       "importConfigFromClipboard": "クリップボードを読み取る",
-      "settingsRestartHint": "プロバイダー設定を更新しました。適用するには、このプロバイダーを使用中の Codex または API サービスを再起動してください。"
+      "settingsRestartHint": "プロバイダー設定を更新しました。適用するには、このプロバイダーを使用中の Codex または API サービスを再起動してください。",
+      "modelEditor": {
+        "title": "モデル一覧",
+        "hint": "モデルごとのコンテキスト、画像入力、推論能力を設定します。リモート適用時に完全なカタログを自動生成します。",
+        "duplicate": "モデル ID は既に存在します",
+        "invalidId": "モデル ID に空白やカンマは使用できません",
+        "fetching": "取得中…",
+        "fetch": "モデルを取得",
+        "modelIdPlaceholder": "モデル ID を入力",
+        "modelId": "モデル ID",
+        "add": "モデルを追加",
+        "empty": "モデルはまだありません。",
+        "context": "コンテキスト",
+        "vision": "画像入力",
+        "reasoning": "推論レベル",
+        "unset": "未設定",
+        "remove": "モデルを削除",
+        "unconfigured": "未設定",
+        "supportedLevels": "対応レベル",
+        "defaultLevel": "既定レベル",
+        "noUpstreamModels": "利用可能なモデルが返されませんでした。モデル ID を手動で追加してください。",
+        "displayName": "表示名"
+      }
     },
     "quickSwitch": {
       "action": "プロバイダーをクイック切り替え",
