@@ -58,7 +58,6 @@ pub mod codex_session_manager;
 pub mod codex_session_usage;
 pub mod codex_session_visibility;
 pub mod codex_speed;
-pub mod codex_ssh;
 pub mod codex_thread_sync;
 pub mod codex_wakeup;
 pub mod codex_wakeup_scheduler;

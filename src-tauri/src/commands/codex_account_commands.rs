@@ -1194,6 +1194,7 @@ pub async fn switch_codex_account(
                 44,
                 serde_json::json!({}),
             );
+            crate::modules::ssh_server::cancel_pending_syncs_on_account_switch();
             stop_default_codex_runtime_before_auth_commit().await?;
             emit_codex_switch_step(
                 &step_app,
@@ -1344,25 +1345,6 @@ pub async fn switch_codex_account(
 
     apply_codex_switch_auth_projections(&account, &user_config);
 
-    // Full #1404: optional auto SSH sync after switch (hash-verified remote projection + app-server reload).
-    if let Some(ssh_sync) =
-        crate::modules::ssh_server::sync_selected_server_after_codex_switch(&account).await
-    {
-        if ssh_sync.verified {
-            logger::log_info(&format!(
-                "[Codex SSH] 切号后同步成功: server_id={}, account={}, verified={}",
-                ssh_sync.server_id, ssh_sync.account_email, ssh_sync.verified
-            ));
-        } else {
-            logger::log_warn(&format!(
-                "[Codex SSH] 切号后同步失败: server_id={}, error={}",
-                ssh_sync.server_id,
-                ssh_sync.error.clone().unwrap_or_default()
-            ));
-        }
-        let _ = app.emit("codex:ssh-sync-result", &ssh_sync);
-    }
-
     emit_codex_switch_step(
         &app,
         &account_id,
@@ -1459,6 +1441,12 @@ pub async fn switch_codex_account(
             96,
             serde_json::json!({ "launchDisabled": true }),
         );
+    }
+
+    if let Err(error) =
+        crate::modules::ssh_server::dispatch_selected_servers_after_codex_switch(&account)
+    {
+        logger::log_warn(&format!("[Codex SSH] 无法启动切号同步: {}", error));
     }
 
     let restart_specified_started = Instant::now();

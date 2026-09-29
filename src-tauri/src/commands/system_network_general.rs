@@ -640,43 +640,6 @@ pub async fn scan_auto_local_import(
     modules::auto_local_import::scan_now(app).await
 }
 
-// --- Codex SSH sync (#1404 vertical slice) ---
-#[tauri::command]
-pub fn codex_ssh_list_servers() -> Result<modules::codex_ssh::CodexSshListResult, String> {
-    let (servers, selected_id) = modules::codex_ssh::list_servers()?;
-    Ok(modules::codex_ssh::CodexSshListResult {
-        servers,
-        selected_id,
-    })
-}
-
-#[tauri::command]
-pub fn codex_ssh_upsert_server(
-    server: modules::codex_ssh::CodexSshServer,
-) -> Result<modules::codex_ssh::CodexSshServer, String> {
-    modules::codex_ssh::upsert_server(server)
-}
-
-#[tauri::command]
-pub fn codex_ssh_delete_server(id: String) -> Result<(), String> {
-    modules::codex_ssh::delete_server(&id)
-}
-
-#[tauri::command]
-pub fn codex_ssh_select_server(id: String) -> Result<(), String> {
-    modules::codex_ssh::select_server(&id)
-}
-
-#[tauri::command]
-pub fn codex_ssh_test_connection(id: String) -> Result<String, String> {
-    modules::codex_ssh::test_connection(&id)
-}
-
-#[tauri::command]
-pub fn codex_ssh_sync_current(id: String) -> Result<String, String> {
-    modules::codex_ssh::sync_current_account(&id)
-}
-
 /// Managed provider id for local API LB (#980 vertical slice).
 #[tauri::command]
 pub fn codex_managed_lb_provider_id() -> String {

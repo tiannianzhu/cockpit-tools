@@ -1,6 +1,6 @@
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Clock3, FolderOpen, Github, Globe2, Layers, MoreHorizontal, PanelTop, Server } from 'lucide-react';
+import { Clock3, FolderOpen, Github, Globe2, Layers, MoreHorizontal, PanelTop, Server, Monitor } from 'lucide-react';
 import { CodexIcon } from '../icons/CodexIcon';
 import { ClaudeIcon } from '../icons/ClaudeIcon';
 import { WindsurfIcon } from '../icons/WindsurfIcon';
@@ -28,6 +28,7 @@ export type PlatformOverviewTab =
   | 'overview'
   | 'wakeup'
   | 'instances'
+  | 'hosts'
   | 'sessions'
   | 'providers'
   | 'proxy'
@@ -216,6 +217,11 @@ export function PlatformOverviewTabsHeader<T extends string = PlatformOverviewTa
       key: 'instances',
       label: t('instances.title', '应用多开'),
       icon: <Layers className="tab-icon" />,
+    },
+    hosts: {
+      key: 'hosts',
+      label: t('codex.hosts.title', '远程主机'),
+      icon: <Monitor className="tab-icon" />,
     },
     sessions: {
       key: 'sessions',
