@@ -4143,6 +4143,14 @@
       }
     },
     "sessionManager": {
+      "shared": {
+        "restored": "Restored {{count}} conversations and their subagents",
+        "purged": "Permanently deleted backups for {{count}} conversations and their subagents",
+        "emptied": "Trash emptied",
+        "trashed": "Moved {{count}} conversations and their subagents to Trash"
+      },
+      "childAgents": "Subagents ({{count}})",
+      "selectConversation": "Select conversation: {{title}}",
       "title": "Session Manager",
       "desc": "Sync, visibility repair, cleanup, and restore live here together: use the top actions to sync sessions, repair session visibility, or restore from Trash, then expand each project to review and trash sessions.",
       "actions": {
@@ -4164,7 +4172,7 @@
       },
       "confirm": {
         "title": "Move to Trash",
-        "message": "Selected sessions will be moved to Trash from their instances so they can be restored later. Running instances may need a restart before the change appears. Continue?",
+        "message": "Move the selected conversations and all their subagent conversations to the trash in their instances so they can be restored later. Continue?",
         "syncMessage": "Missing rollout files, session_index entries, and session file times will be synced to all instances, then official Codex will rebuild the session index. Existing content will not be written again, and target files are backed up before writing. Continue?",
         "repairVisibilityMessage": "Updates the official Codex state DB records that control sidebar session visibility. The state DB files are backed up before writing."
       },
@@ -4189,10 +4197,6 @@
         "repairVisibilitySkippedOnly": "No writable session index differences were found; skipped {{count}} invalid or corrupted SQLite session database(s). Codex must regenerate them before their records can be repaired.",
         "repairVisibilitySkippedWithBase": "{{message}}; skipped {{count}} invalid or corrupted SQLite session database(s). Codex must regenerate them before their records can be repaired.",
         "trashSummary": "Moved {{count}} conversations to the trash and deleted them in official Codex",
-        "trashSummaryFallback": "Moved {{count}} conversations to the trash and triggered an official Codex session index rebuild",
-        "trashSummaryRunningHint": "Running instances may need a refresh or restart before the change appears",
-        "trashSummaryFallbackHint": "Official deletion did not finish for {{count}} instances; files were removed directly and Codex will sync after a restart",
-        "trashSummaryRebuildFailedHint": "Official sidebar index rebuild did not finish for {{count}} instances; Codex will reload it after a restart",
         "trashSummaryEmpty": "The selected conversations are not present in the current instance set, nothing to do"
       },
       "groupCount": "{{count}} sessions",
@@ -4378,10 +4382,16 @@
         "emptyFilteredTitle": "No sessions match",
         "emptyFilteredDesc": "Adjust search, source, or selection state and try again."
       },
+      "archive": {
+        "active": "Unarchived",
+        "archived": "Archived",
+        "all": "All archive states",
+        "label": "Archive status"
+      },
       "kindFilter": "Session type",
       "kind": {
         "conversation": "Chats",
-        "external": "External",
+        "external": "Non-interactive tasks",
         "subagent": "Subagent",
         "all": "All types"
       },
@@ -4396,7 +4406,7 @@
       "tab": "Usage",
       "listTab": "Sessions",
       "title": "Session Usage",
-      "desc": "Aggregate real token usage from local Codex session logs, without official quota or API Service request logs.",
+      "desc": "Aggregate real token usage from Codex session logs on the selected host, without official quota or API Service request logs.",
       "hint": "Official quota is plan allowance. API Service logs only cover local-gateway traffic. This view sums per-request JSONL usage deltas.",
       "range": {
         "label": "Range",
@@ -4418,8 +4428,8 @@
         "idle": "Not scanned yet",
         "scanning": "Scanning session logs…",
         "ready": "Scanned {{files}} files, {{requests}} requests",
-        "lastSynced": "Last sync {{time}}",
-        "deferred": "{{count}} forked sessions waiting for parent",
+        "lastSynced": "Last checked {{time}}",
+        "unprocessed": "{{count}} session files could not yet be counted",
         "errors": "{{count}} files failed to parse"
       },
       "cards": {
@@ -4445,7 +4455,7 @@
       },
       "empty": {
         "title": "No session usage yet",
-        "desc": "Opening this page scans local Codex session logs and extra-instance homes in the background. If you just used Codex, tap Refresh."
+        "desc": "Opening this page scans Codex session logs on the selected host and extra-instance homes in the background. If you just used Codex, tap Refresh."
       },
       "rebuildConfirm": {
         "title": "Rescan",
@@ -5796,6 +5806,38 @@
         "apply": "Settings were saved, but the running gateway could not reload: {{error}}"
       },
       "closeHint": "Once confirmed, import continues saving after the dialog is closed."
+    },
+    "remoteSessions": {
+      "unavailable": "Host removed or unavailable",
+      "chooseHost": "The selected host is unavailable. Choose another host.",
+      "raw": "Raw transcript (JSONL)",
+      "host": "Session host",
+      "local": "Local",
+      "manageHosts": "Manage hosts",
+      "search": "Search remote sessions",
+      "exported": "Exported to this computer",
+      "confirmTrash": "Move “{{title}}” and all its subagent conversations to the trash on {{host}}?",
+      "back": "Back to sessions",
+      "trash": "Remote trash",
+      "scope": "Host: {{host}}. Trash and restore run remotely; exports are saved locally.",
+      "empty": "No sessions found",
+      "view": "View",
+      "moveToTrash": "Move to trash",
+      "limit": "Showing {{shown}} of {{total}}. Search to narrow the results.",
+      "transcript": "Session transcript",
+      "truncated": "Preview truncated. Export to save the complete transcript.",
+      "title": "Remote sessions",
+      "count": "{{count}} sessions",
+      "searchLabel": "Search sessions",
+      "searchPlaceholder": "Search title, directory, or ID",
+      "loadError": "The remote session operation failed. Check the host connection and try again.",
+      "emptyTrash": "Trash is empty",
+      "noMatches": "No matching sessions",
+      "adjustSearch": "Try a different title, directory, or ID.",
+      "emptyHint": "There are no sessions to manage on this host.",
+      "noReadableMessages": "No conversation messages could be extracted. You can view the raw record.",
+      "user": "User",
+      "assistant": "Assistant"
     },
     "hosts": {
       "displayNameOptional": "Display name (optional)",

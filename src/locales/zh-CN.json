@@ -4143,6 +4143,14 @@
       }
     },
     "sessionManager": {
+      "shared": {
+        "restored": "已恢复 {{count}} 条主会话及其子代理",
+        "purged": "已永久删除 {{count}} 条主会话及其子代理备份",
+        "emptied": "废纸篓已清空",
+        "trashed": "已将 {{count}} 条主会话及其子代理移到废纸篓"
+      },
+      "childAgents": "子代理（{{count}}）",
+      "selectConversation": "选择对话：{{title}}",
       "title": "会话管理",
       "desc": "同步、可见性修复、清理与恢复统一放在这里：顶部可一键同步会话、修复会话可见性或从废纸篓恢复，下面按项目展开查看会话并移到废纸篓。",
       "actions": {
@@ -4164,7 +4172,7 @@
       },
       "confirm": {
         "title": "移到废纸篓",
-        "message": "会将所选会话从对应实例中移到废纸篓，便于后续恢复；运行中的实例可能需要重启后才会反映。确认继续？",
+        "message": "会将所选会话及其全部子代理会话从对应实例中移到废纸篓，便于后续恢复。确认继续？",
         "syncMessage": "会将缺失的 rollout、session_index 条目和会话文件时间同步到所有实例，并触发官方 Codex 重建会话索引；已有内容不会重复写入，写入前会先备份目标文件。确认继续？",
         "repairVisibilityMessage": "会校正官方 Codex state DB 中影响侧边栏显示的会话记录；写入前会先备份将要修改的 state DB。"
       },
@@ -4189,10 +4197,6 @@
         "repairVisibilitySkippedOnly": "未发现需要写入的会话索引差异；已跳过 {{count}} 个无效或损坏的 SQLite 会话库，需由 Codex 重新生成后才能修复其中的记录",
         "repairVisibilitySkippedWithBase": "{{message}}；已跳过 {{count}} 个无效或损坏的 SQLite 会话库，需由 Codex 重新生成后才能修复其中的记录",
         "trashSummary": "已将 {{count}} 条会话移到废纸篓，并已在官方 Codex 中删除",
-        "trashSummaryFallback": "已将 {{count}} 条会话移到废纸篓，并已触发官方 Codex 重建会话索引",
-        "trashSummaryRunningHint": "运行中的实例可能需要刷新或重启后显示",
-        "trashSummaryFallbackHint": "{{count}} 个实例的官方删除未完成，已按文件方式移除，Codex 重启后会同步",
-        "trashSummaryRebuildFailedHint": "{{count}} 个实例的官方侧边栏索引重建未完成，重启 Codex 后会重新加载",
         "trashSummaryEmpty": "所选会话在当前实例集合中不存在，无需处理"
       },
       "groupCount": "{{count}} 条会话",
@@ -4378,10 +4382,16 @@
         "emptyFilteredTitle": "当前筛选无会话",
         "emptyFilteredDesc": "调整搜索、来源或选择状态后再试。"
       },
+      "archive": {
+        "active": "未归档",
+        "archived": "已归档",
+        "all": "全部归档状态",
+        "label": "归档状态"
+      },
       "kindFilter": "会话类型",
       "kind": {
         "conversation": "对话",
-        "external": "外部",
+        "external": "非交互任务",
         "subagent": "子代理",
         "all": "全部类型"
       },
@@ -4396,7 +4406,7 @@
       "tab": "会话用量",
       "listTab": "会话列表",
       "title": "会话用量",
-      "desc": "从本机 Codex 会话日志汇总真实 Token 用量，不依赖官方配额或 API 服务请求日志。",
+      "desc": "从所选主机的 Codex 会话日志汇总真实 Token 用量，不依赖官方配额或 API 服务请求日志。",
       "hint": "官方配额是套餐额度；API 服务日志只覆盖走本地网关的请求。这里按会话 JSONL 的每次请求用量增量汇总。",
       "range": {
         "label": "时间范围",
@@ -4418,8 +4428,8 @@
         "idle": "尚未扫描",
         "scanning": "正在扫描会话日志…",
         "ready": "已扫描 {{files}} 个文件，累计 {{requests}} 次请求",
-        "lastSynced": "上次同步 {{time}}",
-        "deferred": "{{count}} 个分叉会话待父会话就绪",
+        "lastSynced": "上次检查 {{time}}",
+        "unprocessed": "{{count}} 个会话文件暂未计入统计",
         "errors": "{{count}} 个文件解析失败"
       },
       "cards": {
@@ -4445,7 +4455,7 @@
       },
       "empty": {
         "title": "还没有会话用量",
-        "desc": "打开此页后会在后台扫描本机 Codex 会话日志及多开会话目录。若刚用过 Codex，点刷新即可。"
+        "desc": "打开此页后会在后台扫描所选主机的 Codex 会话日志。若刚用过 Codex，点刷新即可。"
       },
       "rebuildConfirm": {
         "title": "重新扫描",
@@ -5805,6 +5815,38 @@
         "apply": "配置已保存，但运行网关未能重载：{{error}}"
       },
       "closeHint": "确认导入后，即使关闭弹框也会继续保存。"
+    },
+    "remoteSessions": {
+      "unavailable": "主机已移除或不可用",
+      "chooseHost": "所选主机不可用，请选择其他主机。",
+      "raw": "原始记录（JSONL）",
+      "host": "会话所在主机",
+      "local": "本地",
+      "manageHosts": "管理主机",
+      "search": "搜索远程会话",
+      "exported": "已导出到本地",
+      "confirmTrash": "将“{{title}}”及其全部子代理会话移入 {{host}} 的回收站？",
+      "back": "返回会话",
+      "trash": "远程回收站",
+      "scope": "当前主机：{{host}}。删除和恢复在远程执行，导出保存到本地。",
+      "empty": "没有找到会话",
+      "view": "查看",
+      "moveToTrash": "移入回收站",
+      "limit": "显示 {{shown}} / {{total}} 条，请搜索缩小范围。",
+      "transcript": "会话记录",
+      "truncated": "预览已截断；导出可保存完整记录。",
+      "title": "远程会话",
+      "count": "{{count}} 条",
+      "searchLabel": "搜索会话",
+      "searchPlaceholder": "按标题、目录或 ID 搜索",
+      "loadError": "无法完成远程会话操作。请检查主机连接后重试。",
+      "emptyTrash": "回收站为空",
+      "noMatches": "未找到匹配会话",
+      "adjustSearch": "请调整标题、目录或 ID 后再试。",
+      "emptyHint": "该主机上暂无可管理的会话。",
+      "noReadableMessages": "没有可提取的对话消息，可查看原始记录。",
+      "user": "用户",
+      "assistant": "助手"
     },
     "hosts": {
       "displayNameOptional": "显示名称（可选）",

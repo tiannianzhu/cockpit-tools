@@ -1,10 +1,17 @@
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as JsonValue};
+
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use tokio_tungstenite::tungstenite::{self, Message, WebSocket};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -18,6 +25,18 @@ const CODEX_APP_SERVER_MACOS_EXECUTABLES: &[&str] = &[
 ];
 const CODEX_APP_SERVER_EXECUTABLE_ENV: &str = "CODEX_APP_SERVER_EXECUTABLE";
 const APP_SERVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+const ALL_SOURCE_KINDS: &[&str] = &[
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown",
+];
 
 pub fn rebuild_thread_metadata(codex_home: &Path) -> Result<(), String> {
     rebuild_imported_thread_metadata(codex_home, &[])
@@ -27,182 +46,69 @@ pub fn rebuild_imported_thread_metadata(
     codex_home: &Path,
     mapped_threads: &[(String, String)],
 ) -> Result<(), String> {
-    let flow_started = Instant::now();
-    crate::modules::logger::log_info(&format!(
-        "[Codex Official AppServer] rebuild_thread_metadata flow started: codex_home={}",
-        codex_home.display()
-    ));
-    let sanitize_started = Instant::now();
-    crate::modules::codex_config_format::sanitize_codex_config_toml_file(
-        &codex_home.join("config.toml"),
-    )?;
-    crate::modules::logger::log_info(&format!(
-        "[Codex Official AppServer] sanitize config finished: codex_home={}, elapsed_ms={}, total_ms={}",
-        codex_home.display(),
-        sanitize_started.elapsed().as_millis(),
-        flow_started.elapsed().as_millis()
-    ));
-    let executable_started = Instant::now();
-    let executable = official_app_server_executable()?;
-    crate::modules::logger::log_info(&format!(
-        "[Codex Official AppServer] executable resolved: executable={}, elapsed_ms={}, total_ms={}",
-        executable.display(),
-        executable_started.elapsed().as_millis(),
-        flow_started.elapsed().as_millis()
-    ));
-    crate::modules::logger::log_info(&format!(
-        "[Codex Official AppServer] starting rebuild_thread_metadata: executable={}, codex_home={}",
-        executable.display(),
-        codex_home.display()
-    ));
-    let spawn_started = Instant::now();
-    let mut child = build_app_server_command(&executable, codex_home)
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "启动官方 Codex app-server 失败 ({} / CODEX_HOME={}): {}",
-                executable.display(),
-                codex_home.display(),
-                error
-            )
+    // The official list call repairs rollout metadata before project assignment.
+    let mut server = AppServerSession::start(codex_home)?;
+    list_threads_from(&mut server, false, None)?;
+    if !mapped_threads.is_empty() {
+        assign_imported_threads_to_projects(mapped_threads, |method, params, deadline| {
+            server.request_until(method, params, deadline)
         })?;
-    crate::modules::logger::log_info(&format!(
-        "[Codex Official AppServer] child spawned: codex_home={}, pid={:?}, elapsed_ms={}, total_ms={}",
-        codex_home.display(),
-        child.id(),
-        spawn_started.elapsed().as_millis(),
-        flow_started.elapsed().as_millis()
-    ));
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("无法读取官方 app-server stdout")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("无法读取官方 app-server stderr")?;
-    let mut stdin = child.stdin.take().ok_or("无法写入官方 app-server stdin")?;
-    let (sender, receiver) = mpsc::channel::<String>();
-    let reader = std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            let _ = sender.send(line);
-        }
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            crate::modules::logger::log_warn(&format!(
-                "[Codex Official AppServer][stderr] {}",
-                line
-            ));
-        }
-    });
-
-    let result = (|| {
-        let initialize_started = Instant::now();
-        send_request(
-            &mut stdin,
-            json!({
-                "method": "initialize",
-                "id": 1,
-                "params": {
-                    "clientInfo": {
-                        "name": "cockpit-tools",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": if mapped_threads.is_empty() {
-                        JsonValue::Null
-                    } else {
-                        json!({ "experimentalApi": true })
-                    },
-                },
-            }),
-        )?;
-        wait_for_response(&receiver, 1)?;
-        crate::modules::logger::log_info(&format!(
-            "[Codex Official AppServer] initialize finished: codex_home={}, elapsed_ms={}, total_ms={}",
-            codex_home.display(),
-            initialize_started.elapsed().as_millis(),
-            flow_started.elapsed().as_millis()
-        ));
-
-        let thread_list_started = Instant::now();
-        send_request(
-            &mut stdin,
-            json!({
-                "method": "thread/list",
-                "id": 2,
-                "params": {
-                    "cursor": null,
-                    "limit": 1,
-                    "sortKey": "updated_at",
-                    "sortDirection": "desc",
-                    "modelProviders": null,
-                    "sourceKinds": [],
-                    "archived": false,
-                },
-            }),
-        )?;
-        wait_for_response(&receiver, 2)?;
-        if !mapped_threads.is_empty() {
-            assign_imported_threads_to_projects(&mut stdin, &receiver, mapped_threads)?;
-        }
-        crate::modules::logger::log_info(&format!(
-            "[Codex Official AppServer] thread/list finished: codex_home={}, elapsed_ms={}, total_ms={}",
-            codex_home.display(),
-            thread_list_started.elapsed().as_millis(),
-            flow_started.elapsed().as_millis()
-        ));
-        Ok::<(), String>(())
-    })();
-
-    let finish_started = Instant::now();
-    finish_child(&mut child);
-    let _ = reader.join();
-    let _ = stderr_reader.join();
-    crate::modules::logger::log_info(&format!(
-        "[Codex Official AppServer] child finished: codex_home={}, elapsed_ms={}, total_ms={}",
-        codex_home.display(),
-        finish_started.elapsed().as_millis(),
-        flow_started.elapsed().as_millis()
-    ));
-    let result = result.and_then(|()| {
-        let normalized_count =
-            crate::modules::codex_session_visibility::normalize_official_thread_cwds(codex_home)?;
-        if normalized_count > 0 {
-            crate::modules::logger::log_info(&format!(
-                "[Codex Official AppServer] normalized {} Desktop thread cwd row(s): codex_home={}",
-                normalized_count,
-                codex_home.display()
-            ));
-        }
-        Ok(())
-    });
-    if let Err(error) = &result {
-        crate::modules::logger::log_warn(&format!(
-            "[Codex Official AppServer] rebuild_thread_metadata failed: codex_home={}, elapsed_ms={}, error={}",
-            codex_home.display(),
-            flow_started.elapsed().as_millis(),
-            error
-        ));
-    } else {
-        crate::modules::logger::log_info(&format!(
-            "[Codex Official AppServer] rebuild_thread_metadata completed: codex_home={}, elapsed_ms={}",
-            codex_home.display(),
-            flow_started.elapsed().as_millis()
-        ));
     }
-    result
+    drop(server);
+    crate::modules::codex_session_visibility::normalize_official_thread_cwds(codex_home)?;
+    Ok(())
+}
+
+pub(crate) fn list_threads(
+    codex_home: &Path,
+    archived: bool,
+    ancestor_thread_id: Option<&str>,
+) -> Result<Vec<JsonValue>, String> {
+    let mut server = AppServerSession::start(codex_home)?;
+    list_threads_from(&mut server, archived, ancestor_thread_id)
+}
+
+fn list_threads_from(
+    server: &mut AppServerSession,
+    archived: bool,
+    ancestor_thread_id: Option<&str>,
+) -> Result<Vec<JsonValue>, String> {
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut threads = Vec::new();
+    loop {
+        let result = server.request(
+            "thread/list",
+            json!({
+                "cursor": cursor,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "modelProviders": [],
+                "sourceKinds": ALL_SOURCE_KINDS,
+                "archived": archived,
+                "ancestorThreadId": ancestor_thread_id,
+            }),
+        )?;
+        let page = result
+            .get("data")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| format!("官方 thread/list 响应缺少 data 数组: {}", result))?;
+        threads.extend(page.iter().cloned());
+        let next = result.get("nextCursor").and_then(JsonValue::as_str);
+        match next {
+            Some(next) if seen_cursors.insert(next.to_string()) => cursor = Some(next.to_string()),
+            Some(_) => return Err("官方 thread/list 重复返回分页游标".into()),
+            None => break,
+        }
+    }
+    Ok(threads)
 }
 
 fn assign_imported_threads_to_projects(
-    stdin: &mut impl Write,
-    receiver: &mpsc::Receiver<String>,
     mapped_threads: &[(String, String)],
+    mut request: impl FnMut(&str, JsonValue, Instant) -> Result<JsonValue, AppServerWaitFailure>,
 ) -> Result<(), String> {
-    let mut request_id = 3;
     let mut cursor = JsonValue::Null;
     let mut projects = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -211,14 +117,11 @@ fn assign_imported_threads_to_projects(
         if Instant::now() >= deadline {
             return Err("更新项目归属超时，已导入的会话将保留".into());
         }
-        send_request(
-            stdin,
-            json!({
-                "method": "project/list", "id": request_id,
-                "params": { "cursor": cursor, "limit": 100 }
-            }),
-        )?;
-        let response = match wait_for_response_value_until(receiver, request_id, deadline) {
+        let result = match request(
+            "project/list",
+            json!({ "cursor": cursor, "limit": 100 }),
+            deadline,
+        ) {
             Ok(response) => response,
             Err(error) => {
                 let message = error.message();
@@ -230,9 +133,6 @@ fn assign_imported_threads_to_projects(
                 return Err(message.to_string());
             }
         };
-        let result = response
-            .get("result")
-            .ok_or("project/list 响应缺少 result")?;
         projects.extend(
             result
                 .get("data")
@@ -241,7 +141,6 @@ fn assign_imported_threads_to_projects(
                 .iter()
                 .cloned(),
         );
-        request_id += 1;
         cursor = result.get("nextCursor").cloned().unwrap_or(JsonValue::Null);
         if cursor.is_null() {
             break;
@@ -270,20 +169,16 @@ fn assign_imported_threads_to_projects(
                     continue;
                 }
             };
-        send_request(
-            stdin,
-            json!({
-                "method": "thread/metadata/update", "id": request_id,
-                "params": { "threadId": thread_id, "projectId": project_id }
-            }),
-        )?;
-        if let Err(error) = wait_for_response_value_until(receiver, request_id, deadline) {
+        if let Err(error) = request(
+            "thread/metadata/update",
+            json!({ "threadId": thread_id, "projectId": project_id }),
+            deadline,
+        ) {
             if error.is_timeout() {
                 return Err(error.message().to_string());
             }
             warnings.push(error.message().to_string());
         }
-        request_id += 1;
     }
     warnings.sort();
     warnings.dedup();
@@ -294,157 +189,134 @@ fn assign_imported_threads_to_projects(
     }
 }
 
-/// 通过官方 app-server 的 `thread/delete` 删除会话线程（与官方客户端一致），
-/// 返回成功删除的条数。官方删除会同时清理 state DB、会话目录与 rollout 文件，
-/// 因此客户端不需要重启或重新扫描即可同步。
-///
-/// 单个会话删除失败只记录日志并继续，调用方可根据返回条数决定是否回退到
-/// 文件方式删除；只有 app-server 无法启动这类整体性错误才返回 `Err`。
-pub fn delete_threads(codex_home: &Path, session_ids: &[String]) -> Result<usize, String> {
-    let unique_session_ids = dedupe_session_ids(session_ids);
-    if unique_session_ids.is_empty() {
-        return Ok(0);
-    }
+pub(crate) fn read_thread(codex_home: &Path, id: &str) -> Result<JsonValue, String> {
+    let mut server = AppServerSession::start(codex_home)?;
+    read_thread_from(&mut server, id)
+}
 
-    let flow_started = Instant::now();
-    crate::modules::logger::log_info(&format!(
-        "[Codex Official AppServer] delete_threads flow started: codex_home={}, requested={}",
-        codex_home.display(),
-        unique_session_ids.len()
-    ));
-    if let Err(error) = crate::modules::codex_config_format::sanitize_codex_config_toml_file(
-        &codex_home.join("config.toml"),
-    ) {
-        crate::modules::logger::log_warn(&format!(
-            "[Codex Official AppServer] sanitize config before delete_threads failed, continuing: codex_home={}, error={}",
-            codex_home.display(),
-            error
+fn read_thread_from(server: &mut AppServerSession, id: &str) -> Result<JsonValue, String> {
+    let result = server.request(
+        "thread/read",
+        json!({ "threadId": id, "includeTurns": false }),
+    )?;
+    let thread = result
+        .get("thread")
+        .cloned()
+        .ok_or_else(|| format!("官方 thread/read 响应缺少 thread: {}", result))?;
+    if thread.get("id").and_then(JsonValue::as_str) != Some(id) {
+        return Err(format!(
+            "官方 thread/read 返回了错误的会话 ID: expected={}",
+            id
         ));
     }
-    let executable = official_app_server_executable()?;
-    let mut child = build_app_server_command(&executable, codex_home)
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "启动官方 Codex app-server 失败 ({} / CODEX_HOME={}): {}",
-                executable.display(),
-                codex_home.display(),
-                error
-            )
-        })?;
-    crate::modules::logger::log_info(&format!(
-        "[Codex Official AppServer] delete_threads child spawned: codex_home={}, pid={:?}, requested={}",
-        codex_home.display(),
-        child.id(),
-        unique_session_ids.len()
-    ));
+    Ok(thread)
+}
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("无法读取官方 app-server stdout")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("无法读取官方 app-server stderr")?;
-    let mut stdin = child.stdin.take().ok_or("无法写入官方 app-server stdin")?;
-    let (sender, receiver) = mpsc::channel::<String>();
-    let reader = std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            let _ = sender.send(line);
-        }
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            crate::modules::logger::log_warn(&format!(
-                "[Codex Official AppServer][stderr] {}",
-                line
+pub(crate) fn archive_thread(codex_home: &Path, id: &str, archived: bool) -> Result<(), String> {
+    let mut server = AppServerSession::start(codex_home)?;
+    server.request(
+        if archived {
+            "thread/archive"
+        } else {
+            "thread/unarchive"
+        },
+        json!({ "threadId": id }),
+    )?;
+    Ok(())
+}
+
+/// Register a restored rollout through the official API, then set its archive state.
+/// The caller retains its backup until this returns successfully.
+pub(crate) fn register_restored_thread(
+    codex_home: &Path,
+    id: &str,
+    path: &Path,
+    archived: bool,
+    name: Option<&str>,
+) -> Result<(), String> {
+    let mut server = AppServerSession::start(codex_home)?;
+    let resume_path = if archived {
+        // The server refuses to resume a rollout while it lives in
+        // archived_sessions. Unarchive moves it to sessions and returns the
+        // new path; after registration we archive it again.
+        let unarchived = server.request("thread/unarchive", json!({ "threadId": id }))?;
+        if unarchived.pointer("/thread/id").and_then(JsonValue::as_str) != Some(id) {
+            return Err(format!(
+                "官方 thread/unarchive 返回了错误的会话 ID: expected={}",
+                id
             ));
         }
-    });
+        unarchived
+            .pointer("/thread/path")
+            .and_then(JsonValue::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("官方 thread/unarchive 响应缺少 thread.path: {}", unarchived))?
+    } else {
+        path.to_path_buf()
+    };
+    let result = server.request(
+        "thread/resume",
+        json!({
+            "threadId": id,
+            "path": resume_path.to_string_lossy(),
+            "excludeTurns": true,
+        }),
+    )?;
+    let returned_id = result
+        .pointer("/thread/id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("官方 thread/resume 响应缺少 thread.id: {}", result))?;
+    if returned_id != id {
+        return Err(format!(
+            "恢复会话 ID 不匹配: expected={}, returned={}",
+            id, returned_id
+        ));
+    }
+    if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+        server.request("thread/name/set", json!({ "threadId": id, "name": name }))?;
+    }
+    if archived {
+        server.request("thread/archive", json!({ "threadId": id }))?;
+    }
+    let thread = read_thread_from(&mut server, id)?;
+    if thread.get("id").and_then(JsonValue::as_str) != Some(id) {
+        return Err(format!("恢复后无法验证会话 ID: {}", id));
+    }
+    Ok(())
+}
 
-    let result = (|| {
-        send_request(
-            &mut stdin,
-            json!({
-                "method": "initialize",
-                "id": 1,
-                "params": {
-                    "clientInfo": {
-                        "name": "cockpit-tools",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": null,
-                },
-            }),
-        )?;
-        wait_for_response(&receiver, 1)?;
+/// `thread/delete` removes a thread and its spawned descendants. Any partial
+/// failure returns an error with the IDs already acknowledged by the server.
+pub struct ThreadDeleteResult {
+    pub deleted: Vec<String>,
+    pub failures: Vec<String>,
+}
 
-        let mut deleted_count = 0usize;
-        for (index, session_id) in unique_session_ids.iter().enumerate() {
-            let request_id = 2 + index as i64;
-            if let Err(error) = send_request(
-                &mut stdin,
-                json!({
-                    "method": "thread/delete",
-                    "id": request_id,
-                    "params": { "threadId": session_id },
-                }),
-            ) {
-                crate::modules::logger::log_warn(&format!(
-                    "[Codex Official AppServer] delete_threads write failed: codex_home={}, thread_id={}, error={}",
-                    codex_home.display(),
-                    session_id,
-                    error
-                ));
-                break;
-            }
-            match wait_for_response_value(&receiver, request_id) {
-                Ok(_) => deleted_count += 1,
-                Err(error) if error.is_timeout() => {
-                    // app-server 已无响应：继续逐条等待会让批量删除长时间卡住，
-                    // 剩余会话交给文件方式删除兜底。
-                    crate::modules::logger::log_warn(&format!(
-                        "[Codex Official AppServer] delete_threads 超时，停止继续删除并回退: codex_home={}, remaining={}, error={}",
-                        codex_home.display(),
-                        unique_session_ids.len() - index,
-                        error.message()
-                    ));
-                    break;
-                }
-                Err(error) => {
-                    crate::modules::logger::log_warn(&format!(
-                        "[Codex Official AppServer] delete_threads failed for thread: codex_home={}, thread_id={}, error={}",
-                        codex_home.display(),
-                        session_id,
-                        error.message()
-                    ));
-                }
-            }
+pub fn delete_threads(
+    codex_home: &Path,
+    session_ids: &[String],
+) -> Result<ThreadDeleteResult, String> {
+    let mut server = AppServerSession::for_deletion(codex_home)?;
+    Ok(delete_threads_with(session_ids, |id| {
+        server
+            .request("thread/delete", json!({ "threadId": id }))
+            .map(|_| ())
+    }))
+}
+
+fn delete_threads_with(
+    session_ids: &[String],
+    mut delete: impl FnMut(&str) -> Result<(), String>,
+) -> ThreadDeleteResult {
+    let mut result = ThreadDeleteResult {
+        deleted: Vec::new(),
+        failures: Vec::new(),
+    };
+    for id in dedupe_session_ids(session_ids) {
+        match delete(&id) {
+            Ok(()) => result.deleted.push(id),
+            Err(error) => result.failures.push(format!("{}: {}", id, error)),
         }
-        Ok::<usize, String>(deleted_count)
-    })();
-
-    finish_child(&mut child);
-    let _ = reader.join();
-    let _ = stderr_reader.join();
-    match &result {
-        Ok(deleted_count) => crate::modules::logger::log_info(&format!(
-            "[Codex Official AppServer] delete_threads completed: codex_home={}, requested={}, deleted={}, elapsed_ms={}",
-            codex_home.display(),
-            unique_session_ids.len(),
-            deleted_count,
-            flow_started.elapsed().as_millis()
-        )),
-        Err(error) => crate::modules::logger::log_warn(&format!(
-            "[Codex Official AppServer] delete_threads failed: codex_home={}, requested={}, elapsed_ms={}, error={}",
-            codex_home.display(),
-            unique_session_ids.len(),
-            flow_started.elapsed().as_millis(),
-            error
-        )),
     }
     result
 }
@@ -471,7 +343,7 @@ pub(crate) fn official_app_server_executable() -> Result<PathBuf, String> {
     add_codex_app_server_candidates(&mut candidates);
 
     for executable in &candidates {
-        if executable.exists() {
+        if executable.is_file() {
             return Ok(executable.clone());
         }
     }
@@ -498,7 +370,7 @@ fn add_codex_app_server_candidates(candidates: &mut Vec<PathBuf>) {
 
     #[cfg(target_os = "macos")]
     for executable in CODEX_APP_SERVER_MACOS_EXECUTABLES {
-        push_candidate(candidates, PathBuf::from(executable));
+        push_candidate_from_codex_launch_path(candidates, Path::new(executable));
     }
 }
 
@@ -629,6 +501,262 @@ fn build_app_server_command(executable: &Path, codex_home: &Path) -> Command {
     command
 }
 
+enum AppServerTransport {
+    Stdio(AppServerProcess),
+    #[cfg(unix)]
+    Shared(Box<WebSocket<UnixStream>>),
+}
+
+struct AppServerProcess {
+    child: Child,
+    stdin: ChildStdin,
+    receiver: mpsc::Receiver<String>,
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
+}
+
+struct AppServerSession {
+    transport: AppServerTransport,
+    next_id: i64,
+}
+
+impl AppServerSession {
+    fn for_deletion(codex_home: &Path) -> Result<Self, String> {
+        #[cfg(unix)]
+        if let Some(socket) = connect_shared_app_server(codex_home)? {
+            return Self::initialize(AppServerTransport::Shared(Box::new(socket)));
+        }
+        Self::start(codex_home)
+    }
+
+    fn start(codex_home: &Path) -> Result<Self, String> {
+        let executable = official_app_server_executable()?;
+        let mut child = build_app_server_command(&executable, codex_home)
+            .spawn()
+            .map_err(|error| {
+                format!(
+                    "启动官方 Codex app-server 失败 ({} / CODEX_HOME={}): {}",
+                    executable.display(),
+                    codex_home.display(),
+                    error
+                )
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("无法读取官方 app-server stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or("无法读取官方 app-server stderr")?;
+        let stdin = child.stdin.take().ok_or("无法写入官方 app-server stdin")?;
+        let (sender, receiver) = mpsc::channel();
+        let stdout_reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                crate::modules::logger::log_warn(&format!(
+                    "[Codex Official AppServer][stderr] {}",
+                    line
+                ));
+            }
+        });
+        Self::initialize(AppServerTransport::Stdio(AppServerProcess {
+            child,
+            stdin,
+            receiver,
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
+        }))
+    }
+
+    fn initialize(transport: AppServerTransport) -> Result<Self, String> {
+        let mut session = Self {
+            transport,
+            next_id: 1,
+        };
+        session.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "cockpit-tools",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": { "experimentalApi": true },
+            }),
+        )?;
+        session.send(json!({ "method": "initialized" }))?;
+        Ok(session)
+    }
+
+    fn send(&mut self, request: JsonValue) -> Result<(), String> {
+        match &mut self.transport {
+            AppServerTransport::Stdio(process) => send_request(&mut process.stdin, request),
+            #[cfg(unix)]
+            AppServerTransport::Shared(socket) => socket
+                .send(Message::Text(request.to_string().into()))
+                .map_err(|error| format!("写入官方共享 app-server 失败: {}", error)),
+        }
+    }
+
+    fn request(&mut self, method: &str, params: JsonValue) -> Result<JsonValue, String> {
+        self.request_until(method, params, Instant::now() + APP_SERVER_RESPONSE_TIMEOUT)
+            .map_err(|error| error.message().to_string())
+    }
+
+    fn request_until(
+        &mut self,
+        method: &str,
+        params: JsonValue,
+        deadline: Instant,
+    ) -> Result<JsonValue, AppServerWaitFailure> {
+        let deadline = deadline.min(Instant::now() + APP_SERVER_RESPONSE_TIMEOUT);
+        if Instant::now() >= deadline {
+            return Err(AppServerWaitFailure::Timeout(
+                "更新项目归属超时，已导入的会话将保留".into(),
+            ));
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(json!({ "method": method, "id": id, "params": params }))
+            .map_err(AppServerWaitFailure::Response)?;
+        let response = match &mut self.transport {
+            AppServerTransport::Stdio(process) => {
+                wait_for_response_value_until(&process.receiver, id, deadline)?
+            }
+            #[cfg(unix)]
+            AppServerTransport::Shared(socket) => {
+                wait_for_socket_response_until(socket, id, deadline)?
+            }
+        };
+        response.get("result").cloned().ok_or_else(|| {
+            AppServerWaitFailure::Response(format!("官方 app-server {} 响应缺少 result", method))
+        })
+    }
+}
+
+impl Drop for AppServerSession {
+    fn drop(&mut self) {
+        match &mut self.transport {
+            AppServerTransport::Stdio(process) => {
+                finish_child(&mut process.child);
+                if let Some(reader) = process.stdout_reader.take() {
+                    let _ = reader.join();
+                }
+                if let Some(reader) = process.stderr_reader.take() {
+                    let _ = reader.join();
+                }
+            }
+            #[cfg(unix)]
+            AppServerTransport::Shared(socket) => {
+                let _ = socket.close(None);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn connect_shared_app_server(codex_home: &Path) -> Result<Option<WebSocket<UnixStream>>, String> {
+    let path = codex_home.join("app-server-control/app-server-control.sock");
+    let stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => {
+            return Err(format!(
+                "连接官方 app-server 失败 ({}): {}",
+                path.display(),
+                error
+            ))
+        }
+    };
+    stream
+        .set_read_timeout(Some(APP_SERVER_RESPONSE_TIMEOUT))
+        .and_then(|_| stream.set_write_timeout(Some(APP_SERVER_RESPONSE_TIMEOUT)))
+        .map_err(|error| format!("设置官方 app-server 连接超时失败: {}", error))?;
+    let config =
+        tungstenite::protocol::WebSocketConfig::default().max_message_size(Some(32 * 1024 * 1024));
+    // The control socket speaks WebSocket, not the stdio JSONL protocol.
+    // A listening service's handshake failure must not start a second server.
+    let (socket, _) =
+        tungstenite::client::client_with_config("ws://localhost/", stream, Some(config)).map_err(
+            |error| {
+                format!(
+                    "官方 app-server WebSocket 握手失败 ({}): {}",
+                    path.display(),
+                    error
+                )
+            },
+        )?;
+    Ok(Some(socket))
+}
+
+#[cfg(unix)]
+fn wait_for_socket_response_until(
+    socket: &mut WebSocket<UnixStream>,
+    request_id: i64,
+    deadline: Instant,
+) -> Result<JsonValue, AppServerWaitFailure> {
+    let deadline = deadline.min(Instant::now() + APP_SERVER_RESPONSE_TIMEOUT);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AppServerWaitFailure::Timeout(format!(
+                "等待官方 app-server 响应超时 (id={})",
+                request_id
+            )));
+        }
+        socket
+            .get_mut()
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| {
+                AppServerWaitFailure::Response(format!(
+                    "设置官方 app-server 连接超时失败: {}",
+                    error
+                ))
+            })?;
+        match socket.read().map_err(|error| match &error {
+            tungstenite::Error::Io(io)
+                if matches!(
+                    io.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                AppServerWaitFailure::Timeout(format!(
+                    "等待官方 app-server 响应超时 (id={})",
+                    request_id
+                ))
+            }
+            _ => AppServerWaitFailure::Response(format!("读取官方共享 app-server 失败: {}", error)),
+        })? {
+            Message::Text(line) => {
+                if let Some(response) = parse_response_value(&line, request_id)
+                    .map_err(AppServerWaitFailure::Response)?
+                {
+                    return Ok(response);
+                }
+            }
+            Message::Close(_) => {
+                return Err(AppServerWaitFailure::Response(
+                    "官方共享 app-server 已关闭连接".into(),
+                ))
+            }
+            _ => {}
+        }
+    }
+}
+
 fn send_request(stdin: &mut impl Write, request: JsonValue) -> Result<(), String> {
     let line = serde_json::to_string(&request)
         .map_err(|error| format!("序列化官方 app-server 请求失败: {}", error))?;
@@ -639,10 +767,7 @@ fn send_request(stdin: &mut impl Write, request: JsonValue) -> Result<(), String
         .map_err(|error| format!("写入官方 app-server 请求失败: {}", error))
 }
 
-/// 官方 app-server 响应等待失败：区分「整体无响应」和「单条请求返回错误」。
-///
-/// 批量删除需要据此决定是否继续发送后续请求：app-server 超时说明它已经不可用，
-/// 继续逐条等待只会让整个删除流程长时间卡住，此时应立刻回退到文件方式删除。
+#[derive(Debug)]
 enum AppServerWaitFailure {
     Timeout(String),
     Response(String),
@@ -658,23 +783,6 @@ impl AppServerWaitFailure {
             Self::Timeout(message) | Self::Response(message) => message,
         }
     }
-}
-
-fn wait_for_response(receiver: &mpsc::Receiver<String>, request_id: i64) -> Result<(), String> {
-    wait_for_response_value(receiver, request_id)
-        .map(|_| ())
-        .map_err(|error| error.message().to_string())
-}
-
-fn wait_for_response_value(
-    receiver: &mpsc::Receiver<String>,
-    request_id: i64,
-) -> Result<JsonValue, AppServerWaitFailure> {
-    wait_for_response_value_until(
-        receiver,
-        request_id,
-        Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
-    )
 }
 
 fn wait_for_response_value_until(
@@ -697,30 +805,38 @@ fn wait_for_response_value_until(
                 request_id
             ))
         })?;
-        let Ok(value) = serde_json::from_str::<JsonValue>(&line) else {
-            continue;
-        };
-        if value.get("id").and_then(JsonValue::as_i64) != Some(request_id) {
-            continue;
-        }
-        if let Some(error) = value.get("error") {
-            crate::modules::logger::log_warn(&format!(
-                "[Codex Official AppServer] response error: id={}, error={}",
-                request_id, error
-            ));
-            return Err(AppServerWaitFailure::Response(format!(
-                "官方 app-server 返回错误 (id={}): {}",
-                request_id, error
-            )));
-        }
-        if value.get("result").is_some() {
+        if let Some(value) =
+            parse_response_value(&line, request_id).map_err(AppServerWaitFailure::Response)?
+        {
             return Ok(value);
         }
-        return Err(AppServerWaitFailure::Response(format!(
+    }
+}
+
+fn parse_response_value(line: &str, request_id: i64) -> Result<Option<JsonValue>, String> {
+    let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
+        return Ok(None);
+    };
+    if value.get("id").and_then(JsonValue::as_i64) != Some(request_id) {
+        return Ok(None);
+    }
+    if let Some(error) = value.get("error") {
+        crate::modules::logger::log_warn(&format!(
+            "[Codex Official AppServer] response error: id={}, error={}",
+            request_id, error
+        ));
+        return Err(format!(
+            "官方 app-server 返回错误 (id={}): {}",
+            request_id, error
+        ));
+    }
+    if value.get("result").is_none() {
+        return Err(format!(
             "官方 app-server 响应缺少 result (id={}): {}",
             request_id, value
-        )));
+        ));
     }
+    Ok(Some(value))
 }
 
 fn finish_child(child: &mut Child) {
@@ -735,6 +851,22 @@ fn finish_child(child: &mut Child) {
 mod tests {
     use super::*;
 
+    fn assign_projects_with_responses(
+        stdin: &mut impl Write,
+        receiver: &mpsc::Receiver<String>,
+        mapped_threads: &[(String, String)],
+    ) -> Result<(), String> {
+        let mut request_id = 3;
+        assign_imported_threads_to_projects(mapped_threads, |method, params, deadline| {
+            let id = request_id;
+            request_id += 1;
+            send_request(stdin, json!({"method": method, "id": id, "params": params}))
+                .map_err(AppServerWaitFailure::Response)?;
+            let response = wait_for_response_value_until(receiver, id, deadline)?;
+            Ok(response["result"].clone())
+        })
+    }
+
     #[test]
     fn imported_project_binding_rejects_repeated_pagination_cursor() {
         let (sender, receiver) = mpsc::channel();
@@ -744,7 +876,7 @@ mod tests {
                 .unwrap();
         }
         let mut stdin = Vec::new();
-        assert!(assign_imported_threads_to_projects(
+        assert!(assign_projects_with_responses(
             &mut stdin,
             &receiver,
             &[("thread".into(), "/new/project".into())]
@@ -780,7 +912,7 @@ mod tests {
             .send(json!({"id":5,"result":{}}).to_string())
             .unwrap();
         let mut stdin = Vec::new();
-        assign_imported_threads_to_projects(
+        assign_projects_with_responses(
             &mut stdin,
             &receiver,
             &[("thread-1".into(), "/b/project".into())],
@@ -807,7 +939,7 @@ mod tests {
             )
             .unwrap();
         let mut stdin = Vec::new();
-        assign_imported_threads_to_projects(
+        assign_projects_with_responses(
             &mut stdin,
             &receiver,
             &[("thread-1".into(), "/b/project".into())],
@@ -821,7 +953,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         sender.send(json!({"id":3,"result":{"data":[{"id":"other","roots":[{"path":"/other"}]}],"nextCursor":null}}).to_string()).unwrap();
         let mut stdin = Vec::new();
-        let result = assign_imported_threads_to_projects(
+        let result = assign_projects_with_responses(
             &mut stdin,
             &receiver,
             &[("thread-1".into(), "/b/project".into())],
@@ -832,16 +964,184 @@ mod tests {
         assert_eq!(String::from_utf8(stdin).unwrap().lines().count(), 1);
     }
 
-    #[test]
-    fn maps_macos_launch_binary_to_resources_app_server() {
-        let launch_path = PathBuf::from("/Applications/Codex.app/Contents/MacOS/Codex");
-        let app_server_path = app_server_executable_from_codex_launch_path(&launch_path)
-            .expect("resolve app-server path");
+    #[cfg(unix)]
+    struct SocketHome(PathBuf);
 
+    #[cfg(unix)]
+    impl SocketHome {
+        fn new() -> Self {
+            // Keep the control socket path below macOS's Unix socket limit.
+            let home =
+                PathBuf::from("/tmp").join(format!("ctws-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(home.join("app-server-control")).unwrap();
+            Self(home)
+        }
+
+        fn socket_path(&self) -> PathBuf {
+            self.0.join("app-server-control/app-server-control.sock")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SocketHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_deletion_uses_the_existing_service_and_continues_after_rejection() {
+        use std::os::unix::net::UnixListener;
+        let home = SocketHome::new();
+        let listener = UnixListener::bind(home.socket_path()).unwrap();
+        let service = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let initialize: JsonValue =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(initialize["method"], "initialize");
+            assert_eq!(
+                initialize["params"]["capabilities"]["experimentalApi"],
+                true
+            );
+            socket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let initialized: JsonValue =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(initialized["method"], "initialized");
+
+            for (thread_id, rejected) in [("blocked", true), ("idle", false)] {
+                let request: JsonValue =
+                    serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "thread/delete");
+                assert_eq!(request["params"]["threadId"], thread_id);
+                let response = if rejected {
+                    json!({"id": request["id"], "error": {"message": "delete rejected"}})
+                } else {
+                    // Notifications must not be mistaken for the RPC response.
+                    socket
+                        .send(Message::Text(
+                            json!({"method": "thread/deleted", "params": {"threadId": thread_id}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .unwrap();
+                    json!({"id": request["id"], "result": {}})
+                };
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .unwrap();
+            }
+            assert!(matches!(socket.read().unwrap(), Message::Close(_)));
+            // Dropping the Cockpit client leaves the official service available.
+            let (next, _) = listener.accept().unwrap();
+            drop(next);
+        });
+        let result = delete_threads(&home.0, &["blocked".into(), "idle".into()]).unwrap();
+        assert_eq!(result.deleted, ["idle"]);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].contains("delete rejected"));
+        drop(UnixStream::connect(home.socket_path()).unwrap());
+        service.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_absent_or_refused_shared_sockets_allow_a_temporary_service() {
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        let home = SocketHome::new();
+        assert!(connect_shared_app_server(&home.0).unwrap().is_none());
+        let listener = UnixListener::bind(home.socket_path()).unwrap();
+        drop(listener);
+        assert!(connect_shared_app_server(&home.0).unwrap().is_none());
+        // A stale socket is left for Codex to manage, not removed by Cockpit.
+        assert!(home.socket_path().exists());
+        std::fs::remove_file(home.socket_path()).unwrap();
+        // A mismatched socket type fails consistently on macOS and Linux.
+        let _datagram = UnixDatagram::bind(home.socket_path()).unwrap();
+        assert!(connect_shared_app_server(&home.0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_handshake_failure_does_not_start_a_temporary_service() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        let home = SocketHome::new();
+        let listener = UnixListener::bind(home.socket_path()).unwrap();
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            stream.read(&mut buffer).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let error = match AppServerSession::for_deletion(&home.0) {
+            Err(error) => error,
+            Ok(_) => panic!("failed handshake must not start a different service"),
+        };
+        assert!(error.contains("WebSocket 握手失败"), "{error}");
+        service.join().unwrap();
+    }
+
+    #[test]
+    fn deletion_continues_after_a_rejected_thread() {
+        let mut visited = Vec::new();
+        let result =
+            delete_threads_with(&["first".into(), "blocked".into(), "last".into()], |id| {
+                visited.push(id.to_string());
+                if id == "blocked" {
+                    Err("forked history still references it".into())
+                } else {
+                    Ok(())
+                }
+            });
+        assert_eq!(visited, ["first", "blocked", "last"]);
+        assert_eq!(result.deleted, ["first", "last"]);
         assert_eq!(
-            app_server_path,
-            PathBuf::from("/Applications/Codex.app/Contents/Resources/codex")
+            result.failures,
+            ["blocked: forked history still references it"]
         );
+    }
+
+    #[test]
+    fn macos_candidates_prefer_embedded_cli_and_keep_legacy_fallback() {
+        for launch in [
+            "/fixture/ChatGPT.app",
+            "/fixture/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "/fixture/ChatGPT.app/Contents/Resources/codex",
+        ] {
+            let mut candidates = Vec::new();
+            push_candidate_from_codex_launch_path(&mut candidates, Path::new(launch));
+            assert_eq!(candidates, vec![
+                PathBuf::from("/fixture/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"),
+                PathBuf::from("/fixture/ChatGPT.app/Contents/Resources/codex"),
+            ]);
+        }
+    }
+
+    #[test]
+    fn keeps_direct_embedded_cli_path() {
+        let path = PathBuf::from(
+            "/fixture/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        );
+        let mut candidates = Vec::new();
+        push_candidate_from_codex_launch_path(&mut candidates, &path);
+        push_candidate_from_codex_launch_path(&mut candidates, &path);
+        assert_eq!(candidates, vec![path]);
     }
 
     #[test]
@@ -871,6 +1171,18 @@ mod tests {
         let mut candidates = Vec::new();
         push_candidate_from_codex_launch_path(&mut candidates, &path);
         assert_eq!(candidates, vec![path]);
+    }
+
+    #[test]
+    fn maps_macos_launch_binary_to_resources_app_server() {
+        let launch_path = PathBuf::from("/Applications/Codex.app/Contents/MacOS/Codex");
+        let app_server_path = app_server_executable_from_codex_launch_path(&launch_path)
+            .expect("resolve app-server path");
+
+        assert_eq!(
+            app_server_path,
+            PathBuf::from("/Applications/Codex.app/Contents/Resources/codex")
+        );
     }
 
     #[test]
