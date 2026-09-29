@@ -9,6 +9,9 @@ export type ModelProviderUsageMode =
 
 export interface ModelProviderModel {
   id: string;
+  contextWindow?: number | null;
+  supportsVision?: boolean | null;
+  reasoningEfforts?: string[];
   displayName?: string | null;
 }
 

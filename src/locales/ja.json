@@ -4357,6 +4357,28 @@
         "providerDefault": "プロバイダー既定",
         "sharedSettings": "モデル一覧と機能は選択した範囲に適用されます。プロトコル、認証方式、アドレスはプロバイダー全体の共通設定です。",
         "saveScope": "保存するとプロバイダーと関連アカウントが更新されます。現在のアカウントが対象の場合、ローカルの Codex 設定と認証情報も更新されます。クライアントは自動起動しません。"
+      },
+      "modelEditor": {
+        "title": "モデル一覧",
+        "hint": "モデルごとのコンテキスト、画像入力、推論能力を設定します。リモート適用時に完全なカタログを自動生成します。",
+        "duplicate": "モデル ID は既に存在します",
+        "invalidId": "モデル ID に空白やカンマは使用できません",
+        "fetching": "取得中…",
+        "fetch": "モデルを取得",
+        "modelIdPlaceholder": "モデル ID を入力",
+        "modelId": "モデル ID",
+        "add": "モデルを追加",
+        "empty": "モデルはまだありません。",
+        "context": "コンテキスト",
+        "vision": "画像入力",
+        "reasoning": "推論レベル",
+        "unset": "未設定",
+        "remove": "モデルを削除",
+        "unconfigured": "未設定",
+        "supportedLevels": "対応レベル",
+        "defaultLevel": "既定レベル",
+        "noUpstreamModels": "利用可能なモデルが返されませんでした。モデル ID を手動で追加してください。",
+        "displayName": "表示名"
       }
     },
     "quickSwitch": {

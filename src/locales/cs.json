@@ -4357,6 +4357,28 @@
         "providerDefault": "Výchozí poskytovatele",
         "sharedSettings": "Seznam modelů a jejich schopnosti platí pro zvolený rozsah. Protokol, ověřování a adresa jsou společná nastavení poskytovatele.",
         "saveScope": "Uložení aktualizuje poskytovatele a propojené účty. Pokud je ovlivněn aktuální účet, aktualizuje se také místní konfigurace a přihlašovací údaje Codex. Klient se automaticky nespustí."
+      },
+      "modelEditor": {
+        "add": "Přidat model",
+        "context": "Kontextové okno",
+        "defaultLevel": "Výchozí úroveň",
+        "displayName": "Zobrazovaný název",
+        "duplicate": "ID modelu již existuje",
+        "empty": "Zatím nebyly přidány žádné modely.",
+        "fetch": "Načíst modely",
+        "fetching": "Načítání…",
+        "hint": "Nastavte kontext, práci s obrázky a schopnosti uvažování pro každý model. Úplný katalog se vytvoří při použití na vzdáleném hostiteli.",
+        "invalidId": "ID modelů nesmí obsahovat mezery ani čárky",
+        "modelId": "ID modelu",
+        "modelIdPlaceholder": "Zadejte ID modelu",
+        "noUpstreamModels": "Poskytovatel nevrátil žádné dostupné modely. Přidejte ID modelu ručně.",
+        "reasoning": "Úrovně uvažování",
+        "remove": "Odebrat model",
+        "supportedLevels": "Podporované úrovně",
+        "title": "Modely",
+        "unconfigured": "Nenastaveno",
+        "unset": "Nenastaveno",
+        "vision": "Vstup obrázků"
       }
     },
     "quickSwitch": {

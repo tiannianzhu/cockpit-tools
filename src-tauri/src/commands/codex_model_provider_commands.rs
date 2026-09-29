@@ -606,9 +606,19 @@ fn list_model_provider_models(body: &serde_json::Value) -> Vec<CodexModelProvide
                     }
                     Some(CodexModelProviderModel {
                         id: id.to_string(),
+                        context_window: item.pointer("/info/meta/context_length").and_then(|v| v.as_u64()).filter(|v| *v > 0 && *v <= 9_007_199_254_740_991),
+                        supports_vision: item.pointer("/info/meta/capabilities/vision").and_then(|v| v.as_bool()),
+                        reasoning_efforts: item.pointer("/info/meta/reasoning_effort_modes")
+                            .and_then(|v| v.as_str()).map(|value| {
+                                let mut seen = std::collections::HashSet::new();
+                                value.split(',').map(str::trim).filter(|v| !v.is_empty())
+                                    .filter(|v| seen.insert((*v).to_string())).map(str::to_string).collect()
+                            }).unwrap_or_default(),
                         display_name: item
                             .get("display_name")
                             .or_else(|| item.get("displayName"))
+                            .or_else(|| item.get("name"))
+                            .or_else(|| item.pointer("/info/name"))
                             .and_then(|value| value.as_str())
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
@@ -632,6 +642,9 @@ pub struct CodexModelProviderUsageDetail {
 #[serde(rename_all = "camelCase")]
 pub struct CodexModelProviderModel {
     pub id: String,
+    pub context_window: Option<u64>,
+    pub supports_vision: Option<bool>,
+    pub reasoning_efforts: Vec<String>,
     pub display_name: Option<String>,
 }
 
@@ -1732,6 +1745,9 @@ pub async fn codex_list_model_provider_models(base_url: String, api_key: String,
         let response = request.send().await.map_err(|_| "PROVIDER_MODELS_NETWORK_FAILED".to_string())?;
         if !response.status().is_success() { return Err(format!("PROVIDER_MODELS_HTTP_{}",response.status().as_u16())); }
         let body: serde_json::Value = response.json().await.map_err(|_| "PROVIDER_MODELS_PARSE_FAILED".to_string())?;
+        if !body.get("data").is_some_and(serde_json::Value::is_array) {
+            return Err("PROVIDER_MODELS_PARSE_FAILED: expected data array".to_string());
+        }
         for model in list_model_provider_models(&body) { if seen.insert(model.id.clone()) { models.push(model); } }
         if body["has_more"] != true { break; }
         let Some(last) = body["last_id"].as_str().filter(|s|!s.is_empty()) else { break; };

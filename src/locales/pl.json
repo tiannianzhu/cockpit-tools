@@ -4357,6 +4357,28 @@
         "providerDefault": "Domyślne dostawcy",
         "sharedSettings": "Lista modeli i ich możliwości dotyczą wybranego zakresu. Protokół, uwierzytelnianie i adres są wspólne dla dostawcy.",
         "saveScope": "Zapis aktualizuje dostawcę i powiązane konta. Jeśli dotyczy bieżącego konta, aktualizuje też lokalną konfigurację i dane logowania Codex. Klient nie uruchamia się automatycznie."
+      },
+      "modelEditor": {
+        "add": "Dodaj model",
+        "context": "Okno kontekstu",
+        "defaultLevel": "Poziom domyślny",
+        "displayName": "Nazwa wyświetlana",
+        "duplicate": "Identyfikator modelu już istnieje",
+        "empty": "Nie dodano jeszcze żadnych modeli.",
+        "fetch": "Pobierz modele",
+        "fetching": "Pobieranie…",
+        "hint": "Ustaw kontekst oraz obsługę obrazów i rozumowania dla każdego modelu. Pełny katalog jest generowany podczas stosowania konfiguracji do hosta zdalnego.",
+        "invalidId": "Identyfikatory modeli nie mogą zawierać spacji ani przecinków",
+        "modelId": "Identyfikator modelu",
+        "modelIdPlaceholder": "Wpisz identyfikator modelu",
+        "noUpstreamModels": "Dostawca nie zwrócił dostępnych modeli. Dodaj identyfikator modelu ręcznie.",
+        "reasoning": "Poziomy rozumowania",
+        "remove": "Usuń model",
+        "supportedLevels": "Obsługiwane poziomy",
+        "title": "Modele",
+        "unconfigured": "Nie skonfigurowano",
+        "unset": "Nie ustawiono",
+        "vision": "Wejście obrazu"
       }
     },
     "quickSwitch": {

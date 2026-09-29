@@ -4357,6 +4357,28 @@
         "providerDefault": "Predefiniti fornitore",
         "sharedSettings": "Modelli e funzionalità si applicano all’ambito scelto. Protocollo, autenticazione e indirizzo sono condivisi dal fornitore.",
         "saveScope": "Il salvataggio aggiorna il fornitore e gli account collegati. Se riguarda l’account attuale, vengono aggiornati anche configurazione e credenziali locali di Codex. Il client non si avvia automaticamente."
+      },
+      "modelEditor": {
+        "add": "Aggiungi modello",
+        "context": "Finestra di contesto",
+        "defaultLevel": "Livello predefinito",
+        "displayName": "Nome visualizzato",
+        "duplicate": "L'ID modello esiste già",
+        "empty": "Nessun modello aggiunto.",
+        "fetch": "Recupera modelli",
+        "fetching": "Recupero in corso…",
+        "hint": "Imposta contesto, capacità visive e di ragionamento per ogni modello. Il catalogo completo viene generato quando viene applicato a un host remoto.",
+        "invalidId": "Gli ID modello non possono contenere spazi o virgole",
+        "modelId": "ID modello",
+        "modelIdPlaceholder": "Inserisci ID modello",
+        "noUpstreamModels": "Il provider non ha restituito modelli disponibili. Aggiungi manualmente un ID modello.",
+        "reasoning": "Livelli di ragionamento",
+        "remove": "Rimuovi modello",
+        "supportedLevels": "Livelli supportati",
+        "title": "Modelli",
+        "unconfigured": "Non configurato",
+        "unset": "Non impostato",
+        "vision": "Input immagine"
       }
     },
     "quickSwitch": {

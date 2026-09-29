@@ -4357,6 +4357,28 @@
         "providerDefault": "Padrões do provedor",
         "sharedSettings": "Os modelos e seus recursos se aplicam ao escopo escolhido. Protocolo, autenticação e endereço são compartilhados pelo provedor.",
         "saveScope": "Ao salvar, o provedor e as contas vinculadas são atualizados. Se a conta atual for afetada, a configuração e as credenciais locais do Codex também serão atualizadas. O cliente não inicia automaticamente."
+      },
+      "modelEditor": {
+        "add": "Adicionar modelo",
+        "context": "Janela de contexto",
+        "defaultLevel": "Nível padrão",
+        "displayName": "Nome de exibição",
+        "duplicate": "O ID do modelo já existe",
+        "empty": "Nenhum modelo adicionado ainda.",
+        "fetch": "Buscar modelos",
+        "fetching": "Buscando…",
+        "hint": "Defina contexto e recursos de imagem e raciocínio para cada modelo. O catálogo completo é gerado quando aplicado a um host remoto.",
+        "invalidId": "IDs de modelo não podem conter espaços ou vírgulas",
+        "modelId": "ID do modelo",
+        "modelIdPlaceholder": "Informe o ID do modelo",
+        "noUpstreamModels": "O provedor não retornou modelos disponíveis. Adicione um ID de modelo manualmente.",
+        "reasoning": "Níveis de raciocínio",
+        "remove": "Remover modelo",
+        "supportedLevels": "Níveis compatíveis",
+        "title": "Modelos",
+        "unconfigured": "Não configurado",
+        "unset": "Não definido",
+        "vision": "Entrada de imagem"
       }
     },
     "quickSwitch": {

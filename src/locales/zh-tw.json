@@ -4357,6 +4357,28 @@
         "providerDefault": "供應商預設",
         "sharedSettings": "模型目錄與能力僅套用至所選範圍；協定、驗證與位址為供應商共用設定。",
         "saveScope": "儲存會更新供應商並同步關聯帳號；若目前帳號受影響，也會更新本機 Codex 設定與憑證，不會自動啟動用戶端。"
+      },
+      "modelEditor": {
+        "add": "新增模型",
+        "context": "上下文視窗",
+        "defaultLevel": "預設層級",
+        "displayName": "顯示名稱",
+        "duplicate": "模型 ID 已存在",
+        "empty": "尚未新增模型。",
+        "fetch": "取得模型",
+        "fetching": "取得中…",
+        "hint": "為每個模型設定上下文、影像和推理能力。套用至遠端主機時會產生完整目錄。",
+        "invalidId": "模型 ID 不可包含空白或逗號",
+        "modelId": "模型 ID",
+        "modelIdPlaceholder": "輸入模型 ID",
+        "noUpstreamModels": "供應商未傳回可用模型。請手動新增模型 ID。",
+        "reasoning": "推理層級",
+        "remove": "移除模型",
+        "supportedLevels": "支援的層級",
+        "title": "模型",
+        "unconfigured": "尚未設定",
+        "unset": "未設定",
+        "vision": "影像輸入"
       }
     },
     "quickSwitch": {

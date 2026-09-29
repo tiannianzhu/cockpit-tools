@@ -4357,6 +4357,28 @@
         "providerDefault": "공급자 기본값",
         "sharedSettings": "모델 목록과 기능은 선택한 범위에 적용됩니다. 프로토콜, 인증 방식, 주소는 공급자 공통 설정입니다.",
         "saveScope": "저장하면 공급자와 연결된 계정이 업데이트됩니다. 현재 계정이 영향을 받으면 로컬 Codex 설정과 자격 증명도 업데이트됩니다. 클라이언트는 자동으로 시작되지 않습니다."
+      },
+      "modelEditor": {
+        "add": "모델 추가",
+        "context": "컨텍스트 창",
+        "defaultLevel": "기본 수준",
+        "displayName": "표시 이름",
+        "duplicate": "이미 존재하는 모델 ID입니다",
+        "empty": "아직 추가된 모델이 없습니다.",
+        "fetch": "모델 가져오기",
+        "fetching": "가져오는 중…",
+        "hint": "모델별 컨텍스트, 이미지, 추론 기능을 설정합니다. 원격 호스트에 적용할 때 전체 카탈로그가 생성됩니다.",
+        "invalidId": "모델 ID에는 공백이나 쉼표를 사용할 수 없습니다",
+        "modelId": "모델 ID",
+        "modelIdPlaceholder": "모델 ID 입력",
+        "noUpstreamModels": "제공업체에서 사용 가능한 모델을 반환하지 않았습니다. 모델 ID를 직접 추가하세요.",
+        "reasoning": "추론 수준",
+        "remove": "모델 제거",
+        "supportedLevels": "지원되는 수준",
+        "title": "모델",
+        "unconfigured": "구성되지 않음",
+        "unset": "설정되지 않음",
+        "vision": "이미지 입력"
       }
     },
     "quickSwitch": {

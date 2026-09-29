@@ -4020,6 +4020,28 @@
         "providerDefault": "Provider defaults",
         "sharedSettings": "Model catalogs and capabilities apply to the selected scope. Protocol, authentication and address are shared provider settings.",
         "saveScope": "Saving updates the provider and linked accounts. If the current account is affected, local Codex configuration and credentials are updated too. The client is not started automatically."
+      },
+      "modelEditor": {
+        "title": "Models",
+        "hint": "Set context, image and reasoning capabilities per model. The full catalog is generated when applied to a remote host.",
+        "duplicate": "Model ID already exists",
+        "invalidId": "Model IDs cannot contain whitespace or commas",
+        "fetching": "Fetching…",
+        "fetch": "Fetch models",
+        "modelIdPlaceholder": "Enter model ID",
+        "modelId": "Model ID",
+        "add": "Add model",
+        "empty": "No models added yet.",
+        "context": "Context window",
+        "vision": "Image input",
+        "reasoning": "Reasoning levels",
+        "unset": "Not set",
+        "remove": "Remove model",
+        "unconfigured": "Not configured",
+        "supportedLevels": "Supported levels",
+        "defaultLevel": "Default level",
+        "noUpstreamModels": "The provider returned no available models. Add a model ID manually.",
+        "displayName": "Display name"
       }
     },
     "quickSwitch": {

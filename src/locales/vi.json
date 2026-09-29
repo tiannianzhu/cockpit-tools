@@ -4357,6 +4357,28 @@
         "providerDefault": "Mặc định nhà cung cấp",
         "sharedSettings": "Danh sách và khả năng của mô hình áp dụng cho phạm vi đã chọn. Giao thức, xác thực và địa chỉ là cài đặt chung của nhà cung cấp.",
         "saveScope": "Lưu sẽ cập nhật nhà cung cấp và các tài khoản liên kết. Nếu tài khoản hiện tại bị ảnh hưởng, cấu hình và thông tin xác thực Codex cục bộ cũng được cập nhật. Ứng dụng khách không tự khởi chạy."
+      },
+      "modelEditor": {
+        "add": "Thêm mô hình",
+        "context": "Cửa sổ ngữ cảnh",
+        "defaultLevel": "Mức mặc định",
+        "displayName": "Tên hiển thị",
+        "duplicate": "ID mô hình đã tồn tại",
+        "empty": "Chưa thêm mô hình nào.",
+        "fetch": "Lấy mô hình",
+        "fetching": "Đang lấy…",
+        "hint": "Đặt ngữ cảnh, khả năng xử lý hình ảnh và suy luận cho từng mô hình. Danh mục đầy đủ được tạo khi áp dụng cho máy chủ từ xa.",
+        "invalidId": "ID mô hình không được chứa khoảng trắng hoặc dấu phẩy",
+        "modelId": "ID mô hình",
+        "modelIdPlaceholder": "Nhập ID mô hình",
+        "noUpstreamModels": "Nhà cung cấp không trả về mô hình nào. Hãy thêm ID mô hình theo cách thủ công.",
+        "reasoning": "Mức suy luận",
+        "remove": "Xóa mô hình",
+        "supportedLevels": "Các mức được hỗ trợ",
+        "title": "Mô hình",
+        "unconfigured": "Chưa cấu hình",
+        "unset": "Chưa đặt",
+        "vision": "Đầu vào hình ảnh"
       }
     },
     "quickSwitch": {

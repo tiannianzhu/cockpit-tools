@@ -6,7 +6,10 @@ import ts from 'typescript';
 import { resolveCodexModelProviderForApiKey } from '../../utils/codexModelProviderKeyConfig';
 import { buildCodexModelProviderAccountSnapshot, findCodexAccountsReferencingModelProvider } from '../../utils/codexModelProviderAccountSync';
 import { contextWindowDraftsFromRecord, parseContextWindowDrafts } from '../../utils/codexModelContextWindows';
-import { buildProviderModelVisionCapabilities } from '../../utils/codexModelProviderVision';
+import { buildProviderModelVisionCapabilities, resolveProviderModelVisionState } from '../../utils/codexModelProviderVision';
+import { buildCodexProviderCatalogDefinition, patchCodexProviderModel, buildUpstreamModelDefinitions,
+  deriveCodexProviderCatalogFields } from '../../utils/codexProviderCatalogDefinition';
+import { deferred } from '../../../tests/helpers/reactHookHarness';
 import { resolveCodexApiProviderPresetId } from '../../utils/codexProviderPresets';
 import { isValidProviderApiKeyUrl } from '../../utils/codexProviderApiKeyUrl';
 import { resolveCodexProviderCapabilityProfile } from '../../utils/codexProviderGateway';
@@ -27,8 +30,11 @@ function bind(name: string, state: Record<string, any>) {
 function harness() {
   let provider: any = { id: 'provider', name: 'Relay', baseUrl: 'https://relay.invalid/v1', wireApi: 'responses', authScheme: 'bearer',
     supportsWebsockets: true, modelCatalog: ['default'], supportsVision: false, createdAt: 1, updatedAt: 1,
-    apiKeys: [ { id: 'a', apiKey: 'fixture-a', name: 'A', modelCatalog: ['model-a'], modelContextWindows: { 'model-a': 1000 } },
-      { id: 'b', apiKey: 'fixture-b', name: 'B', modelCatalog: ['model-b'], supportsVision: true } ] };
+    modelCatalogDefinition: { models: [{ slug: 'default', custom: 'provider' }] },
+    apiKeys: [ { id: 'a', apiKey: 'fixture-a', name: 'A', modelCatalog: ['model-a'], modelContextWindows: { 'model-a': 1000 },
+      modelCatalogDefinition: { models: [{ slug: 'model-a', custom: { field: 'keep' } }] } },
+      { id: 'b', apiKey: 'fixture-b', name: 'B', modelCatalog: ['model-b'], supportsVision: true,
+        modelCatalogDefinition: { models: [{ slug: 'model-b', custom: 'other' }] } } ] };
   const accounts = provider.apiKeys.map((key: any) => ({ id: key.id, email: `${key.id}@example.invalid`, auth_mode: 'apikey',
     api_provider_id: provider.id, api_base_url: provider.baseUrl, openai_api_key: key.apiKey, api_sync_model_catalog_to_codex: false }));
   const calls = { patches: [] as any[], bindings: [] as any[][], syncs: [] as any[], creates: 0, closed: 0, queries: 0, reloadMerges: [] as any[] };
@@ -36,12 +42,16 @@ function harness() {
   const state: Record<string, any> = {
     useCallback: (value: any) => value, accounts, providers: [provider], currentEditingProvider: provider,
     resolveCodexModelProviderForApiKey, buildCodexModelProviderAccountSnapshot, findCodexAccountsReferencingModelProvider,
-    contextWindowDraftsFromRecord, parseContextWindowDrafts, buildProviderModelVisionCapabilities,
+    contextWindowDraftsFromRecord, parseContextWindowDrafts, buildProviderModelVisionCapabilities, resolveProviderModelVisionState,
+    buildCodexProviderCatalogDefinition, patchCodexProviderModel, buildUpstreamModelDefinitions, deriveCodexProviderCatalogFields,
     resolveCodexApiProviderPresetId, isValidProviderApiKeyUrl, resolveCodexProviderCapabilityProfile,
     normalizeCodexModelProviderBaseUrl: (url: string) => url.trim().replace(/\/+$/, '').toLowerCase(),
     resolveProviderWireApi: (item: any) => item.wireApi ?? 'responses',
     resolveEnableModePreferenceForWireApi: () => 'direct',
-    selectedSponsorTemplate: null, accountEditor: null, editorModelKeyId: null, saving: false, showModal: true,
+    selectedSponsorTemplate: null, selectedPresetId: 'custom', accountEditor: null, editorModelKeyId: null, saving: false, showModal: true,
+    modelFetchGeneration: { current: 0 }, fetchingProviderModels: false,
+    cancelProviderModelsFetch() { state.modelFetchGeneration.current += 1; state.fetchingProviderModels = false; },
+    setFetchingProviderModels(value: boolean) { state.fetchingProviderModels = value; },
     t: (key: string, args?: any) => args?.error ? `${key}: ${args.error}` : key, parseServiceError: String,
     setSaving(value: boolean) { state.saving = value; }, setShowModal(value: boolean) { state.showModal = value; },
     setFormError(value: any) { state.error = value; }, setNotice() {}, setExistingApiKeySearchQuery() {}, setEditingApiKey() {},
@@ -139,4 +149,38 @@ test('a missing provider key preserves the account credential instead of selecti
   bind('openEditModal', h.state)(h.provider(), { ...h.state.accounts[0], openai_api_key: 'unlisted-key', api_model_catalog: ['private-model'] });
   assert.equal(h.state.accountEditor.apiKeyId, '__new__'); assert.equal(h.state.form.newApiKey, 'unlisted-key');
   assert.equal(h.state.form.modelCatalogText, 'private-model');
+});
+
+test('switching keys keeps full catalog metadata scoped and writes only on save', async () => {
+  const h = harness(); h.openAccount();
+  assert.equal(h.state.form.modelCatalogDefinition.models[0].custom.field, 'keep');
+  bind('selectEditorModelKey', h.state)('b');
+  assert.equal(h.state.form.modelCatalogDefinition.models[0].custom, 'other');
+  bind('selectEditorModelKey', h.state)('a');
+  bind('patchModelDefinition', h.state)('model-a', { display_name: 'Edited A' });
+  assert.equal(h.calls.patches.length, 0);
+  await h.save();
+  assert.equal(h.provider().apiKeys[0].modelCatalogDefinition.models[0].display_name, 'Edited A');
+  assert.equal(h.provider().apiKeys[0].modelCatalogDefinition.models[0].custom.field, 'keep');
+  assert.equal(h.provider().apiKeys[1].modelCatalogDefinition.models[0].custom, 'other');
+  assert.equal(h.provider().modelCatalogDefinition.models[0].custom, 'provider');
+});
+
+test('fetch uses the selected key and ignores a response after switching scope', async () => {
+  const h = harness(); h.openAccount();
+  bind('selectEditorModelKey', h.state)('b');
+  bind('providerModelsApiKey', h.state);
+  const gate = deferred<{ models: Array<{ id: string }> }>();
+  let query: any;
+  h.state.listModelProviderModels = (input: any) => { query = input; return gate.promise; };
+  const pending = bind('fetchProviderModels', h.state)();
+  assert.equal(query.apiKey, 'fixture-b');
+  assert.equal(query.wireApi, 'responses');
+  assert.equal(query.authScheme, 'bearer');
+  bind('selectEditorModelKey', h.state)('a');
+  gate.resolve({ models: [{ id: 'stale' }] });
+  await pending;
+  assert.equal(h.state.form.modelCatalogText, 'model-a');
+  assert.equal(h.state.form.modelCatalogDefinition.models[0].custom.field, 'keep');
+  assert.equal(h.state.fetchingProviderModels, false);
 });

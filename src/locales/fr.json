@@ -4357,6 +4357,28 @@
         "providerDefault": "Valeurs du fournisseur",
         "sharedSettings": "Les modèles et leurs capacités concernent la portée choisie. Le protocole, l’authentification et l’adresse sont communs au fournisseur.",
         "saveScope": "L’enregistrement actualise le fournisseur et les comptes liés. Si le compte actuel est concerné, la configuration locale de Codex et ses identifiants sont aussi actualisés. Le client ne démarre pas automatiquement."
+      },
+      "modelEditor": {
+        "add": "Ajouter un modèle",
+        "context": "Fenêtre de contexte",
+        "defaultLevel": "Niveau par défaut",
+        "displayName": "Nom d’affichage",
+        "duplicate": "Cet ID de modèle existe déjà",
+        "empty": "Aucun modèle ajouté pour le moment.",
+        "fetch": "Récupérer les modèles",
+        "fetching": "Récupération…",
+        "hint": "Définissez le contexte ainsi que les capacités d’image et de raisonnement de chaque modèle. Le catalogue complet est généré lors de son application à un hôte distant.",
+        "invalidId": "Les ID de modèle ne peuvent contenir d’espaces ni de virgules",
+        "modelId": "ID du modèle",
+        "modelIdPlaceholder": "Saisir l’ID du modèle",
+        "noUpstreamModels": "Le fournisseur n’a renvoyé aucun modèle disponible. Ajoutez un ID manuellement.",
+        "reasoning": "Niveaux de raisonnement",
+        "remove": "Supprimer le modèle",
+        "supportedLevels": "Niveaux pris en charge",
+        "title": "Modèles",
+        "unconfigured": "Non configuré",
+        "unset": "Non défini",
+        "vision": "Entrée d’image"
       }
     },
     "quickSwitch": {

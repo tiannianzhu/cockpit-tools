@@ -7,15 +7,17 @@ import { CodexAnthropicProviderFields } from "./CodexAnthropicProviderFields";
 import { ModalErrorMessage } from "../ModalErrorMessage";
 import { Check, ExternalLink, HelpCircle, KeyRound, Pencil, Star, Trash2, X, Search } from "lucide-react";
 import { CodexModelContextWindowTable } from "./CodexModelContextWindowTable";
+import { CodexProviderModelsEditor } from "./CodexProviderModelsEditor";
 import { CODEX_API_PROVIDER_CUSTOM_ID, CODEX_API_PROVIDER_PRESETS, DEEPSEEK_API_PROVIDER_ID } from "../../utils/codexProviderPresets";
 import { canConfigureCodexProviderVision } from "../../utils/codexProviderGateway";
+import { resolveProviderModelVisionState } from "../../utils/codexModelProviderVision";
 import type { useCodexModelProviderManagerController } from './CodexModelProviderManager';
 
 type Props = Pick<ReturnType<typeof useCodexModelProviderManagerController>,
-  'accountEditor' | 'setAccountEditor' | 'accounts' | 'providers' | 'editorModelKeyId' | 'selectEditorModelKey' | 'selectAccountEditorProvider' | 'maskAccountText' | 'closeModal' | 'currentEditingProvider' | 'editingApiKey' | 'existingApiKeySearchQuery' | 'form' | 'formError' | 'handleDeleteApiKey' | 'handleSaveApiKeyEdit' | 'handleSaveProvider' | 'handleSelectPresetEndpoint' | 'handleSelectProviderPreset' | 'handleSelectSponsorTemplate' | 'maskApiKey' | 'mutateForm' | 'parseModelCatalogText' | 'previewPaths' | 'resolveEnableModePreferenceForWireApi' | 'saving' | 'selectedPreset' | 'selectedPresetId' | 'selectedSponsorTemplate' | 'selectedSponsorTemplateId' | 'setEditingApiKey' | 'setExistingApiKeySearchQuery' | 'showModal' | 'sponsorProviderTemplates' | 't'>;
+  'accountEditor' | 'setAccountEditor' | 'accounts' | 'providers' | 'editorModelKeyId' | 'selectEditorModelKey' | 'selectAccountEditorProvider' | 'maskAccountText' | 'closeModal' | 'currentEditingProvider' | 'editingApiKey' | 'existingApiKeySearchQuery' | 'form' | 'formError' | 'handleDeleteApiKey' | 'handleSaveApiKeyEdit' | 'handleSaveProvider' | 'handleSelectPresetEndpoint' | 'handleSelectProviderPreset' | 'handleSelectSponsorTemplate' | 'maskApiKey' | 'mutateForm' | 'parseModelCatalogText' | 'patchModelDefinition' | 'fetchProviderModels' | 'fetchingProviderModels' | 'canFetchProviderModels' | 'previewPaths' | 'resolveEnableModePreferenceForWireApi' | 'saving' | 'selectedPreset' | 'selectedPresetId' | 'selectedSponsorTemplate' | 'selectedSponsorTemplateId' | 'setEditingApiKey' | 'setExistingApiKeySearchQuery' | 'showModal' | 'sponsorProviderTemplates' | 't'>;
 
 export function CodexModelProviderEditor(props: Props) {
-  const { accountEditor, setAccountEditor, accounts, providers, editorModelKeyId, selectEditorModelKey, selectAccountEditorProvider, maskAccountText, closeModal, currentEditingProvider, editingApiKey, existingApiKeySearchQuery, form, formError, handleDeleteApiKey, handleSaveApiKeyEdit, handleSaveProvider, handleSelectPresetEndpoint, handleSelectProviderPreset, handleSelectSponsorTemplate, maskApiKey, mutateForm, parseModelCatalogText, previewPaths, resolveEnableModePreferenceForWireApi, saving, selectedPreset, selectedPresetId, selectedSponsorTemplate, selectedSponsorTemplateId, setEditingApiKey, setExistingApiKeySearchQuery, showModal, sponsorProviderTemplates, t } = props;
+  const { accountEditor, setAccountEditor, accounts, providers, editorModelKeyId, selectEditorModelKey, selectAccountEditorProvider, maskAccountText, closeModal, currentEditingProvider, editingApiKey, existingApiKeySearchQuery, form, formError, handleDeleteApiKey, handleSaveApiKeyEdit, handleSaveProvider, handleSelectPresetEndpoint, handleSelectProviderPreset, handleSelectSponsorTemplate, maskApiKey, mutateForm, parseModelCatalogText, patchModelDefinition, fetchProviderModels, fetchingProviderModels, canFetchProviderModels, previewPaths, resolveEnableModePreferenceForWireApi, saving, selectedPreset, selectedPresetId, selectedSponsorTemplate, selectedSponsorTemplateId, setEditingApiKey, setExistingApiKeySearchQuery, showModal, sponsorProviderTemplates, t } = props;
   useModalScrollLock(showModal);
   const selectedKey = currentEditingProvider?.apiKeys.find(key => key.id === (editorModelKeyId ?? accountEditor?.apiKeyId));
   const queryKey = form.newApiKey || selectedKey?.apiKey || currentEditingProvider?.apiKeys[0]?.apiKey || "";
@@ -23,6 +25,9 @@ export function CodexModelProviderEditor(props: Props) {
   let officialDeepSeek = false;
   try { officialDeepSeek = new URL(form.baseUrl.trim()).hostname.toLowerCase() === "api.deepseek.com"; } catch { /* incomplete URL */ }
   const effectiveWireApi = officialDeepSeek ? "responses" : form.wireApi;
+  const catalogModels = parseModelCatalogText(form.modelCatalogText);
+  const useFullCatalogEditor = effectiveWireApi === "responses"
+    && selectedPresetId !== "openai_official" && selectedPresetId !== DEEPSEEK_API_PROVIDER_ID;
   return showModal ? createPortal((
         <div className="modal-overlay">
           <div
@@ -357,7 +362,21 @@ export function CodexModelProviderEditor(props: Props) {
                 onModels={models => mutateForm({ modelCatalogText: [...new Set([...parseModelCatalogText(form.modelCatalogText), ...models])].join("\n") })} />}
               {(
                 <>
-                  <div className="form-group">
+                  {useFullCatalogEditor ? <CodexProviderModelsEditor
+                    definition={form.modelCatalogDefinition}
+                    models={catalogModels}
+                    contexts={form.modelContextWindowsDraft}
+                    visionStates={Object.fromEntries(catalogModels.map(model => [model.toLowerCase(),
+                      resolveProviderModelVisionState(model, form.visionModelStates, form.supportsVision)]))}
+                    disabled={saving || fetchingProviderModels}
+                    fetching={fetchingProviderModels}
+                    canFetch={canFetchProviderModels}
+                    onFetch={() => void fetchProviderModels()}
+                    onModelsChange={models => mutateForm({ modelCatalogText: models.join("\n") })}
+                    onContextChange={(model, value) => mutateForm({ modelContextWindowsDraft: { ...form.modelContextWindowsDraft, [model]: value } })}
+                    onVisionChange={(model, value) => mutateForm({ visionModelStates: { ...form.visionModelStates, [model.toLowerCase()]: value } })}
+                    onModelPatch={patchModelDefinition}
+                  /> : <div className="form-group">
                     <label>
                       {t("codex.modelProviders.fields.modelCatalog", "模型目录")}
                     </label>
@@ -397,7 +416,7 @@ export function CodexModelProviderEditor(props: Props) {
                       }
                       disabled={saving}
                     />
-                  </div>
+                  </div>}
                   {/* DeepSeek Responses 只保留逐模型能力；其他第三方协议均可配置默认值。 */}
                   {canConfigureCodexProviderVision({ presetId: selectedPresetId, wireApi: effectiveWireApi }) && (
                     <>

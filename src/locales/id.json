@@ -4404,6 +4404,28 @@
         "providerDefault": "Bawaan penyedia",
         "sharedSettings": "Daftar dan kemampuan model berlaku untuk cakupan terpilih. Protokol, autentikasi, dan alamat digunakan bersama oleh penyedia.",
         "saveScope": "Penyimpanan memperbarui penyedia dan akun tertaut. Jika akun saat ini terdampak, konfigurasi serta kredensial Codex lokal juga diperbarui. Klien tidak dimulai secara otomatis."
+      },
+      "modelEditor": {
+        "add": "Tambah model",
+        "context": "Jendela konteks",
+        "defaultLevel": "Tingkat default",
+        "displayName": "Nama tampilan",
+        "duplicate": "ID model sudah ada",
+        "empty": "Belum ada model yang ditambahkan.",
+        "fetch": "Ambil model",
+        "fetching": "Sedang mengambil…",
+        "hint": "Atur konteks, kemampuan gambar, dan penalaran untuk tiap model. Katalog lengkap dibuat saat diterapkan ke host jarak jauh.",
+        "invalidId": "ID model tidak boleh berisi spasi atau koma",
+        "modelId": "ID model",
+        "modelIdPlaceholder": "Masukkan ID model",
+        "noUpstreamModels": "Penyedia tidak mengembalikan model yang tersedia. Tambahkan ID model secara manual.",
+        "reasoning": "Tingkat penalaran",
+        "remove": "Hapus model",
+        "supportedLevels": "Tingkat yang didukung",
+        "title": "Model",
+        "unconfigured": "Belum dikonfigurasi",
+        "unset": "Belum diatur",
+        "vision": "Masukan gambar"
       }
     },
     "quickSwitch": {

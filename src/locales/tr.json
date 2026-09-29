@@ -4357,6 +4357,28 @@
         "providerDefault": "Sağlayıcı varsayılanı",
         "sharedSettings": "Model listesi ve yetenekleri seçilen kapsama uygulanır. Protokol, kimlik doğrulama ve adres sağlayıcının ortak ayarlarıdır.",
         "saveScope": "Kaydetme işlemi sağlayıcıyı ve bağlı hesapları günceller. Geçerli hesap etkilenirse yerel Codex ayarları ve kimlik bilgileri de güncellenir. İstemci otomatik başlatılmaz."
+      },
+      "modelEditor": {
+        "add": "Model ekle",
+        "context": "Bağlam penceresi",
+        "defaultLevel": "Varsayılan seviye",
+        "displayName": "Görünen ad",
+        "duplicate": "Bu model kimliği zaten mevcut",
+        "empty": "Henüz model eklenmedi.",
+        "fetch": "Modelleri al",
+        "fetching": "Alınıyor…",
+        "hint": "Her model için bağlam, görüntü ve akıl yürütme özelliklerini ayarlayın. Uzak sunucuya uygulandığında kataloğun tamamı oluşturulur.",
+        "invalidId": "Model kimlikleri boşluk veya virgül içeremez",
+        "modelId": "Model kimliği",
+        "modelIdPlaceholder": "Model kimliği girin",
+        "noUpstreamModels": "Sağlayıcı kullanılabilir model döndürmedi. Bir model kimliğini elle ekleyin.",
+        "reasoning": "Akıl yürütme seviyeleri",
+        "remove": "Modeli kaldır",
+        "supportedLevels": "Desteklenen seviyeler",
+        "title": "Modeller",
+        "unconfigured": "Yapılandırılmadı",
+        "unset": "Ayarlanmadı",
+        "vision": "Görüntü girdisi"
       }
     },
     "quickSwitch": {

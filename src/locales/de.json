@@ -4357,6 +4357,28 @@
         "providerDefault": "Anbieterstandard",
         "sharedSettings": "Modelllisten und Fähigkeiten gelten für den gewählten Bereich. Protokoll, Anmeldung und Adresse gelten für den gesamten Anbieter.",
         "saveScope": "Speichern aktualisiert den Anbieter und verknüpfte Konten. Ist das aktuelle Konto betroffen, werden auch die lokale Codex-Konfiguration und Zugangsdaten aktualisiert. Der Client startet nicht automatisch."
+      },
+      "modelEditor": {
+        "add": "Modell hinzufügen",
+        "context": "Kontextfenster",
+        "defaultLevel": "Standardstufe",
+        "displayName": "Anzeigename",
+        "duplicate": "Modell-ID ist bereits vorhanden",
+        "empty": "Noch keine Modelle hinzugefügt.",
+        "fetch": "Modelle abrufen",
+        "fetching": "Wird abgerufen…",
+        "hint": "Legen Sie Kontext sowie Bild- und Reasoning-Funktionen pro Modell fest. Der vollständige Katalog wird beim Anwenden auf einen Remote-Host erstellt.",
+        "invalidId": "Modell-IDs dürfen keine Leer- oder Kommazeichen enthalten",
+        "modelId": "Modell-ID",
+        "modelIdPlaceholder": "Modell-ID eingeben",
+        "noUpstreamModels": "Der Anbieter hat keine verfügbaren Modelle zurückgegeben. Fügen Sie eine Modell-ID manuell hinzu.",
+        "reasoning": "Reasoning-Stufen",
+        "remove": "Modell entfernen",
+        "supportedLevels": "Unterstützte Stufen",
+        "title": "Modelle",
+        "unconfigured": "Nicht konfiguriert",
+        "unset": "Nicht festgelegt",
+        "vision": "Bildeingabe"
       }
     },
     "quickSwitch": {

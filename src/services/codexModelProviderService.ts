@@ -27,6 +27,7 @@ import {
 import { moveCodexProviderApiKey } from '../utils/codexModelProviderApiKeyMove';
 import { migrateCodexModelProviderVisionCapabilities } from '../utils/codexModelProviderVisionMigration';
 import { cloneCodexProviderModelConfig, type CodexProviderModelConfig } from '../utils/codexModelProviderKeyConfig';
+import { parseCodexProviderCatalogDefinition, type CodexProviderCatalogDefinition } from '../utils/codexProviderCatalogDefinition';
 
 export interface CodexModelProviderApiKey extends CodexProviderModelConfig {
   id: string;
@@ -43,6 +44,7 @@ export interface CodexModelProvider {
   sourceTag?: string;
   integrationType?: 'sub2api' | 'new_api';
   modelCatalog?: string[];
+  modelCatalogDefinition?: CodexProviderCatalogDefinition;
   modelContextWindows?: Record<string, number>;
   supportsVision?: boolean;
   modelCapabilities?: Record<string, { supportsVision?: boolean }>;
@@ -378,6 +380,8 @@ function deriveProviderNameFromBaseUrl(baseUrl: string): string {
 function cloneProviders(providers: CodexModelProvider[]): CodexModelProvider[] {
   return providers.map((provider) => ({
     ...provider,
+    modelCatalogDefinition: provider.modelCatalogDefinition
+      ? structuredClone(provider.modelCatalogDefinition) : undefined,
     modelCapabilities: provider.modelCapabilities
       ? Object.fromEntries(
           Object.entries(provider.modelCapabilities).map(([model, capability]) => [
@@ -395,6 +399,12 @@ function cloneProviders(providers: CodexModelProvider[]): CodexModelProvider[] {
 function normalizeApiKeyModelConfig(value: CodexProviderModelConfig): CodexProviderModelConfig {
   const config: CodexProviderModelConfig = {};
   if (Array.isArray(value.modelCatalog)) config.modelCatalog = normalizeModelCatalog(value.modelCatalog) ?? [];
+  if (value.modelCatalogDefinition !== undefined) {
+    try {
+      config.modelCatalogDefinition = value.modelCatalogDefinition === null
+        ? null : parseCodexProviderCatalogDefinition(value.modelCatalogDefinition);
+    } catch { config.modelCatalogDefinition = null; }
+  }
   if (value.modelContextWindows !== undefined) {
     config.modelContextWindows = normalizeModelContextWindows(value.modelContextWindows, config.modelCatalog ?? []) ?? {};
   }
@@ -451,6 +461,12 @@ function toValidProviderList(raw: unknown): CodexModelProvider[] {
       modelCatalog:
         normalizeModelCatalog((item as { modelCatalog?: unknown }).modelCatalog) ??
         presetModelCatalogForBaseUrl(baseUrl),
+      modelCatalogDefinition: (() => {
+        try {
+          const value = (item as { modelCatalogDefinition?: unknown }).modelCatalogDefinition;
+          return value === undefined ? undefined : parseCodexProviderCatalogDefinition(value);
+        } catch { return undefined; }
+      })(),
       modelContextWindows: normalizeModelContextWindows(
         (item as { modelContextWindows?: unknown }).modelContextWindows,
         normalizeModelCatalog((item as { modelCatalog?: unknown }).modelCatalog) ??
@@ -701,6 +717,7 @@ export const createCodexModelProvider = serializedProviderMutation(async functio
   baseUrl: string;
   sourceTag?: string;
   modelCatalog?: string[];
+  modelCatalogDefinition?: CodexProviderCatalogDefinition;
   modelContextWindows?: Record<string, number>;
   supportsVision?: boolean;
   modelCapabilities?: Record<string, { supportsVision?: boolean }>;
@@ -737,6 +754,8 @@ export const createCodexModelProvider = serializedProviderMutation(async functio
     modelCatalog:
       normalizeModelCatalog(input.modelCatalog) ??
       presetModelCatalogForBaseUrl(baseUrl),
+    modelCatalogDefinition: input.modelCatalogDefinition
+      ? parseCodexProviderCatalogDefinition(input.modelCatalogDefinition) : undefined,
     modelContextWindows: normalizeModelContextWindows(
       input.modelContextWindows,
       normalizeModelCatalog(input.modelCatalog) ??
@@ -774,6 +793,7 @@ export const updateCodexModelProvider = serializedProviderMutation(async functio
     baseUrl?: string;
     sourceTag?: string | null;
     modelCatalog?: string[] | null;
+    modelCatalogDefinition?: CodexProviderCatalogDefinition | null;
     modelContextWindows?: Record<string, number> | null;
     supportsVision?: boolean;
     modelCapabilities?: Record<string, { supportsVision?: boolean }> | null;
@@ -827,6 +847,10 @@ export const updateCodexModelProvider = serializedProviderMutation(async functio
         : normalizeModelCatalog(patch.modelCatalog);
   } else if (!provider.modelCatalog || provider.modelCatalog.length === 0) {
     provider.modelCatalog = presetModelCatalogForBaseUrl(nextBaseUrl);
+  }
+  if (patch.modelCatalogDefinition !== undefined) {
+    provider.modelCatalogDefinition = patch.modelCatalogDefinition === null
+      ? undefined : parseCodexProviderCatalogDefinition(patch.modelCatalogDefinition);
   }
   if (patch.modelContextWindows !== undefined) {
     provider.modelContextWindows = normalizeModelContextWindows(

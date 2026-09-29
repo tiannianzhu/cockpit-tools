@@ -4,6 +4,7 @@ import { deferred, loadHookModule, settlePromises } from '../../tests/helpers/re
 import type { CodexModelProvider } from './codexModelProviderService';
 import type { CodexAccount } from '../types/codex';
 import { buildCodexModelProviderAccountSnapshot } from '../utils/codexModelProviderAccountSync';
+import { resolveCodexModelProviderForApiKey } from '../utils/codexModelProviderKeyConfig';
 
 function provider(): CodexModelProvider {
   return {
@@ -41,7 +42,7 @@ function harness(initial: CodexModelProvider | CodexModelProvider[] = provider()
       disk = args!.data;
     } },
     './modelProviderUsageService': { queryModelProviderUsage() { throw new Error('unexpected network'); } },
-  }, { URL, TextEncoder }).exports as typeof import('./codexModelProviderService');
+  }, { URL, TextEncoder, structuredClone }).exports as typeof import('./codexModelProviderService');
   return { service, stored: () => JSON.parse(disk) as CodexModelProvider[], writeCount: () => writes,
     failWrite(error: Error | null) { writeError = error; }, failRead(error: Error | null) { readError = error; },
     gateWrite() { return gate = deferred<void>(); },
@@ -391,6 +392,36 @@ test('the shared editor persists a selected key model configuration without over
   assert.equal(saved.apiKeys[0].visionRoutingModel, null);
   assert.equal(saved.apiKeys[1].modelCatalog, undefined);
   assert.equal(saved.authScheme, 'bearer');
+});
+
+test('full model definitions persist per key without changing provider defaults or leaking mutable fields', async () => {
+  const shared = { models: [{ slug: 'shared-model', custom: { source: 'provider' } }] };
+  const scoped = { models: [{ slug: 'key-model', custom: { source: 'key' },
+    supported_reasoning_levels: [{ effort: 'high', description: 'Detailed' }] }] };
+  const h = harness({ ...provider(), modelCatalog: ['shared-model'], modelCatalogDefinition: shared });
+  await h.service.updateCodexModelProvider('provider', {
+    keyModelConfig: { apiKeyId: 'key-1', config: { modelCatalog: ['key-model'], modelCatalogDefinition: scoped } },
+  });
+  h.service.invalidateCodexModelProviderCache();
+  const saved = (await h.service.listCodexModelProviders())[0];
+  assert.deepEqual(saved.modelCatalogDefinition, shared);
+  assert.deepEqual(saved.apiKeys[0].modelCatalogDefinition, scoped);
+  assert.deepEqual(resolveCodexModelProviderForApiKey(saved, 'sk-first').modelCatalogDefinition, scoped);
+  assert.deepEqual(resolveCodexModelProviderForApiKey(saved, 'sk-second').modelCatalogDefinition, shared);
+  const legacyKeyCatalog = { ...saved, apiKeys: saved.apiKeys.map((key, index) =>
+    index === 1 ? { ...key, modelCatalog: ['other-model'] } : key) };
+  assert.equal(resolveCodexModelProviderForApiKey(legacyKeyCatalog, 'sk-second').modelCatalogDefinition, undefined);
+  (saved.apiKeys[0].modelCatalogDefinition!.models[0].custom as { source: string }).source = 'mutated';
+  assert.deepEqual((await h.service.listCodexModelProviders())[0].apiKeys[0].modelCatalogDefinition, scoped);
+
+  await h.service.updateCodexModelProvider('provider', {
+    keyModelConfig: { apiKeyId: 'key-1', config: { modelCatalog: [], modelCatalogDefinition: null } },
+  });
+  h.service.invalidateCodexModelProviderCache();
+  const cleared = (await h.service.listCodexModelProviders())[0];
+  assert.equal(cleared.apiKeys[0].modelCatalogDefinition, null);
+  assert.equal(resolveCodexModelProviderForApiKey(cleared, 'sk-first').modelCatalogDefinition, undefined);
+  assert.deepEqual(cleared.modelCatalogDefinition, shared);
 });
 
 test('invalid or failed scoped writes leave both provider and key settings unchanged', async () => {

@@ -1101,7 +1101,16 @@ fn api_bundle_from_providers(account: &CodexAccount, providers: &[serde_json::Va
     }).collect();
     if matching.len() != 1 { return Err("Select one linked model provider before remote API apply".into()); }
     let provider = matching[0];
-    let definition = provider.get("modelCatalogDefinition")
+    let key_config = account.openai_api_key.as_deref().map(str::trim)
+        .filter(|key| !key.is_empty())
+        .and_then(|key| provider["apiKeys"].as_array()?.iter().find(|entry| {
+            entry["apiKey"].as_str().is_some_and(|value| value.trim() == key)
+        }));
+    // A key-owned catalog (including an explicit clear) must never inherit another catalog.
+    let catalog_owner = key_config.filter(|entry| {
+        entry.get("modelCatalogDefinition").is_some() || entry.get("modelCatalog").is_some()
+    }).unwrap_or(provider);
+    let definition = catalog_owner.get("modelCatalogDefinition")
         .filter(|definition| definition["models"].as_array().is_some_and(|m| !m.is_empty()))
         .ok_or("Configure and save the model parameters in the linked provider before remote API apply")?;
     let url = provider["baseUrl"].as_str().filter(|s| !s.trim().is_empty())
@@ -1114,39 +1123,6 @@ fn api_bundle_from_providers(account: &CodexAccount, providers: &[serde_json::Va
         "supports_websockets": provider["supportsWebsockets"].as_bool().unwrap_or(false),
         "model_catalog_definition": { "models": definition["models"] },
     }))
-}
-
-/// Import the actual catalog; no sidecar definition or remote generator is needed.
-const REMOTE_MODEL_DEFINITION_SCRIPT: &str = r#"
-import json, os, sys, tomllib
-request = json.loads(sys.stdin.buffer.readline())
-home = os.path.realpath(os.path.expanduser(request['codex_home']))
-with open(os.path.join(home, 'config.toml'), 'rb') as source:
-    config = tomllib.load(source)
-catalog = config.get('model_catalog_json')
-if not isinstance(catalog, str) or not catalog.strip(): raise ValueError('missing model catalog')
-candidate = os.path.expanduser(catalog)
-if not os.path.isabs(candidate): candidate = os.path.join(home, candidate)
-resolved = os.path.realpath(candidate)
-if os.path.commonpath([home, resolved]) != home: raise ValueError('catalog outside CODEX_HOME')
-with open(resolved, 'rb') as source: raw = source.read(10 * 1024 * 1024 + 1)
-if len(raw) > 10 * 1024 * 1024: raise ValueError('oversize catalog')
-catalog = json.loads(raw)
-models = catalog.get('models') if isinstance(catalog, dict) else None
-if not isinstance(models, list) or not models: raise ValueError('empty model catalog')
-for model in models:
-    if not isinstance(model, dict) or not isinstance(model.get('slug'), str) or not model['slug'].strip():
-        raise ValueError('invalid model entry')
-    # The destination Codex supplies its own instructions; retain model capabilities.
-    model.pop('base_instructions', None)
-    model.pop('model_messages', None)
-print(json.dumps({'models': models}))
-"#;
-
-pub async fn read_model_catalog_definition(server_id: &str) -> Result<serde_json::Value, String> {
-    let output = run_remote_python(server_id, REMOTE_MODEL_DEFINITION_SCRIPT, &serde_json::json!({})).await
-        .map_err(|_| "Cannot import remote models: requires Python 3.11 and an existing model_catalog_json inside CODEX_HOME".to_string())?;
-    serde_json::from_str(&output).map_err(|_| "Invalid remote model definition".into())
 }
 
 #[derive(Clone)]
@@ -1783,6 +1759,35 @@ mod tests {
         let mut incompatible = provider;
         incompatible["wireApi"] = serde_json::json!("chat");
         assert!(api_bundle_from_providers(&account, &[incompatible]).is_err());
+    }
+
+    #[test]
+    fn api_bundle_uses_key_owned_catalog_without_provider_fallback() {
+        let mut account = CodexAccount::new("fixture-api".into(), "fixture".into(), CodexTokens {
+            id_token: String::new(), access_token: String::new(), refresh_token: None,
+        });
+        account.api_base_url = Some("https://provider.example/v1".into());
+        account.openai_api_key = Some(" fixture-key ".into());
+        let mut provider = serde_json::json!({
+            "baseUrl": "https://provider.example/v1", "wireApi": "responses",
+            "modelCatalogDefinition": {"models": [{"slug": "provider-model"}]},
+            "apiKeys": [
+                {"apiKey": "other-key", "modelCatalogDefinition": {"models": [{"slug": "other-model"}]}},
+                {"apiKey": "fixture-key", "modelCatalog": ["key-model"],
+                 "modelCatalogDefinition": {"models": [{"slug": "key-model", "custom": {"retained": true}}]}},
+            ],
+        });
+        let bundle = api_bundle_from_providers(&account, &[provider.clone()]).unwrap();
+        assert_eq!(bundle["model_catalog_definition"]["models"],
+            serde_json::json!([{"slug": "key-model", "custom": {"retained": true}}]));
+        provider["apiKeys"][1].as_object_mut().unwrap().remove("modelCatalogDefinition");
+        assert!(api_bundle_from_providers(&account, &[provider.clone()]).is_err());
+        provider["apiKeys"][1].as_object_mut().unwrap().remove("modelCatalog");
+        provider["apiKeys"][1]["modelCatalogDefinition"] = serde_json::Value::Null;
+        assert!(api_bundle_from_providers(&account, &[provider.clone()]).is_err());
+        provider["apiKeys"][1].as_object_mut().unwrap().remove("modelCatalogDefinition");
+        let inherited = api_bundle_from_providers(&account, &[provider]).unwrap();
+        assert_eq!(inherited["model_catalog_definition"]["models"], serde_json::json!([{"slug": "provider-model"}]));
     }
 
     #[test]
