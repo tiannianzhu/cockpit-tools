@@ -245,3 +245,6 @@ pub mod buddy_resource_api;
 
 #[path = "../../../crates/cockpit-core/src/modules/qoder_usage.rs"]
 pub mod qoder_usage;
+pub mod remote_codex_sessions;
+
+pub(crate) mod codex_session_index;

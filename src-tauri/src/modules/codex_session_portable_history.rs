@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{list_rollout_files, rollout_reader, SESSION_DIRS};
+use super::{rollout_reader, SESSION_DIRS};
 use crate::modules::codex_history_projection_repair::rollout_file_ids;
 use crate::modules::codex_session_rollout_records::Records;
 
@@ -57,6 +57,39 @@ impl RecordHeader {
                     )
             })
     }
+}
+
+fn list_rollout_files(root_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut result = Vec::new();
+    let entries = fs::read_dir(root_dir)
+        .map_err(|error| format!("读取目录失败 ({}): {}", root_dir.display(), error))?;
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("读取目录项失败 ({}): {}", root_dir.display(), error))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("读取文件类型失败 ({}): {}", path.display(), error))?;
+        if file_type.is_dir() {
+            result.extend(list_rollout_files(&path)?);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|item| item.to_str())
+            .unwrap_or_default();
+        if file_name.starts_with("rollout-")
+            && (file_name.ends_with(".jsonl") || file_name.ends_with(".jsonl.zst")) {
+            result.push(path);
+        }
+    }
+
+    result.sort();
+    Ok(result)
 }
 
 type RolloutPaths = HashMap<String, Vec<PathBuf>>;

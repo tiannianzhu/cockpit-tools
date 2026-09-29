@@ -46,13 +46,15 @@ fn collect_usage_instances() -> Result<Vec<UsageInstance>, String> {
 }
 
 pub fn apply_report_cost(report: &mut CodexSessionUsageReport) {
-    report.totals.estimated_cost_usd = report.by_model.iter().fold(0.0, |sum, row| {
-        sum + crate::modules::codex_local_access::estimate_model_token_cost_usd(
+    report.totals.estimated_cost_usd = report.by_model.iter_mut().fold(0.0, |sum, row| {
+        let cost = crate::modules::codex_local_access::estimate_model_token_cost_usd(
             &row.key,
             row.input_tokens,
             row.cached_input_tokens,
             row.output_tokens,
-        )
+        );
+        row.estimated_cost_usd = Some(cost);
+        sum + cost
     });
 }
 

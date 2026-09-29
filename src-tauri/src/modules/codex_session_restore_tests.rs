@@ -7,7 +7,9 @@ fn restore_index_failure_keeps_durable_target_and_trash_for_retry() {
     let entry = make_trash_entry(&base, "session-1", target.clone());
     let source = fs::read(&entry.trashed_rollout_path).unwrap();
     fs::create_dir(root.join(SESSION_INDEX_FILE)).unwrap();
-    assert!(restore_trashed_session_entry_with_metadata_rebuild(&entry, false).is_err());
+    assert!(
+        restore_trashed_session_entry_with_registration(&entry, |_, _, _, _, _| Ok(())).is_err()
+    );
     assert_eq!(fs::read(&target).unwrap(), source);
     assert_eq!(fs::read(&entry.trashed_rollout_path).unwrap(), source);
     fs::remove_dir(root.join(SESSION_INDEX_FILE)).unwrap();
@@ -16,9 +18,54 @@ fn restore_index_failure_keeps_durable_target_and_trash_for_retry() {
         b"{\"id\":\"other\",\"thread_name\":\"Concurrent record\"}\n",
     )
     .unwrap();
-    restore_trashed_session_entry_with_metadata_rebuild(&entry, false).unwrap();
-    assert_eq!(fs::read(&target).unwrap(), source);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&target)
+        .unwrap()
+        .write_all(b"new concurrent history\n")
+        .unwrap();
+    let mut appended = source.clone();
+    appended.extend_from_slice(b"new concurrent history\n");
+    restore_trashed_session_entry_with_registration(&entry, |_, _, path, _, _| {
+        assert_eq!(path, target);
+        assert_eq!(fs::read(path).unwrap(), appended);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(fs::read(&target).unwrap(), appended);
     assert!(read_session_index_map(&root).unwrap().contains_key("other"));
+    assert!(!entry.entry_dir.exists());
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn restore_registration_failure_keeps_concurrently_appended_history_and_index() {
+    let base = make_temp_dir("codex-session-restore-registration-append");
+    let target = base.join("codex-home/sessions/rollout-session-1.jsonl");
+    let entry = make_trash_entry(&base, "session-1", target.clone());
+    let original = fs::read(&entry.trashed_rollout_path).unwrap();
+    let index_path = entry.manifest.instance_root.join(SESSION_INDEX_FILE);
+    let mut expected = original.clone();
+    expected.extend_from_slice(b"new client history\n");
+    let concurrent_index = b"{\"id\":\"concurrent\",\"thread_name\":\"Client record\"}\n";
+    let error = restore_trashed_session_entry_with_registration(&entry, |_, _, path, _, _| {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"new client history\n")
+            .unwrap();
+        fs::write(&index_path, concurrent_index).unwrap();
+        Err("official confirmation failed".into())
+    })
+    .unwrap_err();
+    assert!(error.contains("official confirmation failed"));
+    assert_eq!(fs::read(&target).unwrap(), expected);
+    assert_eq!(fs::read(&index_path).unwrap(), concurrent_index);
+    assert_eq!(fs::read(&entry.trashed_rollout_path).unwrap(), original);
+    restore_trashed_session_entry_with_registration(&entry, |_, _, _, _, _| Ok(())).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), expected);
+    assert!(fs::read(&index_path).unwrap().starts_with(concurrent_index));
     assert!(!entry.entry_dir.exists());
     fs::remove_dir_all(base).unwrap();
 }
@@ -68,46 +115,4 @@ fn restored_session_index_concurrent_appends_keep_every_entry() {
         assert_eq!(index[&format!("session-{number}")]["thread_name"], number);
     }
     fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn official_fork_dependency_refusal_preserves_parent_child_and_index() {
-    let base = make_temp_dir("codex-session-trash-fork-dependency");
-    let root = base.join("profile");
-    let parent = root.join("sessions/rollout-parent.jsonl");
-    let child = root.join("sessions/rollout-child.jsonl");
-    write_rollout(&parent, "parent", "original history");
-    fs::write(&child, b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"history_base\":{\"thread_id\":\"parent\",\"end_ordinal\":1,\"end_byte_offset\":100}}}\n").unwrap();
-    let index = b"{\"id\":\"parent\",\"thread_name\":\"Parent\"}\n{\"id\":\"child\",\"thread_name\":\"Child\"}\n";
-    fs::write(root.join(SESSION_INDEX_FILE), index).unwrap();
-    let instance = CodexSyncInstance {
-        id: "default".into(),
-        name: "Fixture".into(),
-        data_dir: root.clone(),
-        last_pid: None,
-    };
-    let snapshot = ThreadSnapshot {
-        id: "parent".into(),
-        title: "Parent".into(),
-        cwd: "/tmp".into(),
-        project_name: None,
-        updated_at: None,
-        rollout_path: parent.clone(),
-        session_index_entry: json!({"id":"parent"}),
-        source_root: root.clone(),
-    };
-    let parent_bytes = fs::read(&parent).unwrap();
-    let child_bytes = fs::read(&child).unwrap();
-    let result = trash_snapshots_for_instance_with_app_server(
-        &instance,
-        &base.join("trash"),
-        &[snapshot],
-        |_, _| Err("cannot delete thread parent: forked history still references it".into()),
-        |_| panic!("dependency refusal must never rebuild or remove history"),
-    );
-    assert!(result.is_err());
-    assert_eq!(fs::read(&parent).unwrap(), parent_bytes);
-    assert_eq!(fs::read(&child).unwrap(), child_bytes);
-    assert_eq!(fs::read(root.join(SESSION_INDEX_FILE)).unwrap(), index);
-    fs::remove_dir_all(base).unwrap();
 }

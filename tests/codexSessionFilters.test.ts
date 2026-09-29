@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
+import ts from 'typescript';
 import {
   filterCodexSessionsByKind,
   type CodexSessionKindFilter,
@@ -43,13 +44,18 @@ describe('codex session kind filter', () => {
       `${process.cwd()}/src/components/codex/CodexSessionManager.tsx`,
       'utf8',
     );
-    const loaderStart = source.indexOf('const loadSessions = useCallback');
-    const loaderEnd = source.indexOf('const loadTokenStatsForGroups', loaderStart);
-    const loaderSource = source.slice(loaderStart, loaderEnd);
+    const file = ts.createSourceFile('CodexSessionManager.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    let loaderSource: string | undefined;
+    const visit = (node: ts.Node) => {
+      if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'loadSessions') {
+        loaderSource = node.initializer?.getText(file);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(file);
 
-    assert.notEqual(loaderStart, -1);
-    assert.notEqual(loaderEnd, -1);
+    assert.ok(loaderSource);
     assert.equal(loaderSource.includes('sessionKindFilter'), false);
-    assert.ok(source.includes('filterCodexSessionsByKind(sessions, sessionKindFilter)'));
+    assert.ok(source.includes('useCodexSessionList(sessions, sessionKindFilter, archiveFilter, appliedTitleSearch)'));
   });
 });
