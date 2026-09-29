@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import vm from 'node:vm';
 import ts from 'typescript';
 
@@ -38,19 +39,32 @@ export function loadHookModule(file: URL, imports: Record<string, unknown>, glob
     },
     useCallback(callback: unknown, deps?: unknown[]) { return hooks.useMemo(() => callback, deps); },
   };
-  const exports: Record<string, any> = {};
+  const moduleCache = new Map<string, Record<string, any>>();
+  const loadModule = (moduleFile: URL | string): Record<string, any> => {
+    const moduleUrl = typeof moduleFile === 'string' ? pathToFileURL(moduleFile) : moduleFile;
+    const modulePath = fileURLToPath(moduleUrl);
+    const cached = moduleCache.get(modulePath);
+    if (cached) return cached;
+    const moduleExports: Record<string, any> = {};
+    moduleCache.set(modulePath, moduleExports);
+    const require = createRequire(moduleUrl);
+    const compiled = ts.transpileModule(readFileSync(moduleUrl, 'utf8'), { compilerOptions: {
+      module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX,
+    } }).outputText;
+    vm.runInNewContext(compiled, { exports: moduleExports, crypto: globalThis.crypto, setTimeout, clearTimeout, ...globals,
+      require(name: string) {
+        if (name in imports) return imports[name];
+        if (name === 'react') return { ...hooks, createContext };
+        if (name.endsWith('.css')) return {};
+        return require(name);
+      },
+    });
+    return moduleExports;
+  };
   const require = createRequire(file);
   // Context creation is not a hook; retain React's provider shape for context-owner tests.
   const createContext = require('react').createContext;
-  const compiled = ts.transpileModule(readFileSync(file, 'utf8'), { compilerOptions: {
-    module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX,
-  } }).outputText;
-  vm.runInNewContext(compiled, { exports, crypto: globalThis.crypto, setTimeout, clearTimeout, ...globals, require(name: string) {
-    if (name in imports) return imports[name];
-    if (name === 'react') return { ...hooks, createContext };
-    if (name.endsWith('.css')) return {};
-    return require(name);
-  } });
+  const exports = loadModule(file);
   function flush(): any {
     if (!renderCurrent) throw new Error('Render the hook before flushing');
     let output: any;
@@ -62,7 +76,7 @@ export function loadHookModule(file: URL, imports: Record<string, unknown>, glob
     } while (dirty);
     return output;
   }
-  return { exports, hooks, flush, render(callback: () => any) { renderCurrent = callback; return flush(); },
+  return { exports, hooks, loadModule, flush, render(callback: () => any) { renderCurrent = callback; return flush(); },
     unmount() { cleanups.forEach((cleanup) => cleanup?.()); },
   };
 }

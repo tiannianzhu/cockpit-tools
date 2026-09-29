@@ -202,3 +202,6 @@ pub mod codex_proxy_targets;
 pub mod buddy_resource_api;
 
 pub mod qoder_usage;
+pub mod remote_codex_sessions;
+
+pub(crate) mod codex_session_index;
