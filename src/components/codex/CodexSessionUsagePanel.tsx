@@ -1,3 +1,4 @@
+import { createInitialSessionUsageCheck } from '../../utils/codexSessionUsageCheck';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog';
@@ -15,6 +16,7 @@ import { SingleSelectDropdown, type SingleSelectOption } from '../SingleSelectDr
 import * as codexInstanceService from '../../services/codexInstanceService';
 import type {
   CodexSessionUsageQuery,
+  CodexSessionUsageSyncResult,
   CodexSessionUsageReport,
   CodexSessionUsageBreakdownRow,
 } from '../../types/codex';
@@ -34,6 +36,20 @@ import {
   readCodexSessionUsageRange,
   type CodexSessionUsageRange as UsageRange,
 } from '../../utils/codexStatsRangePreference';
+
+export interface SessionUsageSource {
+  querySessionUsage: (query: CodexSessionUsageQuery) => Promise<CodexSessionUsageReport>;
+  syncSessionUsage: (options: { rebuild?: boolean; query?: CodexSessionUsageQuery }) => Promise<CodexSessionUsageSyncResult>;
+}
+
+// Owned by the manager so list/detail remounts share the same initial check.
+export function useInitialSessionUsageCheck(source: SessionUsageSource = codexInstanceService) {
+  return useMemo(() => createInitialSessionUsageCheck(
+    () => source.syncSessionUsage({ rebuild: false }),
+  ), [source]);
+}
+
+type InitialUsageCheck = () => Promise<CodexSessionUsageSyncResult | undefined>;
 
 function startOfLocalDay(value: Date): Date {
   return new Date(value.getFullYear(), value.getMonth(), value.getDate());
@@ -100,11 +116,13 @@ function UsageBreakdownTable({
   emptyLabel,
   keyLabel,
   lang,
+  showCost = false,
 }: {
   rows: CodexSessionUsageBreakdownRow[];
   emptyLabel: string;
   keyLabel: string;
   lang: string;
+  showCost?: boolean;
 }) {
   const { t } = useTranslation();
   return (
@@ -113,6 +131,7 @@ function UsageBreakdownTable({
         <thead>
           <tr>
             <th>{keyLabel}</th>
+            {showCost && <th>{t('codex.sessionUsage.cards.cost', '估算费用')}</th>}
             <th>{t('codex.sessionUsage.tables.input', '输入 Tokens')}</th>
             <th>{t('codex.sessionUsage.tables.cached', '缓存 Tokens')}</th>
             <th>{t('codex.sessionUsage.tables.output', '输出 Tokens')}</th>
@@ -123,12 +142,13 @@ function UsageBreakdownTable({
         <tbody>
           {rows.length === 0 ? (
             <tr>
-              <td colSpan={6}>{emptyLabel}</td>
+              <td colSpan={showCost ? 7 : 6}>{emptyLabel}</td>
             </tr>
           ) : (
             rows.map((row) => (
               <tr key={row.key || row.label}>
                 <td title={row.label || row.key}>{row.label || row.key || '—'}</td>
+                {showCost && <td>{formatSessionUsageCostUsd(row.estimatedCostUsd)}</td>}
                 <td>
                   <TokenAmount value={row.inputTokens} lang={lang} />
                 </td>
@@ -152,13 +172,20 @@ function UsageBreakdownTable({
 }
 
 export function CodexSessionUsageSummary({
+  initialCheck,
   onOpenDetail,
+  source = codexInstanceService,
+  onReport,
 }: {
+  initialCheck: InitialUsageCheck;
   onOpenDetail: () => void;
+  source?: SessionUsageSource;
+  onReport?: (report: CodexSessionUsageReport) => void;
 }) {
   const { t, i18n } = useTranslation();
   const lang = i18n.resolvedLanguage || i18n.language || 'zh-CN';
   const [report, setReport] = useState<CodexSessionUsageReport | null>(null);
+  const [summaryError, setSummaryError] = useState('');
   const [loadState, setLoadState] = useState<SessionUsageSummaryLoadState>('scanning');
   const [range] = useState<UsageRange>(() => readCodexSessionUsageRange());
   const query = useMemo(() => buildUsageQuery(range, ''), [range]);
@@ -166,29 +193,31 @@ export function CodexSessionUsageSummary({
   useEffect(() => {
     let cancelled = false;
     setLoadState('scanning');
+    setSummaryError('');
     void (async () => {
       let trusted = false;
       try {
-        const cached = await codexInstanceService.querySessionUsage(query);
+        const cached = await source.querySessionUsage(query);
         if (cancelled) return;
         trusted = hasTrustedSessionUsageCache(cached);
         setReport(cached);
+        onReport?.(cached);
         setLoadState(trusted ? 'updating' : 'scanning');
       } catch {
         if (!cancelled) setReport(null);
       }
       try {
-        const synced = await codexInstanceService.syncSessionUsage({
-          rebuild: false,
-          query,
-        });
+        const synced = await initialCheck();
         if (cancelled) return;
-        if (synced.report) {
-          setReport(synced.report);
-        }
+        const current = await source.querySessionUsage(query);
+        if (cancelled) return;
+        setReport(current);
+        onReport?.(current);
+        if (synced && synced.errors.length > 0) setSummaryError(synced.errors[0]);
         setLoadState('ready');
-      } catch {
+      } catch (cause) {
         if (cancelled) return;
+        setSummaryError(String(cause));
         // 列表页只展示已有汇总，扫描失败不挡会话列表。
         setLoadState(trusted ? 'ready' : 'failed');
       }
@@ -196,7 +225,7 @@ export function CodexSessionUsageSummary({
     return () => {
       cancelled = true;
     };
-  }, [query]);
+  }, [query, source, onReport, initialCheck]);
 
   const trusted = hasTrustedSessionUsageCache(report);
   const status = resolveSessionUsageSummaryStatus(loadState, trusted);
@@ -255,6 +284,7 @@ export function CodexSessionUsageSummary({
           </span>
         ) : null}
       </div>
+      {summaryError && <div role="alert" className="message-bar error">{summaryError}</div>}
       <div className="codex-session-usage-summary__metrics">
         {metrics.map(([label, value]) => (
           <span key={label} className="codex-session-usage-summary__metric">
@@ -275,10 +305,14 @@ export function CodexSessionUsageSummary({
 }
 
 export function CodexSessionUsagePanel({
+  initialCheck,
   onBack,
+  source = codexInstanceService,
 }: {
+  initialCheck: InitialUsageCheck;
   onBack?: () => void;
-} = {}) {
+  source?: SessionUsageSource;
+}) {
   const { t, i18n } = useTranslation();
   const lang = i18n.resolvedLanguage || i18n.language || 'zh-CN';
   const isZh = lang.toLowerCase().startsWith('zh');
@@ -298,9 +332,11 @@ export function CodexSessionUsagePanel({
     setLoading(true);
     setError('');
     try {
-      const nextReport = await codexInstanceService.querySessionUsage(nextQuery);
+      const initial = await initialCheck();
+      const nextReport = await source.querySessionUsage(nextQuery);
       if (version === requestVersionRef.current) {
         setReport(nextReport);
+        if (initial && initial.errors.length > 0) setError(initial.errors[0]);
       }
     } catch (loadError) {
       if (version === requestVersionRef.current) {
@@ -316,7 +352,7 @@ export function CodexSessionUsagePanel({
         setLoading(false);
       }
     }
-  }, [t]);
+  }, [t, source, initialCheck]);
 
   const runSync = useCallback(async (rebuild: boolean) => {
     const version = ++requestVersionRef.current;
@@ -326,7 +362,7 @@ export function CodexSessionUsagePanel({
     }
     setError('');
     try {
-      const result = await codexInstanceService.syncSessionUsage({
+      const result = await source.syncSessionUsage({
         rebuild,
         query,
       });
@@ -334,7 +370,7 @@ export function CodexSessionUsagePanel({
         if (result.report) {
           setReport(result.report);
         } else {
-          const nextReport = await codexInstanceService.querySessionUsage(query);
+          const nextReport = await source.querySessionUsage(query);
           setReport(nextReport);
         }
         if (result.errors.length > 0) {
@@ -357,17 +393,11 @@ export function CodexSessionUsagePanel({
         setLoading(false);
       }
     }
-  }, [query, t]);
+  }, [query, t, source]);
 
   useEffect(() => {
     void loadCached(query);
   }, [loadCached, query]);
-
-  useEffect(() => {
-    void runSync(false);
-    // 仅在首次进入面板时增量扫描，切换筛选只读缓存。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const handleRebuild = useCallback(async () => {
     const confirmed = await confirmDialog(
@@ -430,7 +460,7 @@ export function CodexSessionUsagePanel({
       <div className="codex-session-usage__intro">
         <div>
           <h3>{t('codex.sessionUsage.title', '会话用量')}</h3>
-          <p>{t('codex.sessionUsage.desc', '从本机 Codex 会话日志汇总真实 Token 用量，不依赖官方配额或 API 服务请求日志。')}</p>
+          <p>{t('codex.sessionUsage.desc', '从所选主机的 Codex 会话日志汇总真实 Token 用量，不依赖官方配额或 API 服务请求日志。')}</p>
         </div>
         {onBack ? (
           <button
@@ -506,15 +536,15 @@ export function CodexSessionUsagePanel({
           <span>
             {t('codex.sessionUsage.status.lastSynced', {
               time: lastSyncedLabel,
-              defaultValue: '上次同步 {{time}}',
+              defaultValue: '上次检查 {{time}}',
             })}
           </span>
         ) : null}
         {(report?.deferredFiles ?? 0) > 0 ? (
           <span>
-            {t('codex.sessionUsage.status.deferred', {
+            {t('codex.sessionUsage.status.unprocessed', {
               count: report?.deferredFiles ?? 0,
-              defaultValue: '{{count}} 个分叉会话待父会话就绪',
+              defaultValue: '{{count}} 个会话文件暂未计入统计',
             })}
           </span>
         ) : null}
@@ -547,7 +577,7 @@ export function CodexSessionUsagePanel({
           <p>
             {t(
               'codex.sessionUsage.empty.desc',
-              '打开此页后会在后台扫描本机 Codex 会话日志及多开会话目录。若刚用过 Codex，点刷新即可。',
+              '打开此页后会在后台扫描所选主机的 Codex 会话日志。若刚用过 Codex，点刷新即可。',
             )}
           </p>
         </div>
@@ -633,6 +663,7 @@ export function CodexSessionUsagePanel({
               <h4>{t('codex.sessionUsage.tables.model', '按模型')}</h4>
               <UsageBreakdownTable
                 rows={report?.byModel ?? []}
+                showCost
                 keyLabel={t('codex.sessionUsage.tables.modelName', '模型')}
                 emptyLabel={t('codex.sessionUsage.empty.title', '还没有会话用量')}
                 lang={lang}

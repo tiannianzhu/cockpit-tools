@@ -2339,3 +2339,52 @@ html[data-reduced-motion="true"] .codex-accounts-page .codex-accounts-grid .code
     grid-template-columns: 1fr;
   }
 }
+
+.codex-session-manager__search--filters {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.codex-session-manager__search--filters .codex-session-search-field {
+  flex: 1 1 220px;
+  max-width: 420px;
+}
+
+.codex-session-manager__search--filters .codex-session-manager__kind-filter {
+  flex: 0 0 160px;
+}
+
+/* Agent conversations stay inside their owning conversation. */
+.codex-session-branch__children {
+  margin: 6px 0 12px 24px;
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
+}
+.codex-session-manager:not(.codebuddy-session-manager) .codex-session-branch--child > .codex-session-row {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.codex-session-branch__toggle {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.codex-session-branch__toggle:hover { color: var(--text-primary); }
+.codex-session-branch__toggle:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+@media (max-width: 640px) {
+  .codex-session-branch__children { margin-left: 10px; padding-left: 8px; }
+}

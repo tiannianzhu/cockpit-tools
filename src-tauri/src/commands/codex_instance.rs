@@ -2194,6 +2194,38 @@ pub async fn codex_open_session_rollout(
     })
     .await
     .map_err(|error| format!("打开 Codex 会话文件失败: {}", error))??;
+    #[cfg(target_os = "macos")]
+    {
+        // The opener plugin detaches /usr/bin/open and loses its exit status.
+        // JSONL may have no registered handler; use the default text editor then.
+        let _ = app;
+        tauri::async_runtime::spawn_blocking(move || {
+            let opened = Command::new("/usr/bin/open")
+                .arg(&rollout_path)
+                .output()
+                .map_err(|error| format!("打开 Codex 会话文件失败: {}", error))?;
+            if opened.status.success() {
+                return Ok(());
+            }
+            let text_opened = Command::new("/usr/bin/open")
+                .arg("-t")
+                .arg(&rollout_path)
+                .output()
+                .map_err(|error| format!("使用文本编辑器打开会话文件失败: {}", error))?;
+            if text_opened.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "打开 Codex 会话文件失败: {}\n{}",
+                    rollout_path.display(),
+                    String::from_utf8_lossy(&text_opened.stderr).trim()
+                ))
+            }
+        })
+        .await
+        .map_err(|error| format!("打开 Codex 会话文件失败: {}", error))?
+    }
+    #[cfg(not(target_os = "macos"))]
     app.opener()
         .open_path(rollout_path.to_string_lossy().to_string(), None::<String>)
         .map_err(|error| format!("打开 Codex 会话文件失败: {}", error))

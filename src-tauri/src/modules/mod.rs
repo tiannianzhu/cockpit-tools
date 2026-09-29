@@ -164,3 +164,7 @@ pub mod codex_proxy_network;
 pub mod codex_proxy_engine_errors;
 pub mod codex_proxy_catalog_binding;
 pub mod codex_proxy_subscription_parser;
+
+pub mod remote_codex_sessions;
+
+pub(crate) mod codex_session_index;

@@ -145,6 +145,7 @@ export function CodexAccountsView(props: CodexAccountsViewProps) {
     window.addEventListener('codex:open-builtin-page', openPage);
     return () => window.removeEventListener('codex:open-builtin-page', openPage);
   }, [pageRegistry, setActiveTab]);
+  const [sessionHost, setSessionHost] = useState("local");
   useEffect(() => {
     const openHosts = () => {
       if (takePendingCodexHostsRequest()) setActiveTab("hosts");
@@ -1020,8 +1021,12 @@ export function CodexAccountsView(props: CodexAccountsViewProps) {
         />
       )}
 
-      {activeTab === "hosts" && <CodexSshServersPanel />}
-      {activeTab === "sessions" && <CodexSessionManager />}
+      {activeTab === "hosts" && <CodexSshServersPanel onOpenSessions={(serverId) => {
+        setSessionHost(serverId);
+        setActiveTab("sessions");
+      }} />}
+      {activeTab === "sessions" && <CodexSessionManager host={sessionHost}
+        onHostChange={setSessionHost} onManageHosts={() => setActiveTab("hosts")} />}
 
       {activeTab === "providers" && (
         <CodexModelProviderManager

@@ -3350,10 +3350,6 @@
         "repairVisibilitySkippedOnly": "未發現需要寫入的 provider 差異；已略過 {{count}} 個無效或損毀的 state_5.sqlite，需由 Codex 重新產生後才能修復其中的 SQLite 記錄。",
         "repairVisibilitySkippedWithBase": "{{message}}；已略過 {{count}} 個無效或損毀的 state_5.sqlite，需由 Codex 重新產生後才能修復其中的 SQLite 記錄。",
         "trashSummary": "已將 {{count}} 個工作階段移到垃圾桶，並已在官方 Codex 中刪除",
-        "trashSummaryFallback": "已將 {{count}} 個工作階段移到垃圾桶，並已觸發官方 Codex 重建工作階段索引",
-        "trashSummaryRunningHint": "執行中的執行個體可能需要重新整理或重新啟動後才會顯示",
-        "trashSummaryFallbackHint": "{{count}} 個執行個體的官方刪除未完成，已改以檔案方式移除，Codex 重新啟動後會同步",
-        "trashSummaryRebuildFailedHint": "{{count}} 個執行個體的官方側邊欄索引重建未完成，重新啟動 Codex 後會重新載入",
         "trashSummaryEmpty": "所選工作階段不存在於目前的執行個體集合中，無需處理"
       },
       "groupCount": "{{count}} 條會話",
@@ -3573,7 +3569,7 @@
         "idle": "尚未掃描",
         "scanning": "正在掃描會話日誌…",
         "ready": "已掃描 {{files}} 個檔案，累計 {{requests}} 次請求",
-        "lastSynced": "上次同步 {{time}}",
+        "lastSynced": "上次檢查 {{time}}",
         "deferred": "{{count}} 個分叉會話待父會話就緒",
         "errors": "{{count}} 個檔案解析失敗"
       },

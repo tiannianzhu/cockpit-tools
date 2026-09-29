@@ -3194,7 +3194,7 @@
       },
       "confirm": {
         "title": "ゴミ箱へ移動",
-        "message": "選択したセッションは対応するインスタンスからゴミ箱へ移動され、後で復元できます。実行中のインスタンスでは、変更が反映されるまで再起動が必要な場合があります。続行しますか？",
+        "message": "選択した会話とすべての子エージェント会話を各インスタンスのゴミ箱へ移動します。後で復元できます。続行しますか？",
         "syncMessage": "不足しているスレッドとそのセッションデータをすべてのインスタンスに同期します。既存の内容は再書き込みされず、書き込み前に対象インスタンスのファイルをバックアップします。続行しますか？",
         "repairVisibilityMessage": "公式 Codex の state DB にあるサイドバー表示用セッション記録を更新します。書き込み前に対象の state DB をバックアップします。"
       },
@@ -3219,10 +3219,6 @@
         "repairVisibilitySkippedOnly": "書き込み可能な provider 差分は見つかりませんでした。無効または破損した state_5.sqlite ファイル {{count}} 件をスキップしました。SQLite レコードを修復するには、先に Codex がそれらを再生成する必要があります。",
         "repairVisibilitySkippedWithBase": "{{message}}。無効または破損した state_5.sqlite ファイル {{count}} 件をスキップしました。SQLite レコードを修復するには、先に Codex がそれらを再生成する必要があります。",
         "trashSummary": "{{count}} 件の会話をゴミ箱に移動し、公式 Codex 側でも削除しました",
-        "trashSummaryFallback": "{{count}} 件の会話をゴミ箱に移動し、公式 Codex の会話インデックス再構築を実行しました",
-        "trashSummaryRunningHint": "実行中のインスタンスでは、更新または再起動後に反映される場合があります",
-        "trashSummaryFallbackHint": "{{count}} 個のインスタンスで公式削除が完了しなかったため、ファイル操作で削除しました。Codex の再起動後に同期されます",
-        "trashSummaryRebuildFailedHint": "{{count}} 個のインスタンスで公式サイドバーのインデックス再構築が完了しませんでした。Codex の再起動後に再読み込みされます",
         "trashSummaryEmpty": "選択した会話は現在のインスタンス群に存在しないため、処理は不要です"
       },
       "groupCount": "{{count}} 件のセッション",
@@ -3403,10 +3399,16 @@
         "emptyFilteredTitle": "一致する会話がありません",
         "emptyFilteredDesc": "検索、ソース、選択状態を調整してください。"
       },
+      "archive": {
+        "active": "未アーカイブ",
+        "archived": "アーカイブ済み",
+        "all": "すべての状態",
+        "label": "アーカイブ状態"
+      },
       "kindFilter": "セッション種別",
       "kind": {
         "conversation": "会話",
-        "external": "外部",
+        "external": "非対話タスク",
         "subagent": "サブエージェント",
         "all": "すべて"
       },
@@ -3421,7 +3423,7 @@
       "tab": "使用量",
       "listTab": "セッション",
       "title": "セッション使用量",
-      "desc": "ローカルの Codex セッションログから実際のトークン使用量を集計します。公式クォータや API サービスのリクエストログは使いません。",
+      "desc": "選択したホストの Codex セッションログから実際のトークン使用量を集計します。公式クォータや API サービスのリクエストログは使いません。",
       "hint": "公式クォータはプラン枠、API サービスログはローカルゲートウェイ経由のみです。ここでは JSONL のリクエスト単位増分を合計します。",
       "range": {
         "label": "期間",
@@ -5386,6 +5388,38 @@
       "errors": {
         "bindingChanged": "紐付けが変更されました。現在の設定を維持しました。"
       }
+    },
+    "remoteSessions": {
+      "unavailable": "ホストが削除されたか利用できません",
+      "chooseHost": "選択したホストは利用できません。別のホストを選択してください。",
+      "raw": "元の記録（JSONL）",
+      "host": "セッションのホスト",
+      "local": "ローカル",
+      "manageHosts": "ホストを管理",
+      "search": "リモートセッションを検索",
+      "exported": "ローカルにエクスポートしました",
+      "confirmTrash": "「{{title}}」とすべての子エージェント会話を {{host}} のゴミ箱へ移動しますか？",
+      "back": "セッションに戻る",
+      "trash": "リモートのゴミ箱",
+      "scope": "ホスト：{{host}}。削除と復元はリモートで実行され、エクスポートはローカルに保存されます。",
+      "empty": "セッションが見つかりません",
+      "view": "表示",
+      "moveToTrash": "ゴミ箱に移動",
+      "limit": "{{total}} 件中 {{shown}} 件を表示。検索で絞り込んでください。",
+      "transcript": "セッション記録",
+      "truncated": "プレビューは省略されています。全記録はエクスポートできます。",
+      "title": "リモートセッション",
+      "count": "{{count}} 件",
+      "searchLabel": "セッションを検索",
+      "searchPlaceholder": "タイトル、ディレクトリ、ID で検索",
+      "loadError": "リモートセッションの操作に失敗しました。ホストの接続を確認して再試行してください。",
+      "emptyTrash": "ゴミ箱は空です",
+      "noMatches": "一致するセッションがありません",
+      "adjustSearch": "別のタイトル、ディレクトリ、ID で検索してください。",
+      "emptyHint": "このホストには管理できるセッションがありません。",
+      "noReadableMessages": "会話メッセージを抽出できませんでした。元の記録を確認できます。",
+      "user": "ユーザー",
+      "assistant": "アシスタント"
     },
     "hosts": {
       "displayNameOptional": "表示名（任意）",
