@@ -3510,10 +3510,6 @@
         "repairVisibilitySkippedOnly": "쓸 수 있는 provider 차이가 발견되지 않았습니다. 유효하지 않거나 손상된 state_5.sqlite 파일 {{count}}개를 건너뛰었습니다. 해당 SQLite 레코드를 복구하려면 먼저 Codex가 이 파일들을 다시 생성해야 합니다.",
         "repairVisibilitySkippedWithBase": "{{message}}; 유효하지 않거나 손상된 state_5.sqlite 파일 {{count}}개를 건너뛰었습니다. 해당 SQLite 레코드를 복구하려면 먼저 Codex가 이 파일들을 다시 생성해야 합니다.",
         "trashSummary": "{{count}}개의 대화를 휴지통으로 이동하고 공식 Codex에서도 삭제했습니다",
-        "trashSummaryFallback": "{{count}}개의 대화를 휴지통으로 이동하고 공식 Codex 대화 인덱스 재구성을 실행했습니다",
-        "trashSummaryRunningHint": "실행 중인 인스턴스는 새로 고침하거나 다시 시작해야 반영될 수 있습니다",
-        "trashSummaryFallbackHint": "{{count}}개 인스턴스의 공식 삭제가 완료되지 않아 파일 방식으로 제거했습니다. Codex를 다시 시작하면 동기화됩니다",
-        "trashSummaryRebuildFailedHint": "{{count}}개 인스턴스의 공식 사이드바 인덱스 재구성이 완료되지 않았습니다. Codex를 다시 시작하면 다시 불러옵니다",
         "trashSummaryEmpty": "선택한 대화가 현재 인스턴스 집합에 없어 처리할 항목이 없습니다"
       },
       "groupCount": "{{count}}개 세션",
@@ -3711,6 +3707,20 @@
         "hint": "이 세션은 여러 인스턴스에 있습니다. 파일 위치를 열 인스턴스를 선택하세요:",
         "rolloutHint": "이 세션은 여러 인스턴스에 있습니다. 세션 파일을 열 인스턴스를 선택하세요:",
         "running": "실행 중"
+      },
+      "archive": {
+        "active": "보관 해제됨",
+        "all": "모든 보관 상태",
+        "archived": "보관됨",
+        "label": "보관 상태"
+      },
+      "childAgents": "하위 에이전트({{count}})",
+      "selectConversation": "대화 선택: {{title}}",
+      "shared": {
+        "emptied": "휴지통 비움",
+        "purged": "대화 {{count}}개와 하위 에이전트 백업을 영구 삭제함",
+        "restored": "대화 {{count}}개와 하위 에이전트를 복원함",
+        "trashed": "대화 {{count}}개와 하위 에이전트를 휴지통으로 이동함"
       }
     },
     "sessionUsage": {
@@ -3740,8 +3750,8 @@
         "scanning": "세션 로그 스캔 중…",
         "ready": "파일 {{files}}개, 요청 {{requests}}건 집계",
         "lastSynced": "마지막 동기화 {{time}}",
-        "deferred": "부모 대기 포크 {{count}}개",
-        "errors": "파싱 실패 {{count}}개"
+        "errors": "파싱 실패 {{count}}개",
+        "unprocessed": "세션 파일 {{count}}개를 아직 계산할 수 없습니다"
       },
       "cards": {
         "input": "입력 Tokens",
@@ -5988,6 +5998,38 @@
       "title": "원격 호스트",
       "updated": "업데이트됨",
       "useLocalAccount": "현재 로컬 계정 사용"
+    },
+    "remoteSessions": {
+      "adjustSearch": "다른 제목, 디렉터리 또는 ID를 입력해 보세요.",
+      "assistant": "어시스턴트",
+      "back": "세션으로 돌아가기",
+      "chooseHost": "선택한 호스트를 사용할 수 없습니다. 다른 호스트를 선택하세요.",
+      "confirmTrash": "“{{title}}” 및 모든 하위 에이전트 대화를 {{host}}의 휴지통으로 이동할까요?",
+      "count": "세션 {{count}}개",
+      "empty": "세션을 찾을 수 없습니다",
+      "emptyHint": "이 호스트에서 관리할 세션이 없습니다.",
+      "emptyTrash": "휴지통이 비어 있습니다",
+      "exported": "이 컴퓨터로 내보냄",
+      "host": "세션 호스트",
+      "limit": "{{total}}개 중 {{shown}}개 표시 중입니다. 검색하여 결과를 좁히세요.",
+      "loadError": "원격 세션 작업에 실패했습니다. 호스트 연결을 확인하고 다시 시도하세요.",
+      "local": "로컬",
+      "manageHosts": "호스트 관리",
+      "moveToTrash": "휴지통으로 이동",
+      "noMatches": "일치하는 세션이 없습니다",
+      "noReadableMessages": "대화 메시지를 추출할 수 없습니다. 원시 레코드를 확인할 수 있습니다.",
+      "raw": "원시 대화 기록(JSONL)",
+      "scope": "호스트: {{host}}. 휴지통 이동과 복원은 원격으로 실행되고, 내보낸 파일은 로컬에 저장됩니다.",
+      "search": "원격 세션 검색",
+      "searchLabel": "세션 검색",
+      "searchPlaceholder": "제목, 디렉터리 또는 ID 검색",
+      "title": "원격 세션",
+      "transcript": "세션 대화 기록",
+      "trash": "원격 휴지통",
+      "truncated": "미리보기가 잘렸습니다. 전체 대화 기록을 저장하려면 내보내세요.",
+      "unavailable": "호스트가 삭제되었거나 사용할 수 없음",
+      "user": "사용자",
+      "view": "보기"
     }
   },
   "githubCopilot": {

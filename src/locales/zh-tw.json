@@ -3641,10 +3641,6 @@
         "repairVisibilitySkippedOnly": "未發現需要寫入的 provider 差異；已略過 {{count}} 個無效或損毀的 state_5.sqlite，需由 Codex 重新產生後才能修復其中的 SQLite 記錄。",
         "repairVisibilitySkippedWithBase": "{{message}}；已略過 {{count}} 個無效或損毀的 state_5.sqlite，需由 Codex 重新產生後才能修復其中的 SQLite 記錄。",
         "trashSummary": "已將 {{count}} 個工作階段移到垃圾桶，並已在官方 Codex 中刪除",
-        "trashSummaryFallback": "已將 {{count}} 個工作階段移到垃圾桶，並已觸發官方 Codex 重建工作階段索引",
-        "trashSummaryRunningHint": "執行中的執行個體可能需要重新整理或重新啟動後才會顯示",
-        "trashSummaryFallbackHint": "{{count}} 個執行個體的官方刪除未完成，已改以檔案方式移除，Codex 重新啟動後會同步",
-        "trashSummaryRebuildFailedHint": "{{count}} 個執行個體的官方側邊欄索引重建未完成，重新啟動 Codex 後會重新載入",
         "trashSummaryEmpty": "所選工作階段不存在於目前的執行個體集合中，無需處理"
       },
       "groupCount": "{{count}} 條會話",
@@ -3842,6 +3838,20 @@
         "hint": "此工作階段存在於多個實例，請選擇要開啟檔案位置的實例：",
         "rolloutHint": "此工作階段存在於多個實例，請選擇要開啟工作階段檔案的實例：",
         "running": "執行中"
+      },
+      "archive": {
+        "active": "未封存",
+        "all": "所有封存狀態",
+        "archived": "已封存",
+        "label": "封存狀態"
+      },
+      "childAgents": "子代理（{{count}}）",
+      "selectConversation": "選取對話：{{title}}",
+      "shared": {
+        "emptied": "已清空垃圾桶",
+        "purged": "已永久刪除 {{count}} 個對話及其子代理的備份",
+        "restored": "已還原 {{count}} 個對話及其子代理",
+        "trashed": "已將 {{count}} 個對話及其子代理移至垃圾桶"
       }
     },
     "sessionUsage": {
@@ -3870,9 +3880,9 @@
         "idle": "尚未掃描",
         "scanning": "正在掃描會話日誌…",
         "ready": "已掃描 {{files}} 個檔案，累計 {{requests}} 次請求",
-        "lastSynced": "上次同步 {{time}}",
-        "deferred": "{{count}} 個分叉會話待父會話就緒",
-        "errors": "{{count}} 個檔案解析失敗"
+        "lastSynced": "上次檢查 {{time}}",
+        "errors": "{{count}} 個檔案解析失敗",
+        "unprocessed": "尚未能計算 {{count}} 個工作階段檔案"
       },
       "cards": {
         "input": "輸入 Tokens",
@@ -5988,6 +5998,38 @@
       "title": "遠端主機",
       "updated": "已更新",
       "useLocalAccount": "使用目前的本機帳戶"
+    },
+    "remoteSessions": {
+      "adjustSearch": "請嘗試其他標題、目錄或 ID。",
+      "assistant": "助理",
+      "back": "返回工作階段",
+      "chooseHost": "所選主機無法使用。請選擇其他主機。",
+      "confirmTrash": "要將「{{title}}」及其所有子代理對話移至 {{host}} 的垃圾桶嗎？",
+      "count": "{{count}} 個工作階段",
+      "empty": "找不到工作階段",
+      "emptyHint": "此主機上沒有可管理的工作階段。",
+      "emptyTrash": "垃圾桶是空的",
+      "exported": "已匯出至這台電腦",
+      "host": "工作階段主機",
+      "limit": "顯示 {{shown}} / {{total}}。請搜尋以縮小結果範圍。",
+      "loadError": "遠端工作階段操作失敗。請檢查主機連線後再試一次。",
+      "local": "本機",
+      "manageHosts": "管理主機",
+      "moveToTrash": "移至垃圾桶",
+      "noMatches": "沒有相符的工作階段",
+      "noReadableMessages": "無法擷取對話訊息。您可以檢視原始記錄。",
+      "raw": "原始逐字稿 (JSONL)",
+      "scope": "主機：{{host}}。垃圾桶與還原操作會在遠端執行；匯出檔會儲存在本機。",
+      "search": "搜尋遠端工作階段",
+      "searchLabel": "搜尋工作階段",
+      "searchPlaceholder": "搜尋標題、目錄或 ID",
+      "title": "遠端工作階段",
+      "transcript": "工作階段逐字稿",
+      "trash": "遠端垃圾桶",
+      "truncated": "預覽內容已截斷。請匯出以儲存完整逐字稿。",
+      "unavailable": "主機已移除或無法使用",
+      "user": "使用者",
+      "view": "檢視"
     }
   },
   "githubCopilot": {

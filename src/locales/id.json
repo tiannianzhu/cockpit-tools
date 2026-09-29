@@ -3688,10 +3688,6 @@
         "repairVisibilitySkippedOnly": "Tidak ditemukan perbedaan provider yang dapat ditulis; {{count}} file state_5.sqlite yang tidak valid atau rusak dilewati. Codex harus membuatnya ulang sebelum catatan SQLite di dalamnya dapat diperbaiki.",
         "repairVisibilitySkippedWithBase": "{{message}}; {{count}} file state_5.sqlite yang tidak valid atau rusak dilewati. Codex harus membuatnya ulang sebelum catatan SQLite di dalamnya dapat diperbaiki.",
         "trashSummary": "{{count}} percakapan dipindahkan ke tempat sampah dan dihapus di Codex resmi",
-        "trashSummaryFallback": "{{count}} percakapan dipindahkan ke tempat sampah dan pembangunan ulang indeks sesi Codex resmi dijalankan",
-        "trashSummaryRunningHint": "Instance yang berjalan mungkin perlu dimuat ulang atau dimulai ulang agar perubahan terlihat",
-        "trashSummaryFallbackHint": "Penghapusan resmi belum selesai pada {{count}} instance; file dihapus langsung dan Codex akan menyinkronkan setelah dimulai ulang",
-        "trashSummaryRebuildFailedHint": "Pembangunan ulang indeks sidebar resmi belum selesai pada {{count}} instance; Codex akan memuatnya kembali setelah dimulai ulang",
         "trashSummaryEmpty": "Percakapan yang dipilih tidak ada di kumpulan instance saat ini, tidak ada yang perlu diproses"
       },
       "groupCount": "{{count}} sesi",
@@ -3889,6 +3885,20 @@
         "hint": "Sesi ini ada di beberapa instance. Pilih instance untuk membuka lokasi file:",
         "rolloutHint": "Sesi ini ada di beberapa instance. Pilih instance untuk membuka file sesi:",
         "running": "Berjalan"
+      },
+      "archive": {
+        "active": "Tidak diarsipkan",
+        "all": "Semua status arsip",
+        "archived": "Diarsipkan",
+        "label": "Status arsip"
+      },
+      "childAgents": "Subagen ({{count}})",
+      "selectConversation": "Pilih percakapan: {{title}}",
+      "shared": {
+        "emptied": "Sampah dikosongkan",
+        "purged": "Cadangan untuk {{count}} percakapan beserta subagennya dihapus permanen",
+        "restored": "{{count}} percakapan beserta subagennya dipulihkan",
+        "trashed": "{{count}} percakapan beserta subagennya dipindahkan ke Sampah"
       }
     },
     "sessionUsage": {
@@ -3918,8 +3928,8 @@
         "scanning": "Memindai log sesi…",
         "ready": "{{files}} berkas, {{requests}} permintaan",
         "lastSynced": "Sinkron terakhir {{time}}",
-        "deferred": "{{count}} fork menunggu induk",
-        "errors": "{{count}} berkas gagal dibaca"
+        "errors": "{{count}} berkas gagal dibaca",
+        "unprocessed": "{{count}} berkas sesi belum dapat dihitung"
       },
       "cards": {
         "input": "Token masuk",
@@ -6035,6 +6045,38 @@
       "title": "Host jarak jauh",
       "updated": "Diperbarui",
       "useLocalAccount": "Gunakan akun lokal saat ini"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Coba judul, direktori, atau ID lain.",
+      "assistant": "Asisten",
+      "back": "Kembali ke sesi",
+      "chooseHost": "Host terpilih tidak tersedia. Pilih host lain.",
+      "confirmTrash": "Pindahkan “{{title}}” dan semua percakapan subagennya ke sampah di {{host}}?",
+      "count": "{{count}} sesi",
+      "empty": "Tidak ada sesi yang ditemukan",
+      "emptyHint": "Tidak ada sesi yang perlu dikelola di host ini.",
+      "emptyTrash": "Sampah kosong",
+      "exported": "Diekspor ke komputer ini",
+      "host": "Host sesi",
+      "limit": "Menampilkan {{shown}} dari {{total}}. Cari untuk mempersempit hasil.",
+      "loadError": "Operasi sesi jarak jauh gagal. Periksa koneksi host dan coba lagi.",
+      "local": "Lokal",
+      "manageHosts": "Kelola host",
+      "moveToTrash": "Pindahkan ke sampah",
+      "noMatches": "Tidak ada sesi yang cocok",
+      "noReadableMessages": "Pesan percakapan tidak dapat diekstrak. Anda dapat melihat catatan mentahnya.",
+      "raw": "Transkrip mentah (JSONL)",
+      "scope": "Host: {{host}}. Pemindahan ke Sampah dan pemulihan dilakukan dari jarak jauh; ekspor disimpan secara lokal.",
+      "search": "Cari sesi jarak jauh",
+      "searchLabel": "Cari sesi",
+      "searchPlaceholder": "Cari judul, direktori, atau ID",
+      "title": "Sesi jarak jauh",
+      "transcript": "Transkrip sesi",
+      "trash": "Sampah jarak jauh",
+      "truncated": "Pratinjau terpotong. Ekspor untuk menyimpan transkrip lengkap.",
+      "unavailable": "Host dihapus atau tidak tersedia",
+      "user": "Pengguna",
+      "view": "Lihat"
     }
   },
   "codebuddy": {

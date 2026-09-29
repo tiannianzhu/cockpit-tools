@@ -3510,10 +3510,6 @@
         "repairVisibilitySkippedOnly": "Es wurden keine schreibbaren Provider-Unterschiede gefunden; {{count}} ungültige oder beschädigte state_5.sqlite-Datei(en) wurden übersprungen. Codex muss sie neu erstellen, bevor ihre SQLite-Einträge repariert werden können.",
         "repairVisibilitySkippedWithBase": "{{message}}; {{count}} ungültige oder beschädigte state_5.sqlite-Datei(en) wurden übersprungen. Codex muss sie neu erstellen, bevor ihre SQLite-Einträge repariert werden können.",
         "trashSummary": "{{count}} Unterhaltungen in den Papierkorb verschoben und im offiziellen Codex gelöscht",
-        "trashSummaryFallback": "{{count}} Unterhaltungen in den Papierkorb verschoben und den offiziellen Codex-Sitzungsindex neu aufgebaut",
-        "trashSummaryRunningHint": "Laufende Instanzen zeigen die Änderung erst nach Aktualisieren oder Neustart",
-        "trashSummaryFallbackHint": "Für {{count}} Instanzen konnte die offizielle Löschung nicht abgeschlossen werden; die Dateien wurden direkt entfernt und Codex synchronisiert nach einem Neustart",
-        "trashSummaryRebuildFailedHint": "Für {{count}} Instanzen wurde der offizielle Sidebar-Index nicht fertig neu aufgebaut; Codex lädt ihn nach einem Neustart neu",
         "trashSummaryEmpty": "Die ausgewählten Unterhaltungen gibt es in den aktuellen Instanzen nicht, nichts zu tun"
       },
       "groupCount": "{{count}} Sitzungen",
@@ -3711,6 +3707,20 @@
         "hint": "Diese Sitzung existiert auf mehreren Instanzen. Wählen Sie die Instanz für den Dateispeicherort:",
         "rolloutHint": "Diese Sitzung existiert auf mehreren Instanzen. Wählen Sie die Instanz für die Sitzungsdatei:",
         "running": "Läuft"
+      },
+      "archive": {
+        "active": "Nicht archiviert",
+        "all": "Alle Archivierungsstatus",
+        "archived": "Archiviert",
+        "label": "Archivierungsstatus"
+      },
+      "childAgents": "Unteragenten ({{count}})",
+      "selectConversation": "Unterhaltung auswählen: {{title}}",
+      "shared": {
+        "emptied": "Papierkorb geleert",
+        "purged": "Backups für {{count}} Unterhaltungen und deren Unteragenten dauerhaft gelöscht",
+        "restored": "{{count}} Unterhaltungen und deren Unteragenten wiederhergestellt",
+        "trashed": "{{count}} Unterhaltungen und deren Unteragenten in den Papierkorb verschoben"
       }
     },
     "sessionUsage": {
@@ -3740,8 +3750,8 @@
         "scanning": "Sitzungsprotokolle werden gescannt…",
         "ready": "{{files}} Dateien, {{requests}} Anfragen erfasst",
         "lastSynced": "Letzte Sync {{time}}",
-        "deferred": "{{count}} Forks warten auf die Elternsitzung",
-        "errors": "{{count}} Dateien nicht lesbar"
+        "errors": "{{count}} Dateien nicht lesbar",
+        "unprocessed": "{{count}} Sitzungsdateien konnten noch nicht gezählt werden"
       },
       "cards": {
         "input": "Eingabe-Tokens",
@@ -5988,6 +5998,38 @@
       "title": "Remote-Hosts",
       "updated": "Aktualisiert",
       "useLocalAccount": "Aktuelles lokales Konto verwenden"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Versuchen Sie einen anderen Titel, Ordner oder eine andere ID.",
+      "assistant": "Assistent",
+      "back": "Zurück zu den Sitzungen",
+      "chooseHost": "Der ausgewählte Host ist nicht verfügbar. Wählen Sie einen anderen aus.",
+      "confirmTrash": "„{{title}}“ und alle Unteragenten-Unterhaltungen auf {{host}} in den Papierkorb verschieben?",
+      "count": "{{count}} Sitzungen",
+      "empty": "Keine Sitzungen gefunden",
+      "emptyHint": "Auf diesem Host gibt es keine Sitzungen zu verwalten.",
+      "emptyTrash": "Papierkorb ist leer",
+      "exported": "Auf diesen Computer exportiert",
+      "host": "Sitzungs-Host",
+      "limit": "{{shown}} von {{total}} angezeigt. Suchen Sie, um die Ergebnisse einzugrenzen.",
+      "loadError": "Der Remote-Sitzungsvorgang ist fehlgeschlagen. Prüfen Sie die Host-Verbindung und versuchen Sie es erneut.",
+      "local": "Lokal",
+      "manageHosts": "Hosts verwalten",
+      "moveToTrash": "In den Papierkorb verschieben",
+      "noMatches": "Keine passenden Sitzungen",
+      "noReadableMessages": "Es konnten keine Gesprächsnachrichten extrahiert werden. Sie können den Rohdatensatz anzeigen.",
+      "raw": "Rohtranskript (JSONL)",
+      "scope": "Host: {{host}}. Papierkorb und Wiederherstellung erfolgen remote; Exporte werden lokal gespeichert.",
+      "search": "Remote-Sitzungen durchsuchen",
+      "searchLabel": "Sitzungen durchsuchen",
+      "searchPlaceholder": "Titel, Ordner oder ID suchen",
+      "title": "Remote-Sitzungen",
+      "transcript": "Sitzungstranskript",
+      "trash": "Remote-Papierkorb",
+      "truncated": "Vorschau gekürzt. Exportieren Sie das vollständige Transkript.",
+      "unavailable": "Host entfernt oder nicht verfügbar",
+      "user": "Benutzer",
+      "view": "Anzeigen"
     }
   },
   "githubCopilot": {

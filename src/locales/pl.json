@@ -3510,10 +3510,6 @@
         "repairVisibilitySkippedOnly": "Nie znaleziono zapisywalnych różnic provider; pominięto {{count}} nieprawidłowych lub uszkodzonych plików state_5.sqlite. Codex musi je ponownie wygenerować, zanim będzie można naprawić ich rekordy SQLite.",
         "repairVisibilitySkippedWithBase": "{{message}}; pominięto {{count}} nieprawidłowych lub uszkodzonych plików state_5.sqlite. Codex musi je ponownie wygenerować, zanim będzie można naprawić ich rekordy SQLite.",
         "trashSummary": "Przeniesiono {{count}} rozmów do kosza i usunięto je w oficjalnym Codex",
-        "trashSummaryFallback": "Przeniesiono {{count}} rozmów do kosza i uruchomiono odbudowę indeksu sesji oficjalnego Codex",
-        "trashSummaryRunningHint": "Działające instancje mogą wymagać odświeżenia lub ponownego uruchomienia, aby zmiana była widoczna",
-        "trashSummaryFallbackHint": "Oficjalne usuwanie nie zakończyło się dla {{count}} instancji; pliki usunięto bezpośrednio, a Codex zsynchronizuje się po ponownym uruchomieniu",
-        "trashSummaryRebuildFailedHint": "Odbudowa oficjalnego indeksu panelu bocznego nie zakończyła się dla {{count}} instancji; Codex wczyta go ponownie po restarcie",
         "trashSummaryEmpty": "Wybranych rozmów nie ma w bieżącym zestawie instancji, nie ma nic do zrobienia"
       },
       "groupCount": "{{count}} sesji",
@@ -3711,6 +3707,20 @@
         "hint": "Ta sesja jest na wielu instancjach. Wybierz instancję, w której otworzyć lokalizację pliku:",
         "rolloutHint": "Ta sesja jest na wielu instancjach. Wybierz instancję, w której otworzyć plik sesji:",
         "running": "Uruchomiona"
+      },
+      "archive": {
+        "active": "Niearchiwizowane",
+        "all": "Wszystkie stany archiwizacji",
+        "archived": "Zarchiwizowane",
+        "label": "Stan archiwizacji"
+      },
+      "childAgents": "Subagenci ({{count}})",
+      "selectConversation": "Wybierz rozmowę: {{title}}",
+      "shared": {
+        "emptied": "Opróżniono kosz",
+        "purged": "Trwale usunięto kopie zapasowe {{count}} rozmów i ich subagentów",
+        "restored": "Przywrócono {{count}} rozmów i ich subagentów",
+        "trashed": "Przeniesiono {{count}} rozmów i ich subagentów do kosza"
       }
     },
     "sessionUsage": {
@@ -3740,8 +3750,8 @@
         "scanning": "Skanowanie logów…",
         "ready": "{{files}} plików, {{requests}} żądań",
         "lastSynced": "Ostatnia sync {{time}}",
-        "deferred": "{{count}} forki czekają na rodzica",
-        "errors": "{{count}} plików nieczytelnych"
+        "errors": "{{count}} plików nieczytelnych",
+        "unprocessed": "Nie można jeszcze zliczyć {{count}} plików sesji"
       },
       "cards": {
         "input": "Tokeny wejścia",
@@ -5988,6 +5998,38 @@
       "title": "Hosty zdalne",
       "updated": "Zaktualizowano",
       "useLocalAccount": "Użyj bieżącego konta lokalnego"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Spróbuj użyć innego tytułu, katalogu lub identyfikatora.",
+      "assistant": "Asystent",
+      "back": "Wróć do sesji",
+      "chooseHost": "Wybrany host jest niedostępny. Wybierz inny host.",
+      "confirmTrash": "Przenieść „{{title}}” i wszystkie rozmowy jego subagentów do kosza na {{host}}?",
+      "count": "{{count}} sesji",
+      "empty": "Nie znaleziono sesji",
+      "emptyHint": "Na tym hoście nie ma sesji do zarządzania.",
+      "emptyTrash": "Kosz jest pusty",
+      "exported": "Wyeksportowano na ten komputer",
+      "host": "Host sesji",
+      "limit": "Wyświetlanie {{shown}} z {{total}}. Wyszukaj, aby zawęzić wyniki.",
+      "loadError": "Operacja na zdalnej sesji nie powiodła się. Sprawdź połączenie z hostem i spróbuj ponownie.",
+      "local": "Lokalne",
+      "manageHosts": "Zarządzaj hostami",
+      "moveToTrash": "Przenieś do kosza",
+      "noMatches": "Brak pasujących sesji",
+      "noReadableMessages": "Nie udało się wyodrębnić wiadomości rozmowy. Możesz wyświetlić surowy zapis.",
+      "raw": "Surowy zapis rozmowy (JSONL)",
+      "scope": "Host: {{host}}. Kosz i przywracanie działają zdalnie; eksporty są zapisywane lokalnie.",
+      "search": "Szukaj zdalnych sesji",
+      "searchLabel": "Szukaj sesji",
+      "searchPlaceholder": "Szukaj tytułu, katalogu lub identyfikatora",
+      "title": "Sesje zdalne",
+      "transcript": "Zapis sesji",
+      "trash": "Zdalny kosz",
+      "truncated": "Podgląd jest skrócony. Wyeksportuj, aby zapisać pełny zapis rozmowy.",
+      "unavailable": "Host usunięty lub niedostępny",
+      "user": "Użytkownik",
+      "view": "Wyświetl"
     }
   },
   "githubCopilot": {

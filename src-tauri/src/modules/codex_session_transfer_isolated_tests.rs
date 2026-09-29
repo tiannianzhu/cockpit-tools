@@ -3,27 +3,22 @@
 fn isolated_export_fixture(
     base: &Path,
     session_id: &str,
-) -> (CodexSyncInstance, ThreadSnapshot, SessionExportManifest) {
+) -> (SessionPackageSource, SessionExportManifest) {
     let root = base.join("source");
     let rollout = root.join(format!("sessions/2026/10/11/rollout-{session_id}.jsonl"));
     write_rollout(&rollout, session_id, "中文🙂 round trip");
     let index = json!({"id": session_id, "thread_name": "QA export", "pinned": true, "cwd": "/tmp/project"});
     fs::write(root.join(SESSION_INDEX_FILE), format!("{index}\n")).unwrap();
-    let instance = CodexSyncInstance {
-        id: "qa-source".into(),
-        name: "QA source".into(),
-        data_dir: root.clone(),
-        last_pid: None,
-    };
-    let snapshot = ThreadSnapshot {
-        id: session_id.into(),
+    let source = SessionPackageSource {
+        session_id: session_id.into(),
         title: "QA export".into(),
         cwd: "/tmp/project".into(),
-        project_name: None,
         updated_at: Some(1_780_362_123),
+        relative_rollout_path: path_to_package_path(rollout.strip_prefix(&root).unwrap()).unwrap(),
         rollout_path: rollout.clone(),
         session_index_entry: index.clone(),
-        source_root: root,
+        source_instance_id: "qa-source".into(),
+        source_instance_name: "QA source".into(),
     };
     let (size_bytes, sha256) = sha256_file(&rollout).unwrap();
     let manifest = SessionExportManifest {
@@ -34,28 +29,28 @@ fn isolated_export_fixture(
             session_id: session_id.into(),
             title: "QA export".into(),
             cwd: "/tmp/project".into(),
-            updated_at: snapshot.updated_at,
+            updated_at: source.updated_at,
             relative_rollout_path: "sessions/2026/10/11/rollout-imported.jsonl".into(),
             file_entry: format!("files/{session_id}.jsonl"),
             size_bytes,
             sha256,
             session_index_entry: index,
             source_instance: SessionExportInstance {
-                id: instance.id.clone(),
-                name: instance.name.clone(),
+                id: source.source_instance_id.clone(),
+                name: source.source_instance_name.clone(),
             },
         }],
     };
-    (instance, snapshot, manifest)
+    (source, manifest)
 }
 
 #[test]
 fn isolated_export_import_trash_restore_roundtrip_keeps_bytes_index_and_package() {
     let base = make_temp_dir("codex-session-transfer-roundtrip");
-    let (instance, snapshot, manifest) = isolated_export_fixture(&base, "qa-roundtrip");
-    let original_bytes = fs::read(&snapshot.rollout_path).unwrap();
+    let (source, manifest) = isolated_export_fixture(&base, "qa-roundtrip");
+    let original_bytes = fs::read(&source.rollout_path).unwrap();
     let package = base.join("sessions.zip");
-    write_session_export_package(&package, &manifest, &[(instance, snapshot)], None, None).unwrap();
+    write_session_export_package(&package, &manifest, &[source], None, None).unwrap();
     let original_package_hash = sha256_file(&package).unwrap();
     let disk_manifest = read_session_export_manifest_from_path(&package).unwrap();
     assert_eq!(disk_manifest.sessions[0].session_id, "qa-roundtrip");
@@ -80,7 +75,10 @@ fn isolated_export_import_trash_restore_roundtrip_keeps_bytes_index_and_package(
         last_pid: None,
     };
     let imported = ThreadSnapshot {
+        archived: false,
         id: "qa-roundtrip".into(),
+        session_kind: default_session_kind(),
+        parent_thread_id: None,
         title: "QA export".into(),
         cwd: "/tmp/project".into(),
         project_name: None,
@@ -90,16 +88,13 @@ fn isolated_export_import_trash_restore_roundtrip_keeps_bytes_index_and_package(
         source_root: target_root.clone(),
     };
     let trash_root = base.join("trash");
-    let outcome = trash_snapshots_for_instance_with_app_server(
-        &target,
-        &trash_root.join("20261011-000000"),
-        &[imported],
-        |_, _| Err("synthetic offline app-server".into()),
-        |_| Ok(()),
-    )
-    .unwrap();
-    assert!(outcome.official_delete_failed);
-    assert!(!outcome.metadata_rebuild_failed);
+    let batch = trash_root.join("20261011-000000");
+    copy_snapshot_rollout_to_trash(&target, &batch, &imported).unwrap();
+    // Simulate the official thread/delete RPC's filesystem effects. Cockpit
+    // only finalizes the recoverable backup after deletion is confirmed.
+    fs::remove_file(&target_path).unwrap();
+    fs::write(target_root.join(SESSION_INDEX_FILE), "").unwrap();
+    finish_delete_backup(&batch.join("qa-target--qa-roundtrip"), true).unwrap();
     assert!(!target_path.exists());
     assert!(!read_session_index_map(&target_root)
         .unwrap()
@@ -114,7 +109,25 @@ fn isolated_export_import_trash_restore_roundtrip_keeps_bytes_index_and_package(
         fs::read(&entries[0].trashed_rollout_path).unwrap(),
         original_bytes
     );
-    restore_trashed_session_entry_with_metadata_rebuild(&entries[0], false).unwrap();
+    restore_trashed_session_entry_with_registration(
+        &entries[0],
+        |root, id, path, archived, title| {
+            assert_eq!(root, target_root);
+            assert_eq!(id, "qa-roundtrip");
+            assert_eq!(path, target_path);
+            assert!(!archived);
+            assert_eq!(title, "QA export");
+            assert_eq!(fs::read(path).unwrap(), original_bytes);
+            // The official registration RPC owns index updates on restore.
+            upsert_session_index_with_entry(
+                root,
+                &None,
+                id,
+                &entries[0].manifest.session_index_entry,
+            )
+        },
+    )
+    .unwrap();
     assert_eq!(fs::read(&target_path).unwrap(), original_bytes);
     assert_eq!(
         read_session_index_map(&target_root).unwrap()["qa-roundtrip"]["pinned"],
@@ -127,12 +140,37 @@ fn isolated_export_import_trash_restore_roundtrip_keeps_bytes_index_and_package(
 }
 
 #[test]
+fn isolated_package_read_rejects_paginated_history_before_remote_staging() {
+    let base = make_temp_dir("codex-session-import-paginated");
+    let (source, mut manifest) = isolated_export_fixture(&base, "qa-paginated");
+    let content = fs::read_to_string(&source.rollout_path).unwrap();
+    let mut records = content
+        .lines()
+        .map(|line| serde_json::from_str::<JsonValue>(line).unwrap())
+        .collect::<Vec<_>>();
+    records[0]["payload"]["history_base"] = json!({"session_id": "ancestor", "byte_offset": 128});
+    let content = records
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    fs::write(&source.rollout_path, content).unwrap();
+    let (size_bytes, sha256) = sha256_file(&source.rollout_path).unwrap();
+    manifest.sessions[0].size_bytes = size_bytes;
+    manifest.sessions[0].sha256 = sha256;
+    let package = base.join("sessions.zip");
+    write_session_export_package(&package, &manifest, &[source], None, None).unwrap();
+    let error = read_session_export_entry_bytes(&package, &manifest.sessions[0]).unwrap_err();
+    assert!(error.contains("分页会话"));
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn isolated_import_rejects_manifest_id_mismatch_without_publishing_file() {
     let base = make_temp_dir("codex-session-import-id-mismatch");
-    let (instance, snapshot, mut manifest) = isolated_export_fixture(&base, "actual-id");
+    let (source, mut manifest) = isolated_export_fixture(&base, "actual-id");
     manifest.sessions[0].session_id = "wrong-manifest-id".into();
     let package = base.join("sessions.zip");
-    write_session_export_package(&package, &manifest, &[(instance, snapshot)], None, None).unwrap();
+    write_session_export_package(&package, &manifest, &[source], None, None).unwrap();
     let target = base.join("target/rollout.jsonl");
     let mut archive = ZipArchive::new(File::open(&package).unwrap()).unwrap();
     assert!(
@@ -149,9 +187,9 @@ fn isolated_import_rejects_manifest_id_mismatch_without_publishing_file() {
 #[test]
 fn isolated_import_disk_parent_failure_preserves_existing_file_and_package() {
     let base = make_temp_dir("codex-session-import-parent-failure");
-    let (instance, snapshot, manifest) = isolated_export_fixture(&base, "qa-disk-failure");
+    let (source, manifest) = isolated_export_fixture(&base, "qa-disk-failure");
     let package = base.join("sessions.zip");
-    write_session_export_package(&package, &manifest, &[(instance, snapshot)], None, None).unwrap();
+    write_session_export_package(&package, &manifest, &[source], None, None).unwrap();
     let hash = sha256_file(&package).unwrap();
     let blocker = base.join("target-file");
     fs::write(&blocker, b"keep existing data").unwrap();

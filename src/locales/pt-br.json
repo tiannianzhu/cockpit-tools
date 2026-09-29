@@ -3510,10 +3510,6 @@
         "repairVisibilitySkippedOnly": "Nenhuma diferença de provider gravável foi encontrada; {{count}} arquivo(s) state_5.sqlite inválidos ou corrompidos foram ignorados. O Codex precisa recriá-los antes que seus registros SQLite possam ser reparados.",
         "repairVisibilitySkippedWithBase": "{{message}}; {{count}} arquivo(s) state_5.sqlite inválidos ou corrompidos foram ignorados. O Codex precisa recriá-los antes que seus registros SQLite possam ser reparados.",
         "trashSummary": "{{count}} conversas movidas para a lixeira e excluídas no Codex oficial",
-        "trashSummaryFallback": "{{count}} conversas movidas para a lixeira e reconstrução do índice de sessões do Codex oficial acionada",
-        "trashSummaryRunningHint": "Instâncias em execução podem precisar de atualização ou reinício para exibir a mudança",
-        "trashSummaryFallbackHint": "A exclusão oficial não foi concluída em {{count}} instâncias; os arquivos foram removidos diretamente e o Codex sincronizará após reiniciar",
-        "trashSummaryRebuildFailedHint": "A reconstrução do índice oficial da barra lateral não foi concluída em {{count}} instâncias; o Codex recarregará após reiniciar",
         "trashSummaryEmpty": "As conversas selecionadas não existem no conjunto atual de instâncias, nada a fazer"
       },
       "groupCount": "{{count}} sessões",
@@ -3711,6 +3707,20 @@
         "hint": "Esta sessão existe em várias instâncias. Escolha de qual instância abrir o local do arquivo:",
         "rolloutHint": "Esta sessão existe em várias instâncias. Escolha de qual instância abrir o arquivo da sessão:",
         "running": "Em execução"
+      },
+      "archive": {
+        "active": "Desarquivado",
+        "all": "Todos os estados de arquivamento",
+        "archived": "Arquivado",
+        "label": "Status do arquivamento"
+      },
+      "childAgents": "Subagentes ({{count}})",
+      "selectConversation": "Selecionar conversa: {{title}}",
+      "shared": {
+        "emptied": "Lixeira esvaziada",
+        "purged": "Backups de {{count}} conversas e seus subagentes excluídos permanentemente",
+        "restored": "{{count}} conversas e seus subagentes restaurados",
+        "trashed": "{{count}} conversas e seus subagentes movidos para a lixeira"
       }
     },
     "sessionUsage": {
@@ -3740,8 +3750,8 @@
         "scanning": "Escaneando logs…",
         "ready": "{{files}} arquivos, {{requests}} requisições",
         "lastSynced": "Última sync {{time}}",
-        "deferred": "{{count}} forks aguardando o pai",
-        "errors": "{{count}} arquivos falharam"
+        "errors": "{{count}} arquivos falharam",
+        "unprocessed": "Ainda não foi possível contabilizar {{count}} arquivos de sessão"
       },
       "cards": {
         "input": "Tokens de entrada",
@@ -5988,6 +5998,38 @@
       "title": "Hosts remotos",
       "updated": "Atualizado",
       "useLocalAccount": "Usar a conta local atual"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Tente outro título, diretório ou ID.",
+      "assistant": "Assistente",
+      "back": "Voltar às sessões",
+      "chooseHost": "O host selecionado está indisponível. Escolha outro host.",
+      "confirmTrash": "Mover “{{title}}” e todas as conversas dos subagentes para a lixeira em {{host}}?",
+      "count": "{{count}} sessões",
+      "empty": "Nenhuma sessão encontrada",
+      "emptyHint": "Não há sessões para gerenciar neste host.",
+      "emptyTrash": "A lixeira está vazia",
+      "exported": "Exportado para este computador",
+      "host": "Host da sessão",
+      "limit": "Exibindo {{shown}} de {{total}}. Pesquise para restringir os resultados.",
+      "loadError": "A operação de sessão remota falhou. Confira a conexão do host e tente novamente.",
+      "local": "Este computador",
+      "manageHosts": "Gerenciar hosts",
+      "moveToTrash": "Mover para a lixeira",
+      "noMatches": "Nenhuma sessão correspondente",
+      "noReadableMessages": "Não foi possível extrair mensagens da conversa. Você pode ver o registro bruto.",
+      "raw": "Transcrição bruta (JSONL)",
+      "scope": "Host: {{host}}. A lixeira e a restauração são executadas remotamente; as exportações são salvas localmente.",
+      "search": "Pesquisar sessões remotas",
+      "searchLabel": "Pesquisar sessões",
+      "searchPlaceholder": "Pesquisar título, diretório ou ID",
+      "title": "Sessões remotas",
+      "transcript": "Transcrição da sessão",
+      "trash": "Lixeira remota",
+      "truncated": "Prévia truncada. Exporte para salvar a transcrição completa.",
+      "unavailable": "Host removido ou indisponível",
+      "user": "Usuário",
+      "view": "Visualizar"
     }
   },
   "githubCopilot": {

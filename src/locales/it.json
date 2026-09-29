@@ -3510,10 +3510,6 @@
         "repairVisibilitySkippedOnly": "Non sono state trovate differenze provider scrivibili; sono stati ignorati {{count}} file state_5.sqlite non validi o danneggiati. Codex deve rigenerarli prima di poter riparare i relativi record SQLite.",
         "repairVisibilitySkippedWithBase": "{{message}}; sono stati ignorati {{count}} file state_5.sqlite non validi o danneggiati. Codex deve rigenerarli prima di poter riparare i relativi record SQLite.",
         "trashSummary": "{{count}} conversazioni spostate nel cestino ed eliminate in Codex ufficiale",
-        "trashSummaryFallback": "{{count}} conversazioni spostate nel cestino e ricostruzione dell'indice delle sessioni di Codex ufficiale avviata",
-        "trashSummaryRunningHint": "Le istanze in esecuzione potrebbero richiedere un aggiornamento o un riavvio per mostrare la modifica",
-        "trashSummaryFallbackHint": "L'eliminazione ufficiale non è stata completata per {{count}} istanze; i file sono stati rimossi direttamente e Codex si sincronizzerà dopo il riavvio",
-        "trashSummaryRebuildFailedHint": "La ricostruzione dell'indice ufficiale della barra laterale non è stata completata per {{count}} istanze; Codex lo ricaricherà dopo il riavvio",
         "trashSummaryEmpty": "Le conversazioni selezionate non esistono nell'insieme di istanze corrente, nessuna azione necessaria"
       },
       "groupCount": "{{count}} sessioni",
@@ -3711,6 +3707,20 @@
         "hint": "Questa sessione esiste su più istanze. Scegli da quale istanza aprire la posizione del file:",
         "rolloutHint": "Questa sessione esiste su più istanze. Scegli da quale istanza aprire il file di sessione:",
         "running": "In esecuzione"
+      },
+      "archive": {
+        "active": "Non archiviata",
+        "all": "Tutti gli stati di archiviazione",
+        "archived": "Archiviata",
+        "label": "Stato di archiviazione"
+      },
+      "childAgents": "Subagenti ({{count}})",
+      "selectConversation": "Seleziona conversazione: {{title}}",
+      "shared": {
+        "emptied": "Cestino svuotato",
+        "purged": "Backup eliminati definitivamente per {{count}} conversazioni e i relativi subagenti",
+        "restored": "Ripristinate {{count}} conversazioni e i relativi subagenti",
+        "trashed": "{{count}} conversazioni e i relativi subagenti spostati nel cestino"
       }
     },
     "sessionUsage": {
@@ -3740,8 +3750,8 @@
         "scanning": "Scansione dei log…",
         "ready": "{{files}} file, {{requests}} richieste",
         "lastSynced": "Ultima sync {{time}}",
-        "deferred": "{{count}} fork in attesa del padre",
-        "errors": "{{count}} file non letti"
+        "errors": "{{count}} file non letti",
+        "unprocessed": "Impossibile conteggiare {{count}} file di sessione per ora"
       },
       "cards": {
         "input": "Token in ingresso",
@@ -5988,6 +5998,38 @@
       "title": "Host remoti",
       "updated": "Aggiornato",
       "useLocalAccount": "Usa l'account locale corrente"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Prova un altro titolo, percorso o ID.",
+      "assistant": "Assistente",
+      "back": "Torna alle sessioni",
+      "chooseHost": "L'host selezionato non è disponibile. Scegli un altro host.",
+      "confirmTrash": "Spostare “{{title}}” e tutte le conversazioni dei suoi subagenti nel cestino su {{host}}?",
+      "count": "{{count}} sessioni",
+      "empty": "Nessuna sessione trovata",
+      "emptyHint": "Non ci sono sessioni da gestire su questo host.",
+      "emptyTrash": "Il cestino è vuoto",
+      "exported": "Esportato su questo computer",
+      "host": "Host della sessione",
+      "limit": "Visualizzate {{shown}} di {{total}}. Cerca per restringere i risultati.",
+      "loadError": "Operazione sulla sessione remota non riuscita. Controlla la connessione all'host e riprova.",
+      "local": "Locale",
+      "manageHosts": "Gestisci host",
+      "moveToTrash": "Sposta nel cestino",
+      "noMatches": "Nessuna sessione corrispondente",
+      "noReadableMessages": "Non è stato possibile estrarre i messaggi della conversazione. Puoi visualizzare il record grezzo.",
+      "raw": "Trascrizione grezza (JSONL)",
+      "scope": "Host: {{host}}. Cestino e ripristino operano da remoto; le esportazioni vengono salvate localmente.",
+      "search": "Cerca sessioni remote",
+      "searchLabel": "Cerca sessioni",
+      "searchPlaceholder": "Cerca titolo, percorso o ID",
+      "title": "Sessioni remote",
+      "transcript": "Trascrizione della sessione",
+      "trash": "Cestino remoto",
+      "truncated": "Anteprima troncata. Esporta per salvare la trascrizione completa.",
+      "unavailable": "Host rimosso o non disponibile",
+      "user": "Utente",
+      "view": "Visualizza"
     }
   },
   "githubCopilot": {

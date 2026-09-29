@@ -3510,10 +3510,6 @@
         "repairVisibilitySkippedOnly": "No se encontraron diferencias de proveedor que se puedan escribir; se omitieron {{count}} archivo(s) state_5.sqlite no válidos o dañados. Codex debe regenerarlos antes de poder reparar sus registros SQLite.",
         "repairVisibilitySkippedWithBase": "{{message}}; se omitieron {{count}} archivo(s) state_5.sqlite no válidos o dañados. Codex debe regenerarlos antes de poder reparar sus registros SQLite.",
         "trashSummary": "Se movieron {{count}} conversaciones a la papelera y se eliminaron en Codex oficial",
-        "trashSummaryFallback": "Se movieron {{count}} conversaciones a la papelera y se activó la reconstrucción del índice de sesiones de Codex oficial",
-        "trashSummaryRunningHint": "Las instancias en ejecución pueden necesitar actualizarse o reiniciarse para mostrarlo",
-        "trashSummaryFallbackHint": "La eliminación oficial no terminó en {{count}} instancias; los archivos se eliminaron directamente y Codex se sincronizará tras reiniciar",
-        "trashSummaryRebuildFailedHint": "La reconstrucción del índice oficial de la barra lateral no terminó en {{count}} instancias; Codex lo recargará tras reiniciar",
         "trashSummaryEmpty": "Las conversaciones seleccionadas no existen en el conjunto actual de instancias, no hay nada que hacer"
       },
       "groupCount": "{{count}} sesiones",
@@ -3711,6 +3707,20 @@
         "hint": "Esta sesión existe en varias instancias. Elige de qué instancia abrir la ubicación del archivo:",
         "rolloutHint": "Esta sesión existe en varias instancias. Elige de qué instancia abrir el archivo de sesión:",
         "running": "En ejecución"
+      },
+      "archive": {
+        "active": "Sin archivar",
+        "all": "Todos los estados de archivo",
+        "archived": "Archivadas",
+        "label": "Estado de archivo"
+      },
+      "childAgents": "Subagentes ({{count}})",
+      "selectConversation": "Seleccionar conversación: {{title}}",
+      "shared": {
+        "emptied": "Papelera vaciada",
+        "purged": "Se eliminaron permanentemente las copias de seguridad de {{count}} conversaciones y sus subagentes",
+        "restored": "Se restauraron {{count}} conversaciones y sus subagentes",
+        "trashed": "Se movieron {{count}} conversaciones y sus subagentes a la papelera"
       }
     },
     "sessionUsage": {
@@ -3740,8 +3750,8 @@
         "scanning": "Escaneando registros…",
         "ready": "{{files}} archivos, {{requests}} solicitudes",
         "lastSynced": "Última sync {{time}}",
-        "deferred": "{{count}} forks esperando al padre",
-        "errors": "{{count}} archivos fallidos"
+        "errors": "{{count}} archivos fallidos",
+        "unprocessed": "Aún no se han podido contabilizar {{count}} archivos de sesión"
       },
       "cards": {
         "input": "Tokens de entrada",
@@ -5988,6 +5998,38 @@
       "title": "Hosts remotos",
       "updated": "Actualizado",
       "useLocalAccount": "Usar la cuenta local actual"
+    },
+    "remoteSessions": {
+      "adjustSearch": "Prueba con otro título, directorio o ID.",
+      "assistant": "Asistente",
+      "back": "Volver a las sesiones",
+      "chooseHost": "El host seleccionado no está disponible. Elige otro.",
+      "confirmTrash": "¿Mover «{{title}}» y todas las conversaciones de sus subagentes a la papelera de {{host}}?",
+      "count": "{{count}} sesiones",
+      "empty": "No se encontraron sesiones",
+      "emptyHint": "No hay sesiones que administrar en este host.",
+      "emptyTrash": "La papelera está vacía",
+      "exported": "Exportado a este equipo",
+      "host": "Host de la sesión",
+      "limit": "Se muestran {{shown}} de {{total}}. Busca para limitar los resultados.",
+      "loadError": "La operación de sesión remota falló. Comprueba la conexión del host y vuelve a intentarlo.",
+      "local": "Este equipo",
+      "manageHosts": "Administrar hosts",
+      "moveToTrash": "Mover a la papelera",
+      "noMatches": "No hay sesiones coincidentes",
+      "noReadableMessages": "No se pudieron extraer mensajes de la conversación. Puedes ver el registro sin procesar.",
+      "raw": "Transcripción sin procesar (JSONL)",
+      "scope": "Host: {{host}}. La papelera y la restauración se gestionan de forma remota; las exportaciones se guardan localmente.",
+      "search": "Buscar sesiones remotas",
+      "searchLabel": "Buscar sesiones",
+      "searchPlaceholder": "Buscar título, directorio o ID",
+      "title": "Sesiones remotas",
+      "transcript": "Transcripción de la sesión",
+      "trash": "Papelera remota",
+      "truncated": "La vista previa está recortada. Exporta para guardar la transcripción completa.",
+      "unavailable": "Host eliminado o no disponible",
+      "user": "Usuario",
+      "view": "Ver"
     }
   },
   "githubCopilot": {
