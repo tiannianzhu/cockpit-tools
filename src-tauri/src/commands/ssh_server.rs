@@ -47,8 +47,3 @@ pub async fn switch_ssh_server_account(
 ) -> Result<SshCodexSyncResult, String> {
     ssh_server::switch_account(&server_id, &account_id).await
 }
-
-#[tauri::command]
-pub async fn read_ssh_server_model_catalog_definition(server_id: String) -> Result<serde_json::Value, String> {
-    ssh_server::read_model_catalog_definition(&server_id).await
-}

@@ -701,7 +701,7 @@ export function CodexSshServersPanel({ onOpenSessions }: CodexSshServersPanelPro
               {chosenAccount && <p className="codex-hosts__selection-detail">
                 {[providerName(chosenAccount), chosenAccount.api_base_url, chosenAccount.api_startup_model]
                   .filter(Boolean).join(' · ') || t('codex.hosts.officialCredentials', '官方账户凭据')}
-                {chosenAccount.api_provider_mode === 'custom' && <span> · {t('codex.hosts.catalogImportHint', '自定义 API 需先在供应商管理中导入模型目录定义。')}</span>}
+                {chosenAccount.api_provider_mode === 'custom' && <span> · {t('codex.hosts.catalogImportHint', '请先在供应商管理中配置并保存各模型的参数。')}</span>}
               </p>}
             </div>
           </div>
@@ -741,7 +741,7 @@ export function CodexSshServersPanel({ onOpenSessions }: CodexSshServersPanelPro
             {chosenAccount && <p className="codex-hosts__selection-detail">
               {[providerName(chosenAccount), chosenAccount.api_base_url, chosenAccount.api_startup_model]
                 .filter(Boolean).join(' · ') || t('codex.hosts.officialCredentials', '官方账户凭据')}
-              {chosenAccount.api_provider_mode === 'custom' && <span> · {t('codex.hosts.catalogImportHint', '自定义 API 需先在供应商管理中导入模型目录定义。')}</span>}
+              {chosenAccount.api_provider_mode === 'custom' && <span> · {t('codex.hosts.catalogImportHint', '请先在供应商管理中配置并保存各模型的参数。')}</span>}
             </p>}
             <div className="codex-hosts__bulk-targets" aria-live="polite">
               {bulkTargets.map((server) => <div className="codex-hosts__bulk-target" key={server.id}>
