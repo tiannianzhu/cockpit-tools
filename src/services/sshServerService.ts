@@ -1,16 +1,18 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SshCodexSyncResult, SshServer, SshServerDraft, SshServerList } from '../types/sshServer';
+import type { SshCodexSyncResult, SshServer, SshServerAccountInspection, SshServerDraft, SshServerList } from '../types/sshServer';
 
 function toServer(draft: SshServerDraft): SshServer {
   return {
     id: draft.id ?? '',
     name: draft.name,
     host: draft.host,
-    port: draft.port ?? 22,
+    // 0 tells the backend to resolve the SSH config/default port.
+    port: draft.port ?? 0,
     username: draft.username,
-    codex_home: draft.codex_home?.trim() || '~/.codex',
+    // Each entry targets one CODEX_HOME; the backend creates it when applying an account.
+    codex_home: draft.codex_home?.trim() ?? '',
     auth: draft.auth,
-    sync_on_codex_switch: draft.sync_on_codex_switch ?? true,
+    sync_on_codex_switch: draft.sync_on_codex_switch ?? false,
     created_at: 0,
     updated_at: 0,
     last_sync: null,
@@ -18,15 +20,15 @@ function toServer(draft: SshServerDraft): SshServer {
 }
 
 export async function listSshServers(): Promise<SshServerList> {
-  return await invoke('list_ssh_servers');
+  return invoke<SshServerList>('list_ssh_servers');
 }
 
 export async function upsertSshServer(draft: SshServerDraft): Promise<SshServerList> {
-  return await invoke('upsert_ssh_server', { server: toServer(draft) });
+  return invoke<SshServerList>('upsert_ssh_server', { server: toServer(draft) });
 }
 
 export async function deleteSshServer(serverId: string): Promise<SshServerList> {
-  return await invoke('delete_ssh_server', { serverId });
+  return invoke<SshServerList>('delete_ssh_server', { serverId });
 }
 
 export async function selectSshServers(serverIds: string[]): Promise<SshServerList> {
@@ -47,4 +49,12 @@ export async function syncCurrentCodexAccountToSshServer(
   return await invoke('sync_current_codex_account_to_ssh_server', {
     serverId,
   });
+}
+
+export async function inspectSshServerAccount(serverId: string): Promise<SshServerAccountInspection> {
+  return await invoke('inspect_ssh_server_account', { serverId });
+}
+
+export async function switchSshServerAccount(serverId: string, accountId: string): Promise<SshCodexSyncResult> {
+  return await invoke('switch_ssh_server_account', { serverId, accountId });
 }

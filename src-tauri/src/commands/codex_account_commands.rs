@@ -1272,6 +1272,7 @@ async fn switch_codex_account_internal(
                 44,
                 serde_json::json!({}),
             );
+            crate::modules::ssh_server::cancel_pending_syncs_on_account_switch();
             stop_default_codex_runtime_before_auth_commit().await?;
             emit_codex_switch_step(
                 &step_app,
@@ -1428,30 +1429,6 @@ async fn switch_codex_account_internal(
 
     apply_codex_switch_auth_projections(&account, &user_config);
 
-    // SSH projection is a follow-up. Do not delay local launch by several SSH
-    // round trips or by an offline server's timeout. The worker serializes
-    // remote writes and drops queued accounts superseded by a newer switch.
-    let ssh_sync_app = app.clone();
-    let ssh_sync_account = account.clone();
-    tauri::async_runtime::spawn(async move {
-        let started = Instant::now();
-        crate::modules::ssh_server::sync_selected_servers_after_codex_switch(&ssh_sync_account, launch_after_switch, |ssh_sync| {
-            if ssh_sync.verified && ssh_sync.error.is_none() {
-                logger::log_info(&format!(
-                    "[Codex SSH] 切号后同步成功: server_id={}, verified={}, elapsed_ms={}",
-                    ssh_sync.server_id, ssh_sync.verified, started.elapsed().as_millis()
-                ));
-            } else {
-                logger::log_warn(&format!(
-                    "[Codex SSH] 切号后同步失败: server_id={}, error={}",
-                    ssh_sync.server_id,
-                    ssh_sync.error.clone().unwrap_or_default()
-                ));
-            }
-            let _ = ssh_sync_app.emit("codex:ssh-sync-result", &ssh_sync);
-        }).await;
-    });
-
     emit_codex_switch_step(
         &app,
         &account_id,
@@ -1541,6 +1518,12 @@ async fn switch_codex_account_internal(
             96,
             serde_json::json!({ "launchDisabled": true }),
         );
+    }
+
+    if let Err(error) = crate::modules::ssh_server::dispatch_selected_servers_after_codex_switch(
+        &account, launch_after_switch,
+    ) {
+        logger::log_warn(&format!("[Codex SSH] 无法启动切号同步: {}", error));
     }
 
     let restart_specified_started = Instant::now();

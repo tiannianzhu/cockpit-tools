@@ -1,49 +1,51 @@
-use crate::models::codex::CodexAccount;
+use crate::models::codex::{CodexAccount, CodexApiProviderMode};
 use crate::models::ssh_server::{
-    SshAuthConfig, SshCodexSyncResult, SshCodexSyncStatus, SshServer, SshServerStore,
+    SshAuthConfig, SshCodexSyncResult, SshCodexSyncStatus, SshRemoteAccountSummary, SshServer,
+    SshServerStore, SshSyncStage,
 };
 use crate::modules::{account, codex_account, logger};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
+use tauri::Emitter;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::watch;
+use tokio::time::timeout;
 use uuid::Uuid;
 
+const SSH_SERVERS_FILE: &str = "ssh_servers.json";
 #[path = "ssh_server_store.rs"]
 mod store;
 #[path = "ssh_server_batch.rs"]
 mod batch;
-pub use crate::models::ssh_server::SshServerList;
-
 #[path = "ssh_server_process.rs"]
 mod process;
-
+pub use crate::models::ssh_server::SshServerList;
 pub(crate) use process::output as command_output;
 
 pub(crate) fn has_auto_sync_targets() -> bool {
     load_store().is_ok_and(|state| !store::switch_targets(&state).is_empty())
 }
-
-const SSH_SERVERS_FILE: &str = "ssh_servers.json";
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+static SYNC_STATUSES: LazyLock<Mutex<HashMap<String, SshCodexSyncStatus>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 /// TCP/SSH 握手超时（传给 OpenSSH ConnectTimeout）
 const CONNECTION_TIMEOUT_SECS: u64 = 12;
 /// 测连整段命令墙钟超时
 const TEST_COMMAND_TIMEOUT_SECS: u64 = 20;
 /// 读写同步脚本墙钟超时
 const SYNC_TIMEOUT_SECS: u64 = 45;
-static ACCOUNT_SYNC_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
+const APPLY_TIMEOUT_SECS: u64 = 120;
+const REMOTE_PYTHON_TIMEOUT_SECS: u64 = 30;
+const REMOTE_PYTHON_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
-fn ensure_current_sync_account(account: &CodexAccount) -> Result<(), String> {
-    if codex_account::get_current_account().is_some_and(|current| {
-        current.id == account.id && current.token_generation == account.token_generation
-    }) {
-        Ok(())
-    } else {
-        Err("ssh_sync_superseded: a newer Codex account is active".into())
-    }
-}
 
 fn now_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
@@ -150,7 +152,7 @@ fn validate_server(server: &SshServer) -> Result<(), String> {
         ("username", server.username.as_str()),
         ("codex_home", server.codex_home.as_str()),
     ] {
-        if value.trim().is_empty() {
+        if value.trim().is_empty() && label != "username" {
             return Err(format!("SSH server {} is required", label));
         }
         if contains_control_separator(value) {
@@ -160,8 +162,12 @@ fn validate_server(server: &SshServer) -> Result<(), String> {
             ));
         }
     }
-    if server.port == 0 {
-        return Err("SSH server port must be between 1 and 65535".to_string());
+    if server.host.starts_with('-')
+        || server.host.chars().any(char::is_whitespace)
+        || server.username.starts_with('-')
+        || server.username.chars().any(char::is_whitespace)
+    {
+        return Err("SSH host and username contain unsupported characters".to_string());
     }
     match &server.auth {
         SshAuthConfig::Agent => {}
@@ -189,37 +195,32 @@ fn normalize_server(
     }
     server.name = normalize_text(&server.name);
     server.host = normalize_text(&server.host);
+    if server.name.is_empty() { server.name = server.host.clone(); }
     server.username = normalize_text(&server.username);
     server.codex_home = normalize_text(&server.codex_home);
     if server.codex_home.is_empty() {
         server.codex_home = default_codex_home();
     }
-    if server.port == 0 {
-        server.port = 22;
-    }
+
     if server.created_at <= 0 {
         server.created_at = existing.map(|item| item.created_at).unwrap_or(now);
     }
     server.updated_at = now;
     if let Some(existing) = existing {
-        if server.last_sync.is_none() {
-            server.last_sync = existing.last_sync.clone();
-        }
+        server.last_sync = existing.last_sync.clone();
+        server.sync_on_codex_switch = existing.sync_on_codex_switch;
     }
     validate_server(&server)?;
     Ok(server)
 }
 
 pub fn load_store() -> Result<SshServerStore, String> {
-    store::load(&store_path()?)
-}
-
-#[cfg(test)]
-fn save_store(store: &SshServerStore) -> Result<(), String> {
-    let path = store_path()?;
-    let content = serde_json::to_string_pretty(store)
-        .map_err(|e| format!("Failed to serialize SSH servers store: {}", e))?;
-    crate::modules::atomic_write::write_string_atomic(&path, &content)
+    let mut state = store::load(&store_path()?)?;
+    let statuses = SYNC_STATUSES.lock().unwrap_or_else(|e| e.into_inner());
+    for server in &mut state.servers {
+        server.last_sync = statuses.get(&server.id).cloned();
+    }
+    Ok(state)
 }
 
 pub fn list_servers() -> Result<SshServerList, String> {
@@ -227,41 +228,102 @@ pub fn list_servers() -> Result<SshServerList, String> {
 }
 
 pub fn upsert_server(server: SshServer) -> Result<SshServerList, String> {
-    store::update(&store_path()?, |store| {
-        let existing_index = store.servers.iter().position(|item| item.id == server.id);
-        let existing = existing_index.and_then(|index| store.servers.get(index));
+    let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    store::update(&store_path()?, |state| {
+        let index = state.servers.iter().position(|item| item.id == server.id);
+        let existing = index.and_then(|index| state.servers.get(index));
         let server = normalize_server(server, existing)?;
-        // Saving another auto-sync server adds it without replacing prior targets.
-        store.selected_server_ids.retain(|id| id != &server.id);
-        if server.sync_on_codex_switch { store.selected_server_ids.push(server.id.clone()); }
-        if let Some(index) = existing_index { store.servers[index] = server; }
-        else { store.servers.push(server); }
+        if let Some(index) = index {
+            let existing = &state.servers[index];
+            if existing.host != server.host || existing.username != server.username
+                || existing.port != server.port || existing.codex_home != server.codex_home
+                || existing.auth != server.auth
+            {
+                cancel_server_jobs(existing);
+            }
+            state.servers[index] = server;
+        } else {
+            // A newly saved enabled host joins the existing targets.
+            if server.sync_on_codex_switch {
+                state.selected_server_ids.push(server.id.clone());
+            }
+            state.servers.push(server);
+        }
         Ok(())
-    })
+    })?;
+    list_servers()
 }
 
 pub fn delete_server(server_id: &str) -> Result<SshServerList, String> {
+    let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let server_id = server_id.trim();
-    store::update(&store_path()?, |store| {
-        store.servers.retain(|server| server.id != server_id);
+    store::update(&store_path()?, |state| {
+        if let Some(server) = state.servers.iter().find(|server| server.id == server_id) {
+            cancel_server_jobs(server);
+        }
+        state.servers.retain(|server| server.id != server_id);
         Ok(())
-    })
+    })?;
+    SYNC_STATUSES.lock().unwrap_or_else(|e| e.into_inner()).remove(server_id);
+    list_servers()
 }
 
 pub fn select_servers(server_ids: Vec<String>) -> Result<SshServerList, String> {
-    store::select(&store_path()?, server_ids)
+    let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    store::update(&store_path()?, |state| {
+        let mut selected = Vec::new();
+        for id in server_ids {
+            let id = id.trim().to_string();
+            if id.is_empty() { continue; }
+            if !state.servers.iter().any(|server| server.id == id) {
+                return Err(format!("SSH server not found: {}", id));
+            }
+            if !selected.contains(&id) { selected.push(id); }
+        }
+        for server in &state.servers {
+            if state.selected_server_ids.contains(&server.id) && !selected.contains(&server.id) {
+                cancel_server_jobs(server);
+            }
+        }
+        apply_selection(state, selected);
+        Ok(())
+    })?;
+    list_servers()
 }
 
 pub fn set_server_selected(server_id: &str, selected: bool) -> Result<SshServerList, String> {
-    store::set_selected(&store_path()?, server_id, selected)
+    let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    store::update(&store_path()?, |state| {
+        let server = state.servers.iter().find(|server| server.id == server_id)
+            .ok_or_else(|| format!("SSH server not found: {}", server_id))?;
+        if !selected { cancel_server_jobs(server); }
+        let mut ids = state.selected_server_ids.clone();
+        ids.retain(|id| id != server_id);
+        if selected { ids.push(server_id.to_string()); }
+        apply_selection(state, ids);
+        Ok(())
+    })?;
+    list_servers()
+}
+
+fn apply_selection(state: &mut SshServerStore, selected: Vec<String>) {
+    for server in &mut state.servers {
+        server.sync_on_codex_switch = selected.contains(&server.id);
+    }
+    state.selected_server_ids = selected;
+}
+
+fn selected_servers(state: &SshServerStore, automatic: bool) -> Vec<SshServer> {
+    state.servers.iter().filter(|server| {
+        state.selected_server_ids.contains(&server.id)
+            && (!automatic || server.sync_on_codex_switch)
+    }).cloned().collect()
 }
 
 /// OpenSSH 参数：非交互、握手超时与私钥 IdentitiesOnly，避免 agent 里一堆 key 拖慢/超时。
 fn build_ssh_args(server: &SshServer, connect_timeout_secs: u64) -> Vec<String> {
     let connect_timeout = connect_timeout_secs.clamp(3, 30);
     let mut args = vec![
-        "-p".to_string(),
-        server.port.to_string(),
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
@@ -273,6 +335,9 @@ fn build_ssh_args(server: &SshServer, connect_timeout_secs: u64) -> Vec<String> 
         "-o".to_string(),
         "ServerAliveCountMax=2".to_string(),
     ];
+    if server.port != 0 {
+        args.extend(["-p".to_string(), server.port.to_string()]);
+    }
     if let SshAuthConfig::PrivateKeyFile { path } = &server.auth {
         // 与手动 `ssh -o IdentitiesOnly=yes -i key` 对齐：只用指定私钥，不试 agent 其它身份
         args.push("-o".to_string());
@@ -280,7 +345,12 @@ fn build_ssh_args(server: &SshServer, connect_timeout_secs: u64) -> Vec<String> 
         args.push("-i".to_string());
         args.push(path.clone());
     }
-    args.push(format!("{}@{}", server.username, server.host));
+    args.push("--".to_string());
+    args.push(if server.username.is_empty() {
+        server.host.clone()
+    } else {
+        format!("{}@{}", server.username, server.host)
+    });
     args
 }
 
@@ -297,11 +367,9 @@ async fn run_ssh(
     command.args(remote_args);
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-
     let output = process::output(command, Duration::from_secs(timeout_secs), stdin_payload).await?;
 
     if !output.status.success() {
@@ -347,120 +415,817 @@ pub async fn test_connection(server_id: &str) -> Result<String, String> {
     }
 }
 
-async fn read_remote_config_toml(server: &SshServer) -> Result<Option<String>, String> {
-    let script = r#"set -eu
-codex_home=$1
-case "$codex_home" in
-  "~") codex_home="$HOME" ;;
-  "~/"*) codex_home="$HOME/${{codex_home#~/}}" ;;
-esac
-target="$codex_home/config.toml"
-if [ -f "$target" ]; then
-  printf '__COCKPIT_EXISTS__\n'
-  cat "$target"
-elif [ -e "$target" ]; then
-  printf 'config.toml is not a regular file\n' >&2
-  exit 3
-else
-  printf '__COCKPIT_MISSING__\n'
-fi
-"#;
-    let output = run_ssh(
-        server,
-        SYNC_TIMEOUT_SECS,
-        &["sh", "-s", "--", &server.codex_home],
-        Some(script.to_string()),
-    )
-    .await
-    .map_err(|e| format!("ssh_remote_read_failed: {}", sanitize_error(e)))?;
-    if let Some(rest) = output.strip_prefix("__COCKPIT_EXISTS__\n") {
-        return Ok(Some(rest.to_string()));
-    }
-    if output.trim() == "__COCKPIT_MISSING__" {
-        return Ok(None);
-    }
-    Err("ssh_remote_read_failed: unexpected remote read response".to_string())
+/// Run a small Python request on a saved host. The caller cannot substitute a
+/// different CODEX_HOME; stderr and remote exception text are never returned.
+pub async fn run_remote_python(
+    server_id: &str,
+    script: &str,
+    payload: &serde_json::Value,
+) -> Result<String, String> {
+    let server = load_store()?
+        .servers
+        .into_iter()
+        .find(|server| server.id == server_id)
+        .ok_or_else(|| format!("SSH server not found: {}", server_id))?;
+    run_remote_python_on_server(&server, script, payload, REMOTE_PYTHON_TIMEOUT_SECS).await
 }
 
-async fn upload_and_verify_bundle(
-    server: &SshServer,
-    bundle: &codex_account::CodexAccountProjectionBundle,
-) -> Result<(), String> {
-    let mut payload = String::new();
-    for file in &bundle.files {
-        payload.push_str(&format!(
-            "{}\t{:o}\t{}\t{}\n",
-            file.relative_path,
-            file.mode,
-            file.sha256,
-            STANDARD.encode(file.content.as_bytes())
-        ));
-    }
-    let script = format!(
-        r#"set -eu
-codex_home=$1
-case "$codex_home" in
-  "~") codex_home="$HOME" ;;
-  "~/"*) codex_home="$HOME/${{codex_home#~/}}" ;;
-esac
-mkdir -p "$codex_home"
-chmod 700 "$codex_home" 2>/dev/null || true
-tmp_dir="$codex_home/.cockpit-codex-sync.$$"
-rm -rf "$tmp_dir"
-mkdir -p "$tmp_dir"
-cleanup() {{ rm -rf "$tmp_dir"; }}
-trap cleanup EXIT INT TERM
-cat <<'__COCKPIT_CODEX_PAYLOAD__' | while IFS='	' read -r rel mode expected encoded; do
-{payload}__COCKPIT_CODEX_PAYLOAD__
-  [ -n "$rel" ] || continue
-  case "$rel" in
-    auth.json|config.toml|.cockpit_codex_auth.json) ;;
-    *) printf 'invalid relative path: %s\n' "$rel" >&2; exit 4 ;;
-  esac
-  tmp="$tmp_dir/$rel"
-  target="$codex_home/$rel"
-  if ! printf '%s' "$encoded" | base64 -d > "$tmp" 2>/dev/null; then
-    printf '%s' "$encoded" | base64 -D > "$tmp"
-  fi
-  chmod "$mode" "$tmp" 2>/dev/null || true
-  mv "$tmp" "$target"
-  chmod "$mode" "$target" 2>/dev/null || true
-  actual="$(sha256sum "$target" 2>/dev/null | awk '{{print $1}}' || shasum -a 256 "$target" | awk '{{print $1}}')"
-  if [ "$actual" != "$expected" ]; then
-    printf 'hash mismatch for %s\n' "$rel" >&2
-    exit 5
-  fi
-  printf '%s\t%s\n' "$rel" "$actual"
-done
-"#
-    );
-    let output = run_ssh(
-        server,
-        SYNC_TIMEOUT_SECS,
-        &["sh", "-s", "--", &server.codex_home],
-        Some(script),
-    )
-    .await
-    .map_err(|e| format!("ssh_remote_write_failed: {}", sanitize_error(e)))?;
+pub(crate) async fn run_remote_usage_python(
+    server_id: &str,
+    script: &str,
+    payload: &serde_json::Value,
+) -> Result<String, String> {
+    let server = load_store()?.servers.into_iter().find(|server| server.id == server_id)
+        .ok_or_else(|| format!("SSH server not found: {}", server_id))?;
+    // First-use compilation and a full remote rebuild can exceed normal RPC timeouts.
+    run_remote_python_on_server(&server, script, payload, 1200).await
+}
 
-    for file in &bundle.files {
-        let verified = output
-            .lines()
-            .any(|line| line == format!("{}\t{}", file.relative_path, file.sha256));
-        if !verified {
-            return Err(format!(
-                "ssh_remote_verify_failed: missing verification for {}",
-                file.relative_path
-            ));
+async fn run_remote_python_on_server(
+    server: &SshServer,
+    script: &str,
+    payload: &serde_json::Value,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    validate_server(&server)?;
+    let mut request = payload
+        .as_object()
+        .cloned()
+        .ok_or("Remote Python payload must be a JSON object")?;
+    request.insert(
+        "codex_home".into(),
+        serde_json::Value::String(server.codex_home.clone()),
+    );
+    let bytes = serde_json::to_vec(&request).map_err(|_| "Cannot encode remote request")?;
+    if bytes.len() as u64 > REMOTE_PYTHON_MAX_BYTES {
+        return Err("Remote request exceeds size limit".into());
+    }
+    let mut command = Command::new("ssh");
+    command.args(build_ssh_args(&server, CONNECTION_TIMEOUT_SECS));
+    command.arg(format!("python3 -c {}", shell_quote(script)));
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().map_err(|_| "Cannot start SSH")?;
+    let mut stdin = child.stdin.take().ok_or("SSH stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("SSH stdout unavailable")?;
+    let stderr = child.stderr.take().ok_or("SSH stderr unavailable")?;
+    let mut output = Vec::new();
+    let mut diagnostics = Vec::new();
+    let operation = async {
+        stdin
+            .write_all(&bytes)
+            .await
+            .map_err(|_| "SSH request write failed")?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|_| "SSH request write failed")?;
+        drop(stdin);
+        let mut bounded_stdout = stdout.take(REMOTE_PYTHON_MAX_BYTES + 1);
+        let mut bounded_stderr = stderr.take(REMOTE_PYTHON_MAX_BYTES + 1);
+        let reads = tokio::try_join!(
+            bounded_stdout.read_to_end(&mut output),
+            bounded_stderr.read_to_end(&mut diagnostics),
+        );
+        reads.map_err(|_| "SSH response read failed")?;
+        if output.len() as u64 > REMOTE_PYTHON_MAX_BYTES
+            || diagnostics.len() as u64 > REMOTE_PYTHON_MAX_BYTES
+        {
+            return Err("Remote response exceeds size limit");
         }
+        let status = child.wait().await.map_err(|_| "SSH wait failed")?;
+        if !status.success() {
+            return Err("Remote Python request failed; check SSH access and remote Python 3");
+        }
+        String::from_utf8(output).map_err(|_| "Remote response is not UTF-8")
+    };
+    timeout(Duration::from_secs(timeout_secs), operation)
+        .await
+        .map_err(|_| "Remote Python request timed out".to_string())?
+        .map_err(str::to_string)
+}
+
+const REMOTE_RESOLVE_HOME_SCRIPT: &str = r#"
+import json, os, sys
+request = json.loads(sys.stdin.buffer.readline())
+print(json.dumps(os.path.realpath(os.path.expanduser(request['codex_home']))))
+"#;
+
+async fn resolve_remote_codex_home(server: &SshServer) -> Result<String, String> {
+    let output = run_remote_python_on_server(
+        server,
+        REMOTE_RESOLVE_HOME_SCRIPT,
+        &serde_json::json!({}),
+        REMOTE_PYTHON_TIMEOUT_SECS,
+    )
+    .await?;
+    let home: String = serde_json::from_str(&output)
+        .map_err(|_| "Invalid remote CODEX_HOME response".to_string())?;
+    if !home.starts_with('/') || contains_control_separator(&home) {
+        return Err("Invalid resolved remote CODEX_HOME".into());
+    }
+    Ok(home)
+}
+
+/// Account sync writes only auth.json. A directory flock covers transfer and
+/// app-server reload, including independent SSH aliases. Its
+/// stdin lease cancels a pending stop if the desktop job disappears.
+/// Python 3 and POSIX flock are required on the remote Linux host.
+const REMOTE_SYNC_SCRIPT: &str = r#"
+import base64, fcntl, hashlib, json, os, select, signal, socket, stat, struct, sys, tempfile, threading, time
+
+def emit(stage):
+    print(stage, flush=True)
+
+def stop(signum, frame):
+    raise InterruptedError('SSH command cancelled')
+
+for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, stop)
+
+def atomic_file(home, name, content, mode=0o600):
+    fd, temporary = tempfile.mkstemp(prefix='.auth-restore-', dir=home)
+    try:
+        with os.fdopen(fd, 'wb') as output:
+            os.fchmod(output.fileno(), mode)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, os.path.join(home, name))
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
+def restore_bundle(home, originals):
+    for name, original in originals.items():
+        if name != 'auth.json':
+            raise ValueError('invalid rollback target')
+        if original is None:
+            try: os.unlink(os.path.join(home, name))
+            except FileNotFoundError: pass
+        else:
+            atomic_file(home, name, base64.b64decode(original['data'], validate=True), original['mode'])
+
+def process_identity(pid):
+    try:
+        with open('/proc/'+str(pid)+'/stat') as source:
+            fields = source.read().rsplit(')', 1)[1].split()
+        # A zombie has already exited; its parent may reap it later.
+        return None if fields[0] == 'Z' else fields[19]
+    except FileNotFoundError:
+        return None
+
+def stop_desktop_server(home, alive):
+    # The selected CODEX_HOME socket identifies exactly one service. Never scan
+    # command-line text or signal proxies, other homes, or other users.
+    socket_path = os.path.join(home, 'app-server-control', 'app-server-control.sock')
+    try:
+        os.stat(socket_path)
+    except FileNotFoundError:
+        return
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(5)
+        try:
+            connection.connect(os.path.realpath(socket_path))
+        except (FileNotFoundError, ConnectionRefusedError):
+            return  # No listener: Desktop will load the saved files on connection.
+        pid, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if pid <= 1 or uid != os.getuid():
+            raise RuntimeError('Control socket is not owned by the current user app-server')
+        identity = process_identity(pid)
+        if identity is None:
+            return
+        try:
+            executable = os.path.basename(os.readlink('/proc/'+str(pid)+'/exe'))
+            with open('/proc/'+str(pid)+'/cmdline', 'rb') as source:
+                args = source.read().split(b'\0')
+        except FileNotFoundError:
+            return
+        if executable != 'codex' or b'app-server' not in args or b'--listen' not in args:
+            raise RuntimeError('Control socket owner is not a listening Codex app-server')
+        if not alive.is_set():
+            raise RuntimeError('Remote restart cancelled')
+        if process_identity(pid) != identity:
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    deadline = time.monotonic() + 15
+    while process_identity(pid) == identity:
+        if not alive.is_set():
+            raise RuntimeError('Remote restart cancelled')
+        if time.monotonic() >= deadline:
+            raise RuntimeError('App-server did not exit within 15 seconds after SIGTERM; no force kill performed')
+        time.sleep(0.1)
+
+def main():
+    request = json.loads(sys.stdin.buffer.readline())
+    home = os.path.expanduser(request['home'])
+    payload = base64.b64decode(request['auth'], validate=True)
+    expected = request['sha256']
+    if hashlib.sha256(payload).hexdigest() != expected:
+        raise RuntimeError('input SHA256 mismatch')
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    alive = threading.Event()
+    alive.set()
+    def lease():
+        while alive.is_set():
+            # The sender sends one heartbeat every two seconds. A disconnected
+            # or partitioned SSH session cannot leave a deferred reset running.
+            ready, _, _ = select.select([sys.stdin.buffer], [], [], 10)
+            if not ready or not sys.stdin.buffer.readline():
+                alive.clear()
+                return
+    threading.Thread(target=lease, daemon=True).start()
+    lock = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    temp = None
+    originals = None
+    committed = False
+    try:
+        while alive.is_set():
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(0.1)
+        if not alive.is_set():
+            raise RuntimeError('superseded or disconnected')
+        target = os.path.join(home, 'auth.json')
+        if os.path.islink(target):
+            raise ValueError('symlink auth target')
+        original = None
+        if os.path.exists(target):
+            with open(target, 'rb') as source:
+                content = source.read(10 * 1024 * 1024 + 1)
+            if len(content) > 10 * 1024 * 1024:
+                raise ValueError('oversize auth target')
+            original = {'data': base64.b64encode(content).decode(), 'mode': stat.S_IMODE(os.stat(target).st_mode)}
+        originals = {'auth.json': original}
+        emit('transferring')
+        fd, temp = tempfile.mkstemp(prefix='.auth-sync-', dir=home)
+        with os.fdopen(fd, 'wb') as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        if not alive.is_set():
+            raise RuntimeError('superseded or disconnected')
+        target = os.path.join(home, 'auth.json')
+        os.replace(temp, target)
+        temp = None
+        os.fsync(lock)
+        with open(target, 'rb') as source:
+            actual = hashlib.sha256(source.read()).hexdigest()
+        if actual != expected or stat.S_IMODE(os.stat(target).st_mode) != 0o600:
+            raise RuntimeError('remote auth verification failed')
+        emit('credentials_synced')
+        if not alive.is_set():
+            raise RuntimeError('superseded or disconnected')
+        # Credentials remain committed even if the old service cannot be stopped.
+        committed = True
+        emit('reloading')
+        try:
+            stop_desktop_server(home, alive)
+        except (OSError, RuntimeError) as error:
+            detail = str(error) if isinstance(error, RuntimeError) else 'Cannot stop remote app-server (OS error '+str(error.errno)+')'
+            emit('reload_error:' + json.dumps(detail))
+            raise
+        if not alive.is_set():
+            raise RuntimeError('superseded or disconnected')
+        os.fsync(lock)
+        committed = True
+        # Files are verified and no old service remains. Desktop owns reconnection;
+        # this is not a claim that a new client has connected or authenticated.
+        emit('applied')
+    finally:
+        alive.clear()
+        if originals is not None and not committed:
+            restore_bundle(home, originals)
+            os.fsync(lock)
+            emit('rolled_back')
+        if temp is not None:
+            os.unlink(temp)
+        os.close(lock)
+
+try:
+    main()
+except Exception as error:
+    # No exception details: OS errors must never echo auth payloads.
+    print('remote auth sync or reload failed: ' + type(error).__name__, file=sys.stderr)
+    sys.exit(1)
+"#;
+
+/// Only identity metadata and one-way credential digests leave the remote host.
+const REMOTE_INSPECT_SCRIPT: &str = r#"
+import base64, hashlib, json, os, sys
+
+def response(identity):
+    metadata = {}
+    try:
+        import tomllib
+        from urllib.parse import urlsplit, urlunsplit
+        with open(os.path.join(home, 'config.toml'), 'rb') as source:
+            raw = source.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024: raise ValueError('oversize config')
+        config = tomllib.loads(raw.decode())
+        provider = config.get('model_provider', 'openai')
+        metadata['model_provider'] = provider if isinstance(provider, str) else None
+        metadata['model'] = config.get('model') if isinstance(config.get('model'), str) else None
+        settings = config.get('model_providers', {}).get(provider, {})
+        name = settings.get('name')
+        metadata['model_provider_name'] = name.strip() if isinstance(name, str) and name.strip() else None
+        url = settings.get('base_url') or config.get('openai_base_url')
+        if isinstance(url, str):
+            parsed = urlsplit(url)
+            metadata['base_url'] = urlunsplit((parsed.scheme, parsed.netloc.split('@')[-1], parsed.path, '', ''))
+        catalog = config.get('model_catalog_json')
+        if isinstance(catalog, str):
+            metadata['model_catalog_path'] = catalog
+            path = os.path.expanduser(catalog)
+            if not os.path.isabs(path): path = os.path.join(home, path)
+            metadata['model_catalog_exists'] = os.path.isfile(path)
+            if metadata['model_catalog_exists']:
+                with open(path, 'rb') as source: raw = source.read(10 * 1024 * 1024 + 1)
+                if len(raw) <= 10 * 1024 * 1024:
+                    models = json.loads(raw).get('models')
+                    if isinstance(models, list): metadata['catalog_model_count'] = len(models)
+    except Exception:
+        pass
+    return dict(identity, **metadata)
+
+def digest(value):
+    return hashlib.sha256(value.encode('utf-8')).hexdigest() if isinstance(value, str) and value else None
+
+def jwt_claim(token, key):
+    try:
+        encoded = token.split('.')[1]
+        payload = json.loads(base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
+        value = payload.get(key)
+        return value if isinstance(value, str) and value else None
+    except (AttributeError, IndexError, ValueError, TypeError):
+        return None
+
+try:
+    request = json.loads(sys.stdin.buffer.readline())
+    home = os.path.expanduser(request['codex_home'])
+    with open(os.path.join(home, 'auth.json'), 'rb') as source:
+        data = source.read(10 * 1024 * 1024 + 1)
+    if len(data) > 10 * 1024 * 1024:
+        raise ValueError('oversize')
+    auth = json.loads(data)
+    if not isinstance(auth, dict):
+        raise ValueError('invalid auth')
+    tokens = auth.get('tokens') if isinstance(auth.get('tokens'), dict) else {}
+    identity = auth.get('agent_identity') if isinstance(auth.get('agent_identity'), dict) else {}
+    api_key = auth.get('OPENAI_API_KEY')
+    personal = auth.get('personal_access_token')
+    access = tokens.get('access_token')
+    if isinstance(api_key, str) and api_key:
+        mode, secret = 'api_key', api_key
+    elif isinstance(identity.get('agent_private_key'), str) and identity['agent_private_key']:
+        mode, secret = 'agent_identity', identity['agent_private_key']
+    elif isinstance(personal, str) and personal:
+        mode, secret = 'personal_access_token', personal
+    elif isinstance(access, str) and access:
+        mode, secret = 'oauth', access
+    else:
+        mode, secret = 'unknown', None
+    account_id = identity.get('account_id') or tokens.get('account_id') or jwt_claim(tokens.get('id_token'), 'chatgpt_account_id')
+    email = identity.get('email') or jwt_claim(tokens.get('id_token'), 'email') or jwt_claim(access, 'email')
+    if not isinstance(account_id, str): account_id = None
+    if not isinstance(email, str): email = None
+    print(json.dumps(response({'auth_mode': mode, 'account_id': account_id, 'email': email, 'fingerprint': digest(secret)})))
+except FileNotFoundError:
+    print(json.dumps(response({'auth_mode': 'none', 'account_id': None, 'email': None, 'fingerprint': None})))
+except Exception:
+    print(json.dumps(response({'auth_mode': 'unknown', 'account_id': None, 'email': None, 'fingerprint': None})))
+"#;
+
+const REMOTE_AUTH_COMPATIBILITY_SCRIPT: &str = r#"
+import json, os, re, sys
+
+try:
+    request = json.loads(sys.stdin.buffer.readline())
+    home = os.path.expanduser(request['codex_home'])
+    with open(os.path.join(home, 'config.toml'), 'rb') as source:
+        data = source.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024:
+        raise ValueError('oversize')
+    text = data.decode('utf-8')
+    try:
+        import tomllib
+    except ImportError:
+        # Python 3.10 lacks tomllib. Fail closed for every provider/auth
+        # declaration; a plain model/settings config remains compatible.
+        risky = r'^\s*(model_provider|openai_base_url|profile|cli_auth_credentials_store|forced_login_method|forced_chatgpt_workspace_id)\s*='
+        custom_openai = r'^\s*\[\s*model_providers\.openai(?:\.|\s*\])'
+        compatible = not re.search(risky, text, re.M) and not re.search(custom_openai, text, re.M)
+    else:
+        config = tomllib.loads(text)
+        compatible = (
+            config.get('model_provider') in (None, 'openai')
+            and not config.get('openai_base_url')
+            and not config.get('profile')
+            and not config.get('forced_chatgpt_workspace_id')
+            and not (isinstance(config.get('model_providers'), dict) and 'openai' in config['model_providers'])
+            and config.get('cli_auth_credentials_store') in (None, 'file')
+            and config.get('forced_login_method') in (None, 'chatgpt' if request['target_mode'] == 'oauth' else 'api')
+        )
+    print(json.dumps({'compatible': compatible}))
+except FileNotFoundError:
+    print(json.dumps({'compatible': True}))
+except Exception:
+    print(json.dumps({'compatible': False}))
+"#;
+
+async fn ensure_remote_auth_compatible(
+    server: &SshServer,
+    snapshot: &AuthSnapshot,
+) -> Result<(), String> {
+    let auth: serde_json::Value = serde_json::from_slice(&snapshot.bytes).map_err(|_| "Invalid auth snapshot")?;
+    let target_mode = if auth["OPENAI_API_KEY"].as_str().is_some_and(|key| !key.is_empty()) { "apikey" } else { "oauth" };
+    let output = run_remote_python_on_server(
+        server,
+        REMOTE_AUTH_COMPATIBILITY_SCRIPT,
+        &serde_json::json!({"target_mode": target_mode}),
+        REMOTE_PYTHON_TIMEOUT_SECS,
+    )
+    .await?;
+    if serde_json::from_str::<serde_json::Value>(&output)
+        .ok()
+        .and_then(|value| value.get("compatible").and_then(|item| item.as_bool()))
+        != Some(true)
+    {
+        return Err("Remote config.toml uses provider, profile, or credential settings incompatible with auth-only switching".into());
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct RemoteInspectResponse {
+    auth_mode: String,
+    account_id: Option<String>,
+    email: Option<String>,
+    fingerprint: Option<String>,
+    #[serde(default)]
+    model_provider: Option<String>,
+    #[serde(default)]
+    model_provider_name: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    model_catalog_path: Option<String>,
+    #[serde(default)]
+    model_catalog_exists: bool,
+    #[serde(default)]
+    catalog_model_count: Option<usize>,
+}
+
+fn account_fingerprint(account: &CodexAccount) -> Option<String> {
+    let secret = if account.is_api_key_auth() {
+        account.openai_api_key.as_deref()
+    } else if let Some(identity) = &account.agent_identity {
+        Some(identity.agent_private_key.as_str())
+    } else {
+        Some(account.tokens.access_token.as_str())
+    }?;
+    if secret.is_empty() {
+        None
+    } else {
+        Some(format!("{:x}", Sha256::digest(secret.as_bytes())))
+    }
+}
+
+fn remote_matches_account(remote: &RemoteInspectResponse, account: &CodexAccount) -> bool {
+    let mode_matches = match remote.auth_mode.as_str() {
+        "api_key" => account.is_api_key_auth(),
+        "agent_identity" => account.agent_identity.is_some(),
+        "oauth" | "personal_access_token" => {
+            !account.is_api_key_auth() && account.agent_identity.is_none()
+        }
+        _ => false,
+    };
+    let provider_matches = remote.auth_mode != "api_key" || match remote.base_url.as_deref() {
+        Some(url) => account.api_base_url.as_deref().is_some_and(|base| base.trim().trim_end_matches('/') == url.trim().trim_end_matches('/')),
+        None => account.api_provider_mode == CodexApiProviderMode::OpenaiBuiltin && account.api_base_url.as_deref().unwrap_or("").trim().is_empty(),
+    };
+    mode_matches && provider_matches
+        && remote
+            .fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| account_fingerprint(account).as_ref() == Some(fingerprint))
+}
+
+fn resolved_ssh_address(output: &str) -> Option<String> {
+    let fields: HashMap<&str, &str> = output.lines().filter_map(|line| line.split_once(' '))
+        .map(|(key, value)| (key, value.trim())).collect();
+    let host = *fields.get("hostname")?;
+    let user = *fields.get("user")?;
+    let port = fields.get("port")?.parse::<u16>().ok()?;
+    if host.is_empty() || user.is_empty() || port == 0 { return None; }
+    let host = if host.contains(':') { format!("[{}]", host) } else { host.to_string() };
+    Some(format!("{}@{}:{}", user, host, port))
+}
+
+async fn inspect_ssh_address(server_id: &str) -> Option<String> {
+    let server = load_store().ok()?.servers.into_iter().find(|server| server.id == server_id)?;
+    let mut command = Command::new("ssh");
+    command.arg("-G").args(build_ssh_args(&server, 5))
+        .stdin(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+    let output = timeout(Duration::from_secs(5), command.output()).await.ok()?.ok()?;
+    if !output.status.success() { return None; }
+    resolved_ssh_address(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub async fn inspect_account(server_id: &str) -> Result<SshRemoteAccountSummary, String> {
+    let output =
+        run_remote_python(server_id, REMOTE_INSPECT_SCRIPT, &serde_json::json!({})).await?;
+    let remote: RemoteInspectResponse = serde_json::from_str(output.trim())
+        .map_err(|_| "Invalid remote account response".to_string())?;
+    let accounts = codex_account::list_accounts();
+    let matched_account_id = accounts
+        .iter()
+        .find(|account| remote_matches_account(&remote, account))
+        .map(|account| account.id.clone())
+        .or_else(|| {
+            // A remote OAuth token may have rotated since the library copy.
+            // An official account ID is useful only when it identifies one
+            // unambiguous local entry; email alone is not identity proof.
+            let official_id = remote.account_id.as_deref()?;
+            if !matches!(
+                remote.auth_mode.as_str(),
+                "oauth" | "personal_access_token" | "agent_identity"
+            ) {
+                return None;
+            }
+            let mut matches = accounts.iter().filter(|account| {
+                account.account_id.as_deref() == Some(official_id)
+                    || account
+                        .agent_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.account_id == official_id)
+            });
+            let only = matches.next()?;
+            matches.next().is_none().then(|| only.id.clone())
+        });
+    let connection_address = inspect_ssh_address(server_id).await;
+    Ok(SshRemoteAccountSummary {
+        connection_address,
+        server_id: server_id.to_string(),
+        auth_mode: remote.auth_mode,
+        account_id: remote.account_id,
+        email: remote.email,
+        matched_account_id,
+        model_provider: remote.model_provider,
+        model_provider_name: remote.model_provider_name,
+        base_url: remote.base_url,
+        model: remote.model,
+        model_catalog_path: remote.model_catalog_path,
+        model_catalog_exists: remote.model_catalog_exists,
+        catalog_model_count: remote.catalog_model_count,
+    })
+}
+
+fn validate_auth_only_account(account: &CodexAccount) -> Result<(), String> {
+    if account.is_api_key_auth()
+        && (account.api_provider_mode != CodexApiProviderMode::OpenaiBuiltin
+            || !account.api_base_url.as_deref().unwrap_or("").trim().is_empty())
+    {
+        return Err("SSH account sync supports official accounts and OpenAI API keys without a custom endpoint".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct AuthSnapshot {
+    account_id: String,
+    account_email: String,
+    token_generation: u64,
+    bytes: Vec<u8>,
+    hash: String,
+}
+
+impl AuthSnapshot {
+    fn read(account: &CodexAccount) -> Result<Self, String> {
+        validate_auth_only_account(account)?;
+        let bytes = std::fs::read(codex_account::get_codex_home().join("auth.json"))
+            .map_err(|_| "Cannot read current local Codex auth.json".to_string())?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "Current local Codex auth.json is invalid JSON".to_string())?;
+        if !value.is_object() {
+            return Err("Current local Codex auth.json must be an object".to_string());
+        }
+        let matches = if account.is_api_key_auth() {
+            account
+                .openai_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .is_some_and(|key| {
+                    value.get("OPENAI_API_KEY").and_then(|v| v.as_str()) == Some(key)
+                })
+        } else if let Some(identity) = &account.agent_identity {
+            value.get("agent_identity") == serde_json::to_value(identity).ok().as_ref()
+        } else {
+            let token = value
+                .pointer("/tokens/access_token")
+                .or_else(|| value.get("personal_access_token"))
+                .and_then(|v| v.as_str());
+            !account.tokens.access_token.is_empty()
+                && token == Some(account.tokens.access_token.as_str())
+        };
+        if !matches {
+            return Err(
+                "Current official auth.json does not match the selected account; SSH sync skipped"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            account_id: account.id.clone(),
+            account_email: account.email.clone(),
+            token_generation: account.token_generation,
+            hash: format!("{:x}", Sha256::digest(&bytes)),
+            bytes,
+        })
+    }
+
+    fn from_stored_account(account: &CodexAccount) -> Result<Self, String> {
+        validate_auth_only_account(account)?;
+        if account.is_web_session_auth() {
+            return Err("Web session accounts cannot be used for Codex SSH authentication".into());
+        }
+        let auth = if account.is_api_key_auth() {
+            let key = account
+                .openai_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .ok_or("Stored API key account has no credential")?;
+            serde_json::json!({"auth_mode": "apikey", "OPENAI_API_KEY": key})
+        } else if let Some(identity) = &account.agent_identity {
+            if identity.agent_private_key.is_empty() {
+                return Err("Stored agent identity has no private key".into());
+            }
+            serde_json::json!({"auth_mode": "agentIdentity", "agent_identity": identity})
+        } else {
+            let access = account.tokens.access_token.trim();
+            if access.is_empty() {
+                return Err("Stored OAuth account has no access token".into());
+            }
+            let refresh = account.tokens.refresh_token.as_deref().unwrap_or("").trim();
+            if account.tokens.id_token.trim().is_empty() && refresh.is_empty() {
+                serde_json::json!({"OPENAI_API_KEY": null, "personal_access_token": access})
+            } else {
+                let last_refresh = account
+                    .token_updated_at
+                    .and_then(|timestamp| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+                    })
+                    .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+                serde_json::json!({
+                    "auth_mode": "chatgpt",
+                    "OPENAI_API_KEY": null,
+                    "tokens": {
+                        "id_token": account.tokens.id_token,
+                        "access_token": access,
+                        "refresh_token": refresh,
+                        "account_id": account.account_id,
+                    },
+                    "last_refresh": last_refresh,
+                })
+            }
+        };
+        let bytes =
+            serde_json::to_vec(&auth).map_err(|_| "Cannot encode stored account credentials")?;
+        Ok(Self {
+            account_id: account.id.clone(),
+            account_email: account.email.clone(),
+            token_generation: account.token_generation,
+            hash: format!("{:x}", Sha256::digest(&bytes)),
+            bytes,
+        })
+    }
+}
+
+struct HostJobs {
+    latest: watch::Sender<HostReservation>,
+    gate: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone, Copy)]
+struct HostReservation {
+    generation: u64,
+    tied_to_local_account: bool,
+}
+
+static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static JOB_SESSION_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{}:", Uuid::new_v4()));
+
+fn next_generation() -> u64 {
+    let now = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_default()
+        .max(0) as u64;
+    let previous = JOB_SEQUENCE
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |previous| {
+            Some(now.max(previous + 1))
+        })
+        .expect("generation update cannot fail");
+    now.max(previous + 1)
+}
+
+pub fn cancel_pending_syncs_on_account_switch() {
+    let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let hosts = HOST_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    for ((_, resolved), host) in hosts.iter() {
+        cancel_local_follow_job(host, *resolved);
+    }
+}
+
+// Caller holds STORE_LOCK while checking and updating the latest reservation.
+fn cancel_local_follow_job(host: &HostJobs, resolved: bool) {
+    let reservation = *host.latest.borrow();
+    if reservation.tied_to_local_account {
+        host.latest.send_replace(HostReservation {
+            // The entry reservation cancels the running job. Keep the directory's
+            // cutoff so a newer independent request still awaiting lookup survives.
+            generation: if resolved { reservation.generation } else { next_generation() },
+            tied_to_local_account: false,
+        });
+    }
+}
+
+// Configured paths and resolved directories have separate reservation scopes.
+static HOST_JOBS: LazyLock<Mutex<HashMap<(String, bool), Arc<HostJobs>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn host_key(server: &SshServer) -> String {
+    format!(
+        "{}@{}:{}:{}",
+        server.username, server.host, server.port, server.codex_home
+    )
+}
+
+// Caller holds STORE_LOCK, matching reservation and publication ordering.
+fn cancel_server_jobs(server: &SshServer) {
+    if let Some(host) = HOST_JOBS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(host_key(server), false))
+    {
+        host.latest.send_replace(HostReservation {
+            generation: next_generation(),
+            tied_to_local_account: false,
+        });
+    }
+}
+
+fn host_jobs(server: &SshServer, resolved: bool) -> Arc<HostJobs> {
+    let key = (host_key(server), resolved);
+    HOST_JOBS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_insert_with(|| {
+            let (latest, _) = watch::channel(HostReservation {
+                generation: 0,
+                tied_to_local_account: false,
+            });
+            Arc::new(HostJobs {
+                latest,
+                gate: tokio::sync::Mutex::new(()),
+            })
+        })
+        .clone()
+}
+
+struct SyncJob {
+    server: SshServer,
+    snapshot: AuthSnapshot,
+    // The configured path remains cancellable when an entry is edited or removed.
+    host: Arc<HostJobs>,
+    // The resolved directory shares ordering across equivalent configured paths.
+    target: Option<Arc<HostJobs>>,
+    generation: u64,
+    status: SshCodexSyncStatus,
 }
 
 fn result_from_status(server: &SshServer, status: SshCodexSyncStatus) -> SshCodexSyncResult {
     SshCodexSyncResult {
         server_id: server.id.clone(),
         server_name: server.name.clone(),
+        job_id: status.job_id,
+        stage: status.stage,
         account_id: status.account_id,
         account_email: status.account_email,
         token_generation: status.token_generation,
@@ -471,183 +1236,363 @@ fn result_from_status(server: &SshServer, status: SshCodexSyncStatus) -> SshCode
     }
 }
 
-fn persist_sync_status(
-    server_id: &str,
-    status: SshCodexSyncStatus,
-) -> Result<SshCodexSyncResult, String> {
-    let list = store::update(&store_path()?, |store| {
-        let server = store.servers.iter_mut().find(|server| server.id == server_id)
-            .ok_or_else(|| format!("SSH server not found: {server_id}"))?;
-        server.last_sync = Some(status.clone());
-        server.updated_at = now_timestamp();
-        Ok(())
-    })?;
-    let server = list.servers.iter().find(|server| server.id == server_id)
-        .ok_or_else(|| format!("SSH server not found: {server_id}"))?;
-    Ok(result_from_status(server, status))
-}
-
-async fn sync_account_to_server(server: SshServer, account: &CodexAccount, wait_for_desktop: bool) -> SshCodexSyncResult {
-    let synced_at = now_timestamp();
-    let sync_attempt = async {
-        ensure_current_sync_account(account)?;
-        validate_server(&server)?;
-        let existing_config = read_remote_config_toml(&server).await?;
-        ensure_current_sync_account(account)?;
-        let bundle =
-            codex_account::build_projection_bundle_for_remote(account, existing_config.as_deref())
-                .map_err(|e| format!("codex_bundle_failed: {}", sanitize_error(e)))?;
-        // 鉴权落盘 + 校验是硬条件
-        upload_and_verify_bundle(&server, &bundle).await?;
-        ensure_current_sync_account(account)?;
-        let refresh_error = match crate::modules::codex_app_injection::refresh_ssh_connection(
-            &server, account, wait_for_desktop,
-        ).await {
-            Ok(true) => {
-                logger::log_info(&format!("[Codex SSH] 客户端连接已重连并确认账号: server_id={}", server.id));
-                None
-            }
-            Ok(false) => None, // No running Desktop connection to refresh.
-            Err(error) => Some(format!("ssh_connection_refresh_failed: {}", sanitize_error(error))),
-        };
-        Ok::<_, String>((bundle, refresh_error))
-    }
-    .await;
-
-    let status = match sync_attempt {
-        Ok((bundle, refresh_error)) => SshCodexSyncStatus {
-            account_id: bundle.account_id,
-            account_email: bundle.account_email,
-            token_generation: bundle.token_generation,
-            bundle_hash: bundle.bundle_hash,
-            synced_at,
-            verified: true,
-            error: refresh_error,
-        },
-        Err(error) => SshCodexSyncStatus {
-            account_id: account.id.clone(),
-            account_email: account.email.clone(),
-            token_generation: account.token_generation,
-            bundle_hash: String::new(),
-            synced_at,
-            verified: false,
-            error: Some(sanitize_error(error)),
-        },
-    };
-
-    // A switch may finish while SSH is in flight. The next serialized worker
-    // will write the current credentials; never publish the older status.
-    if ensure_current_sync_account(account).is_err() {
-        return result_from_status(&server, status);
-    }
-    match persist_sync_status(&server.id, status.clone()) {
-        Ok(result) => result,
-        Err(error) => {
-            logger::log_warn(&format!(
-                "[Codex SSH] 保存同步状态失败: server_id={}, error={}",
-                server.id, error
-            ));
-            result_from_status(&server, status)
+fn emit_result(result: &SshCodexSyncResult) {
+    if let Some(app) = crate::get_app_handle() {
+        if let Err(error) = app.emit("codex:ssh-sync-result", result) {
+            logger::log_warn(&format!("[Codex SSH] Cannot emit sync status: {}", error));
         }
     }
+}
+
+impl SyncJob {
+    fn reserve(server: SshServer, snapshot: AuthSnapshot, tied_to_local_account: bool) -> Self {
+        let host = host_jobs(&server, false);
+        // Reserve and publish under the same lock as in-memory status updates, so a
+        // previous job can never replace a newer job's status.
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = next_generation();
+        host.latest.send_replace(HostReservation {
+            generation,
+            tied_to_local_account,
+        });
+        let job = Self {
+            status: SshCodexSyncStatus {
+                job_id: format!("{}{}", *JOB_SESSION_PREFIX, Uuid::new_v4()),
+                stage: SshSyncStage::Pending,
+                account_id: snapshot.account_id.clone(),
+                account_email: snapshot.account_email.clone(),
+                token_generation: snapshot.token_generation,
+                bundle_hash: snapshot.hash.clone(),
+                synced_at: now_timestamp(),
+                verified: false,
+                error: None,
+            },
+            server,
+            snapshot,
+            host,
+            target: None,
+            generation,
+        };
+        job.cache_and_emit();
+        job
+    }
+
+    fn is_current(&self) -> bool {
+        self.host.latest.borrow().generation == self.generation
+            && self.target.as_ref().map_or(true, |target| {
+                target.latest.borrow().generation == self.generation
+            })
+    }
+
+    fn bind_remote_home(&mut self, home: String) -> bool {
+        let mut server = self.server.clone();
+        server.codex_home = home;
+        let target = host_jobs(&server, true);
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.is_current() {
+            return false;
+        }
+        let reservation = *self.host.latest.borrow();
+        self.target = Some(target.clone());
+        // Keep request order even when an older SSH path lookup finishes later.
+        if target.latest.borrow().generation > self.generation {
+            return false;
+        }
+        target.latest.send_replace(reservation);
+        self.server = server;
+        true
+    }
+
+    // Caller holds STORE_LOCK.
+    fn cache_and_emit(&self) {
+        let result = result_from_status(&self.server, self.status.clone());
+        let mut statuses = SYNC_STATUSES.lock().unwrap_or_else(|e| e.into_inner());
+        let same_job = statuses.get(&self.server.id).is_some_and(|status| status.job_id == self.status.job_id);
+        if self.is_current() || (same_job && self.status.stage == SshSyncStage::Superseded) {
+            statuses.insert(self.server.id.clone(), self.status.clone());
+        }
+        drop(statuses);
+        emit_result(&result);
+    }
+
+    fn publish(&mut self, stage: SshSyncStage, error: Option<String>) {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.status.stage = if self.is_current() {
+            stage
+        } else {
+            SshSyncStage::Superseded
+        };
+        if stage == SshSyncStage::CredentialsSynced {
+            self.status.verified = true;
+        }
+        self.status.error = error.map(sanitize_error);
+        self.status.synced_at = now_timestamp();
+        self.cache_and_emit();
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn transfer_and_apply(job: &mut SyncJob) -> Result<(), String> {
+    validate_server(&job.server)?;
+    let mut command = Command::new("ssh");
+    command.args(build_ssh_args(&job.server, CONNECTION_TIMEOUT_SECS));
+    command.arg(format!("python3 -c {}", shell_quote(REMOTE_SYNC_SCRIPT)));
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("ssh_binary_missing: {}", e))?;
+    let mut stdin = child.stdin.take().ok_or("SSH stdin unavailable")?;
+    let mut stdout = BufReader::new(child.stdout.take().ok_or("SSH stdout unavailable")?).lines();
+    let stderr = child.stderr.take().ok_or("SSH stderr unavailable")?;
+    // Drain stderr concurrently to prevent SSH diagnostics blocking the process.
+    // Deliberately do not expose raw remote output (which could contain secrets).
+    let stderr_task = tauri::async_runtime::spawn(async move {
+        let mut stderr = stderr;
+        let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+    });
+    let payload = serde_json::json!({
+        "home": job.server.codex_home, "auth": STANDARD.encode(&job.snapshot.bytes),
+        "sha256": job.snapshot.hash,
+    })
+    .to_string()
+        + "\n";
+    let mut changed = job.host.latest.subscribe();
+    let mut target_changed = job
+        .target
+        .as_ref()
+        .ok_or("Remote CODEX_HOME has not been resolved")?
+        .latest
+        .subscribe();
+    let exchange = async {
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|_| "SSH transfer failed".to_string())?;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
+        let mut applied = false;
+        let mut reload_error = None;
+        let transfer_deadline = tokio::time::sleep(Duration::from_secs(SYNC_TIMEOUT_SECS));
+        tokio::pin!(transfer_deadline);
+        loop {
+            if !job.is_current() {
+                return Err("superseded".to_string());
+            }
+            tokio::select! {
+                biased;
+                _ = changed.changed() => return Err("superseded".to_string()),
+                _ = target_changed.changed() => return Err("superseded".to_string()),
+                _ = &mut transfer_deadline, if !job.status.verified => return Err("SSH credentials transfer timed out".to_string()),
+                line = stdout.next_line() => {
+                    match line.map_err(|_| "SSH result read failed".to_string())?.as_deref() {
+                        Some("superseded") => return Err("superseded".to_string()),
+                        Some("transferring") => job.publish(SshSyncStage::Transferring, None),
+                        Some("rolled_back") => { job.status.verified = false; },
+                        Some("credentials_synced") => job.publish(SshSyncStage::CredentialsSynced, None),
+                        Some("reloading") if job.status.verified => job.publish(SshSyncStage::Reloading, None),
+                        Some(line) if line.starts_with("reload_error:") => {
+                            reload_error = serde_json::from_str::<String>(&line[13..]).ok();
+                        },
+                        Some("applied") if job.status.verified => { applied = true; },
+                        Some(_) => {},
+                        None => break,
+                    }
+                },
+                _ = heartbeat.tick() => {
+                    stdin.write_all(b"alive\n").await.map_err(|_| "SSH heartbeat failed".to_string())?;
+                },
+            }
+        }
+        let exit = child
+            .wait()
+            .await
+            .map_err(|_| "SSH wait failed".to_string())?;
+        if exit.success() && applied {
+            Ok(())
+        } else if let Some(error) = reload_error {
+            Err(format!("认证已同步，但旧的远端服务未确认退出：{}。", error))
+        } else if job.status.verified {
+            Err("Credentials verified; remote reload was interrupted. Reconnect remote Codex to use the saved configuration.".to_string())
+        } else {
+            Err("SSH credentials transfer failed. Check SSH access, remote Python 3, and existing CODEX_HOME.".to_string())
+        }
+    };
+    let outcome = timeout(Duration::from_secs(APPLY_TIMEOUT_SECS), exchange)
+        .await
+        .unwrap_or_else(|_| Err("SSH sync or reload timed out".to_string()));
+    // Close the remote lease first. Even if transport is partitioned, the remote
+    // wrapper expires its lease and cancels pending work before releasing flock.
+    drop(stdin);
+    let _ = child.kill().await;
+    stderr_task.abort();
+    outcome
+}
+
+async fn run_job(mut job: SyncJob, wait_for_desktop: bool) -> SshCodexSyncResult {
+    let outcome = async {
+        if !job.is_current() {
+            return Err("superseded".to_string());
+        }
+        let home = resolve_remote_codex_home(&job.server).await?;
+        if !job.bind_remote_home(home) {
+            return Err("superseded".to_string());
+        }
+        let target = job.target.as_ref().unwrap().clone();
+        let _gate = target.gate.lock().await;
+        if !job.is_current() {
+            return Err("superseded".to_string());
+        }
+        ensure_remote_auth_compatible(&job.server, &job.snapshot).await?;
+        transfer_and_apply(&mut job).await?;
+        if !job.is_current() { return Err("superseded".to_string()); }
+        // The remote transaction only verifies files and stops its old service.
+        // Refresh a matching local Desktop connection once, after that transaction.
+        if job.host.latest.borrow().tied_to_local_account {
+            let account = codex_account::get_current_account()
+                .filter(|account| account.id == job.snapshot.account_id
+                    && account.token_generation == job.snapshot.token_generation)
+                .ok_or_else(|| "superseded".to_string())?;
+            let mut changed = job.host.latest.subscribe();
+            let mut target_changed = target.latest.subscribe();
+            // A subscription starts at the latest reservation, so recheck after
+            // subscribing to catch cancellation during account lookup.
+            if !job.is_current() { return Err("superseded".to_string()); }
+            let refreshed = tokio::select! {
+                biased;
+                _ = changed.changed() => return Err("superseded".to_string()),
+                _ = target_changed.changed() => return Err("superseded".to_string()),
+                result = crate::modules::codex_app_injection::refresh_ssh_connection(
+                    &job.server, &account, wait_for_desktop,
+                ) => result,
+            };
+            refreshed.map_err(|error| format!("ssh_connection_refresh_failed: {}", sanitize_error(error)))?;
+        }
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => job.publish(SshSyncStage::Applied, None),
+        Err(error) if !job.is_current() || error == "superseded" => {
+            job.publish(SshSyncStage::Superseded, None)
+        }
+        Err(error) => job.publish(SshSyncStage::Failed, Some(error)),
+    }
+    result_from_status(&job.server, job.status)
+}
+
+/// Called after the successful local auth projection while the local switch lock
+/// still protects the snapshot. Network and idle waits run only in spawned jobs.
+pub fn dispatch_selected_servers_after_codex_switch(account: &CodexAccount, wait_for_desktop: bool) -> Result<(), String> {
+    let store = load_store()?;
+    let servers = selected_servers(&store, true);
+    if servers.is_empty() {
+        return Ok(());
+    }
+    let snapshot = match AuthSnapshot::read(account) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let snapshot = AuthSnapshot {
+                account_id: account.id.clone(),
+                account_email: account.email.clone(),
+                token_generation: account.token_generation,
+                bytes: Vec::new(),
+                hash: String::new(),
+            };
+            for server in servers {
+                let mut job = SyncJob::reserve(server, snapshot.clone(), true);
+                job.publish(SshSyncStage::Failed, Some(error.clone()));
+            }
+            return Err(error);
+        }
+    };
+    for server in servers {
+        let job = SyncJob::reserve(server, snapshot.clone(), true);
+        tauri::async_runtime::spawn(run_job(job, wait_for_desktop));
+    }
+    Ok(())
 }
 
 pub async fn sync_current_account_to_server(
-    server_id: Option<String>,
+    server_id: String,
 ) -> Result<SshCodexSyncResult, String> {
-    let _guard = ACCOUNT_SYNC_LOCK.lock().await;
-    let account = codex_account::get_current_account()
-        .ok_or_else(|| "codex_bundle_failed: no current Codex account".to_string())?;
-    let store = load_store()?;
-    let server = if let Some(server_id) = server_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
-        store
+    let job = {
+        let home = codex_account::get_codex_home();
+        let _lease = codex_account::try_acquire_profile_mutation_lease(&home, "ssh-auth-snapshot")?;
+        let account = codex_account::get_current_account().ok_or("No current Codex account")?;
+        let snapshot = AuthSnapshot::read(&account)?;
+        let store = load_store()?;
+        let id = server_id;
+        let server = store
             .servers
-            .iter()
-            .find(|server| server.id == server_id)
-            .cloned()
-            .ok_or_else(|| format!("SSH server not found: {}", server_id))?
-    } else {
-        if store.selected_server_ids.len() != 1 {
-            return Err("ssh_target_required: specify one SSH server for manual sync".into());
-        }
-        store.servers.iter().find(|s| store.selected_server_ids.contains(&s.id)).cloned()
-            .ok_or_else(|| "ssh_not_configured: no selected SSH server".to_string())?
+            .into_iter()
+            .find(|server| server.id == id)
+            .ok_or_else(|| format!("SSH server not found: {}", id))?;
+        SyncJob::reserve(server, snapshot, true)
     };
-    Ok(sync_account_to_server(server, &account, false).await)
+    Ok(run_job(job, false).await)
 }
 
-pub async fn sync_selected_servers_after_codex_switch(
-    account: &CodexAccount,
-    wait_for_desktop: bool,
-    mut publish: impl FnMut(SshCodexSyncResult),
-) {
-    let _guard = ACCOUNT_SYNC_LOCK.lock().await;
-    if ensure_current_sync_account(account).is_err() { return; }
-    let store = match load_store() {
-        Ok(store) => store,
-        Err(error) => {
-            logger::log_warn(&format!("[Codex SSH] 读取 SSH 服务器配置失败: {}", error));
-            return;
-        }
-    };
-    let result = batch::run(store::switch_targets(&store),
-        || ensure_current_sync_account(account).is_ok(),
-        |server| load_store().map(|latest|
-            store::switch_targets(&latest).iter().any(|target| target.id == server.id)),
-        |server| sync_account_to_server(server, account, wait_for_desktop), &mut publish).await;
-    if let Err((server, error)) = result {
-        logger::log_warn(&format!("[Codex SSH] 无法回读同步目标，停止当前队列: {}", sanitize_error(&error)));
-        publish(result_from_status(&server, SshCodexSyncStatus {
-            account_id: account.id.clone(), account_email: account.email.clone(),
-            token_generation: account.token_generation, bundle_hash: String::new(),
-            synced_at: now_timestamp(), verified: false, error: Some(sanitize_error(error)),
-        }));
-    }
+/// Switch only the selected remote host. The local official auth file and
+/// current account selection are neither read nor changed.
+pub async fn switch_account(
+    server_id: &str,
+    account_id: &str,
+) -> Result<SshCodexSyncResult, String> {
+    let account = codex_account::list_accounts_checked()?
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .ok_or("Stored Codex account not found")?;
+    let snapshot = AuthSnapshot::from_stored_account(&account)?;
+    let server = load_store()?
+        .servers
+        .into_iter()
+        .find(|server| server.id == server_id)
+        .ok_or_else(|| format!("SSH server not found: {}", server_id))?;
+    let job = SyncJob::reserve(server, snapshot, false);
+    Ok(run_job(job, false).await)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::models::codex::CodexTokens;
 
-    struct StoreBackup {
-        path: PathBuf,
-        original: Option<Vec<u8>>,
+    #[test]
+    fn resolved_address_uses_ssh_config_fields_and_formats_ipv6() {
+        assert_eq!(resolved_ssh_address("hostname host.example\nuser alice\nport 2202\n"), Some("alice@host.example:2202".into()));
+        assert_eq!(resolved_ssh_address("hostname 2001:db8::1\nuser alice\nport 22\n"), Some("alice@[2001:db8::1]:22".into()));
+        assert!(resolved_ssh_address("hostname example\n").is_none());
     }
 
-    impl StoreBackup {
-        fn capture() -> Self {
-            let path = store_path().expect("resolve ssh server store path");
-            let original = std::fs::read(&path).ok();
-            Self { path, original }
-        }
+    #[test]
+    fn blank_display_name_defaults_to_host_without_replacing_custom_name() {
+        let mut draft = server("test");
+        draft.name = " ".into();
+        draft.host = "my-host".into();
+        assert_eq!(normalize_server(draft.clone(), None).unwrap().name, "my-host");
+        draft.name = "My workstation".into();
+        assert_eq!(normalize_server(draft, None).unwrap().name, "My workstation");
     }
 
-    impl Drop for StoreBackup {
-        fn drop(&mut self) {
-            if let Some(original) = self.original.as_ref() {
-                if let Some(parent) = self.path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(&self.path, original);
-            } else if self.path.exists() {
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
-    }
-
-    fn valid_server() -> SshServer {
+    fn server(id: &str) -> SshServer {
         SshServer {
-            id: "server-1".to_string(),
-            name: "Dev".to_string(),
-            host: "example.com".to_string(),
-            port: 22,
-            username: "alice".to_string(),
-            codex_home: "~/.codex".to_string(),
+            id: id.into(),
+            name: id.into(),
+            host: "fixture-alias".into(),
+            port: 0,
+            username: String::new(),
+            codex_home: "~/.codex".into(),
             auth: SshAuthConfig::Agent,
             sync_on_codex_switch: true,
             created_at: 1,
@@ -656,110 +1601,531 @@ mod tests {
         }
     }
 
-    #[test]
-    fn validation_rejects_empty_host() {
-        let mut server = valid_server();
-        server.host.clear();
-        assert!(validate_server(&server).is_err());
-    }
-
-    #[test]
-    fn validation_rejects_private_key_without_path() {
-        let mut server = valid_server();
-        server.auth = SshAuthConfig::PrivateKeyFile {
-            path: String::new(),
+    fn sync_job(server: SshServer) -> SyncJob {
+        let bytes = br#"{"fixture":true}"#.to_vec();
+        let snapshot = AuthSnapshot {
+            account_id: Uuid::new_v4().to_string(),
+            account_email: "fixture@example.test".into(),
+            token_generation: 1,
+            hash: format!("{:x}", Sha256::digest(&bytes)),
+            bytes,
         };
-        assert!(validate_server(&server).is_err());
+        SyncJob::reserve(server, snapshot, false)
     }
 
     #[test]
-    fn ssh_args_include_batch_mode_without_disabling_host_key_checks() {
-        let server = valid_server();
-        let args = build_ssh_args(&server, 10);
-        assert!(args.contains(&"BatchMode=yes".to_string()));
-        assert!(args.contains(&"ConnectTimeout=10".to_string()));
-        assert!(!args
-            .iter()
-            .any(|arg| arg.contains("StrictHostKeyChecking=no")));
-        // agent 模式不强制 IdentitiesOnly
-        assert!(!args.iter().any(|arg| arg == "IdentitiesOnly=yes"));
-    }
-
-    #[test]
-    fn ssh_args_use_identities_only_for_private_key() {
-        let mut server = valid_server();
-        server.auth = SshAuthConfig::PrivateKeyFile {
-            path: "/tmp/id_test".to_string(),
-        };
-        let args = build_ssh_args(&server, 12);
-        assert!(args
-            .windows(2)
-            .any(|w| w[0] == "-o" && w[1] == "IdentitiesOnly=yes"));
-        assert!(args
-            .windows(2)
-            .any(|w| w[0] == "-i" && w[1] == "/tmp/id_test"));
+    fn stored_openai_api_key_snapshot_contains_only_authentication() {
+        let account = CodexAccount::new_api_key(
+            "fixture-api".into(), "fixture".into(), " fixture-key ".into(),
+            CodexApiProviderMode::OpenaiBuiltin, None, None, None, Vec::new(),
+        );
+        let snapshot = AuthSnapshot::from_stored_account(&account).unwrap();
+        let auth: serde_json::Value = serde_json::from_slice(&snapshot.bytes).unwrap();
+        assert_eq!(auth, serde_json::json!({"auth_mode": "apikey", "OPENAI_API_KEY": "fixture-key"}));
     }
 
     #[test]
     fn sanitize_error_redacts_secret_values() {
         let error = r#"access_token=abc123 refresh_token: 'def456' {"id_token":"ghi789","OPENAI_API_KEY":"sk-test"}"#;
         let sanitized = sanitize_error(error);
+        for secret in ["abc123", "def456", "ghi789", "sk-test"] {
+            assert!(!sanitized.contains(secret));
+        }
         assert!(sanitized.contains("access_token=[redacted]"));
         assert!(sanitized.contains("refresh_token: '[redacted]'"));
-        assert!(sanitized.contains(r#""id_token":"[redacted]""#));
-        assert!(sanitized.contains(r#""OPENAI_API_KEY":"[redacted]""#));
-        assert!(!sanitized.contains("abc123"));
-        assert!(!sanitized.contains("def456"));
-        assert!(!sanitized.contains("ghi789"));
-        assert!(!sanitized.contains("sk-test"));
     }
 
-    #[tokio::test]
-    #[ignore]
-    async fn live_ssh_own_syncs_current_codex_account() {
-        if std::env::var("COCKPIT_LIVE_SSH_OWN_SYNC").ok().as_deref() != Some("1") {
-            eprintln!("set COCKPIT_LIVE_SSH_OWN_SYNC=1 to run the live own SSH sync test");
-            return;
+    #[test]
+    fn stored_api_key_snapshot_rejects_custom_providers_and_endpoints() {
+        for (mode, endpoint) in [
+            (CodexApiProviderMode::Custom, None),
+            (CodexApiProviderMode::OpenaiBuiltin, Some("https://provider.example/v1".into())),
+        ] {
+            let account = CodexAccount::new_api_key(
+                "fixture-api".into(), "fixture".into(), "fixture-key".into(),
+                mode, endpoint, None, None, Vec::new(),
+            );
+            let error = AuthSnapshot::from_stored_account(&account)
+                .err().expect("custom provider authentication must be rejected before transfer");
+            assert!(error.contains("without a custom endpoint"));
+        }
+    }
+
+    #[test]
+    fn stored_oauth_snapshot_uses_library_credentials_without_local_profile() {
+        let mut account = CodexAccount::new(
+            "library-entry".into(),
+            "person@example.test".into(),
+            CodexTokens {
+                id_token: "id-fixture".into(),
+                access_token: "access-fixture".into(),
+                refresh_token: Some("refresh-fixture".into()),
+            },
+        );
+        account.account_id = Some("official-id".into());
+        let snapshot = AuthSnapshot::from_stored_account(&account).unwrap();
+        let auth: serde_json::Value = serde_json::from_slice(&snapshot.bytes).unwrap();
+        assert_eq!(auth["auth_mode"], "chatgpt");
+        assert_eq!(auth["tokens"]["account_id"], "official-id");
+        assert_eq!(auth["tokens"]["access_token"], "access-fixture");
+        assert_eq!(snapshot.account_id, "library-entry");
+    }
+
+    #[test]
+    fn selection_is_the_single_opt_in_and_disabled_legacy_target_stays_disabled() {
+        let mut disabled = server("a");
+        disabled.sync_on_codex_switch = false;
+        let mut state: SshServerStore = serde_json::from_value(serde_json::json!({
+            "version": "1", "selected_server_id": "a", "servers": [disabled, server("b")]
+        })).unwrap();
+        assert!(selected_servers(&state, true).is_empty());
+        apply_selection(&mut state, vec!["a".into(), "b".into()]);
+        assert_eq!(selected_servers(&state, true).len(), 2);
+        apply_selection(&mut state, vec!["b".into()]);
+        assert!(!state.servers[0].sync_on_codex_switch);
+        assert_eq!(selected_servers(&state, true)[0].id, "b");
+        let mut edited = state.servers[1].clone();
+        edited.sync_on_codex_switch = false;
+        assert!(normalize_server(edited, Some(&state.servers[1])).unwrap().sync_on_codex_switch);
+        apply_selection(&mut state, vec![]);
+        assert!(selected_servers(&state, true).is_empty());
+    }
+
+    #[test]
+    fn aliases_preserve_ssh_config_and_quote_remote_code() {
+        let server = server("a");
+        validate_server(&server).unwrap();
+        let args = build_ssh_args(&server, 12);
+        assert_eq!(args.last().unwrap(), "fixture-alias");
+        assert!(!args.contains(&"-p".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert!(!args.iter().any(|a| a.contains("StrictHostKeyChecking=no")));
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn generations_are_monotonic_and_shared_per_host_and_home() {
+        let a = server("ordering-a");
+        let b = server("ordering-b");
+        let first = host_jobs(&a, false);
+        let second = host_jobs(&b, false);
+        assert!(Arc::ptr_eq(&first, &second));
+        let old = next_generation();
+        let new = next_generation();
+        assert!(new > old);
+        first.latest.send_replace(HostReservation {
+            generation: old,
+            tied_to_local_account: true,
+        });
+        second.latest.send_replace(HostReservation {
+            generation: new,
+            tied_to_local_account: true,
+        });
+        assert_eq!(first.latest.borrow().generation, new);
+    }
+
+    #[test]
+    fn equivalent_homes_supersede_older_jobs_and_preserve_entry_cancellation() {
+        for alias in ["~/.codex/", "~/.codex/.", "/fixture/.codex", "profile-link"] {
+            let mut first_server = server(&Uuid::new_v4().to_string());
+            first_server.host = Uuid::new_v4().to_string();
+            let mut second_server = first_server.clone();
+            second_server.id = Uuid::new_v4().to_string();
+            second_server.codex_home = alias.into();
+            let mut first = sync_job(first_server);
+            assert!(first.bind_remote_home("/fixture/.codex".into()));
+            let changes = first.target.as_ref().unwrap().latest.subscribe();
+            let mut second = sync_job(second_server.clone());
+            assert!(second.bind_remote_home("/fixture/.codex".into()));
+            assert!(!first.is_current());
+            assert!(second.is_current());
+            assert!(changes.has_changed().unwrap());
+            assert!(Arc::ptr_eq(
+                first.target.as_ref().unwrap(),
+                second.target.as_ref().unwrap(),
+            ));
+            assert_eq!(second.server.codex_home, "/fixture/.codex");
+            let entry_changes = second.host.latest.subscribe();
+            let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            cancel_server_jobs(&second_server);
+            assert!(!second.is_current());
+            assert!(entry_changes.has_changed().unwrap());
+        }
+    }
+
+    #[test]
+    fn slower_home_resolution_cannot_replace_a_newer_request() {
+        let mut older_server = server(&Uuid::new_v4().to_string());
+        older_server.host = Uuid::new_v4().to_string();
+        let mut newer_server = older_server.clone();
+        newer_server.id = Uuid::new_v4().to_string();
+        newer_server.codex_home = "~/.codex/".into();
+        let mut older = sync_job(older_server);
+        let mut newer = sync_job(newer_server);
+        assert!(newer.bind_remote_home("/fixture/.codex".into()));
+        assert!(!older.bind_remote_home("/fixture/.codex".into()));
+        assert!(!older.is_current());
+        assert!(newer.is_current());
+        assert_eq!(
+            newer.target.as_ref().unwrap().latest.borrow().generation,
+            newer.generation,
+        );
+    }
+
+    #[test]
+    fn cancelled_home_resolution_cannot_supersede_a_live_target() {
+        let mut live_server = server(&Uuid::new_v4().to_string());
+        live_server.host = Uuid::new_v4().to_string();
+        let mut cancelled_server = live_server.clone();
+        cancelled_server.id = Uuid::new_v4().to_string();
+        cancelled_server.codex_home = "~/.codex/".into();
+        let mut live = sync_job(live_server);
+        assert!(live.bind_remote_home("/fixture/.codex".into()));
+        let mut cancelled = sync_job(cancelled_server.clone());
+        {
+            let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            cancel_server_jobs(&cancelled_server);
+        }
+        assert!(!cancelled.bind_remote_home("/fixture/.codex".into()));
+        assert!(live.is_current());
+    }
+
+    #[test]
+    fn distinct_resolved_homes_remain_independent() {
+        let mut first_server = server(&Uuid::new_v4().to_string());
+        first_server.host = Uuid::new_v4().to_string();
+        let mut second_server = first_server.clone();
+        second_server.id = Uuid::new_v4().to_string();
+        second_server.codex_home = "~/.second-profile".into();
+        let mut first = sync_job(first_server.clone());
+        let mut second = sync_job(second_server);
+        assert!(first.bind_remote_home("/fixture/.codex".into()));
+        assert!(second.bind_remote_home("/fixture/.second-profile".into()));
+        assert!(first.is_current());
+        assert!(second.is_current());
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_server_jobs(&first_server);
+        assert!(!first.is_current());
+        assert!(second.is_current());
+    }
+
+    #[test]
+    fn configured_path_does_not_reserve_a_directory_until_it_is_resolved() {
+        let mut first_server = server(&Uuid::new_v4().to_string());
+        first_server.host = Uuid::new_v4().to_string();
+        let mut second_server = first_server.clone();
+        second_server.id = Uuid::new_v4().to_string();
+        second_server.codex_home = "/fixture/.codex".into();
+        let mut first = sync_job(first_server);
+        assert!(first.bind_remote_home("/fixture/.codex".into()));
+        let mut second = sync_job(second_server);
+        assert!(first.is_current());
+        // The absolute configured path may now be a symlink to another profile.
+        assert!(second.bind_remote_home("/fixture/.second-profile".into()));
+        assert!(first.is_current());
+        assert!(second.is_current());
+    }
+
+    #[test]
+    fn local_switch_preserves_a_newer_independent_job_awaiting_home_resolution() {
+        let mut following_server = server(&Uuid::new_v4().to_string());
+        following_server.host = Uuid::new_v4().to_string();
+        let mut independent_server = following_server.clone();
+        independent_server.id = Uuid::new_v4().to_string();
+        independent_server.codex_home = "~/.codex/".into();
+        let mut following = sync_job(following_server);
+        following.host.latest.send_replace(HostReservation {
+            generation: following.generation,
+            tied_to_local_account: true,
+        });
+        assert!(following.bind_remote_home("/fixture/.codex".into()));
+        let mut independent = sync_job(independent_server);
+        {
+            let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            cancel_local_follow_job(&following.host, false);
+            cancel_local_follow_job(following.target.as_ref().unwrap(), true);
+        }
+        assert!(!following.is_current());
+        assert!(independent.is_current());
+        assert!(independent.bind_remote_home("/fixture/.codex".into()));
+        assert!(independent.is_current());
+    }
+
+    #[test]
+    fn different_homes_on_the_same_host_do_not_supersede_or_cancel_each_other() {
+        let mut first_server = server("first-profile");
+        first_server.host = format!("profiles-{}", Uuid::new_v4());
+        let mut second_server = first_server.clone();
+        second_server.id = "second-profile".into();
+        second_server.codex_home = "~/.second-profile".into();
+        let first = host_jobs(&first_server, false);
+        let second = host_jobs(&second_server, false);
+        assert!(!Arc::ptr_eq(&first, &second));
+        let first_generation = next_generation();
+        let second_generation = next_generation();
+        first.latest.send_replace(HostReservation {
+            generation: first_generation,
+            tied_to_local_account: true,
+        });
+        second.latest.send_replace(HostReservation {
+            generation: second_generation,
+            tied_to_local_account: false,
+        });
+        assert_eq!(first.latest.borrow().generation, first_generation);
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_server_jobs(&first_server);
+        assert!(first.latest.borrow().generation > first_generation);
+        assert_eq!(second.latest.borrow().generation, second_generation);
+    }
+
+    #[test]
+    fn local_account_change_cancels_only_local_follow_jobs() {
+        let mut independent_server = server("independent");
+        independent_server.host = format!("independent-{}", Uuid::new_v4());
+        let mut following_server = server("following");
+        following_server.host = format!("following-{}", Uuid::new_v4());
+        let independent = host_jobs(&independent_server, false);
+        let following = host_jobs(&following_server, false);
+        let independent_generation = next_generation();
+        let following_generation = next_generation();
+        independent.latest.send_replace(HostReservation {
+            generation: independent_generation,
+            tied_to_local_account: false,
+        });
+        following.latest.send_replace(HostReservation {
+            generation: following_generation,
+            tied_to_local_account: true,
+        });
+        cancel_local_follow_job(&independent, false);
+        cancel_local_follow_job(&following, false);
+        assert_eq!(
+            independent.latest.borrow().generation,
+            independent_generation
+        );
+        assert!(following.latest.borrow().generation > following_generation);
+        assert!(!following.latest.borrow().tied_to_local_account);
+    }
+
+    #[cfg(unix)]
+    struct Fixture {
+        root: PathBuf,
+        home: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("cockpit-ssh-fixture-{}", Uuid::new_v4()));
+            let home = root.join("existing profile");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(
+                home.join("config.toml"),
+                "# fixture must remain byte-identical\n",
+            )
+            .unwrap();
+            Self { root, home }
         }
 
-        let current = codex_account::get_current_account()
-            .expect("a current Codex account is required for live SSH sync");
-        let _backup = StoreBackup::capture();
-        let now = now_timestamp();
-        let server = SshServer {
-            id: "live-ssh-own".to_string(),
-            name: "own".to_string(),
-            host: "own".to_string(),
-            port: 22,
-            username: "ubuntu".to_string(),
-            codex_home: "~/.codex".to_string(),
-            auth: SshAuthConfig::Agent,
-            sync_on_codex_switch: true,
-            created_at: now,
-            updated_at: now,
-            last_sync: None,
-        };
-        let store = SshServerStore {
-            version: "2".to_string(),
-            selected_server_ids: vec![server.id.clone()],
-            servers: vec![server.clone()],
-        };
-        save_store(&store).expect("write live SSH server store");
+        fn start(&self, generation: u64, payload: &[u8]) -> std::process::Child {
+            use std::io::Write;
+            let mut child = std::process::Command::new("python3")
+                .args(["-c", REMOTE_SYNC_SCRIPT])
+                .env("HOME", &self.root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let request = serde_json::json!({
+                "home": self.home, "generation": generation.to_string(),
+                "auth": STANDARD.encode(payload), "sha256": format!("{:x}", Sha256::digest(payload)),
+            });
+            writeln!(child.stdin.as_mut().unwrap(), "{}", request).unwrap();
+            child
+        }
 
-        test_connection(&server.id)
-            .await
-            .expect("live SSH connection test should pass");
-        let result = sync_current_account_to_server(Some(server.id.clone()))
-            .await
-            .expect("live SSH sync should return a result");
+        fn complete(&self, generation: u64, payload: &[u8]) -> std::process::Output {
+            let mut child = self.start(generation, payload);
+            // Keep the stdin lease open until the transaction exits.
+            let stdin = child.stdin.take().unwrap();
+            let output = child.wait_with_output().unwrap();
+            drop(stdin);
+            output
+        }
+    }
 
-        assert!(
-            result.verified,
-            "live SSH sync should verify remote hashes: {:?}",
-            result.error
+    #[cfg(unix)]
+    fn run_fixture_python(
+        script: &str,
+        home: &std::path::Path,
+        target_mode: &str,
+    ) -> serde_json::Value {
+        use std::io::Write;
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let request = serde_json::json!({"codex_home": home, "target_mode": target_mode});
+        writeln!(child.stdin.take().unwrap(), "{request}").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_reports_digest_without_credential_and_checks_provider_config() {
+        let fixture = Fixture::new();
+        let auth = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "fixture-private-access", "account_id": "official-id"}
+        });
+        std::fs::write(fixture.home.join("auth.json"), auth.to_string()).unwrap();
+        let inspected = run_fixture_python(REMOTE_INSPECT_SCRIPT, &fixture.home, "oauth");
+        assert_eq!(inspected["auth_mode"], "oauth");
+        assert_eq!(inspected["account_id"], "official-id");
+        assert_eq!(
+            inspected["fingerprint"],
+            format!("{:x}", Sha256::digest(b"fixture-private-access"))
         );
-        assert_eq!(result.account_id, current.id);
-        assert_eq!(result.account_email, current.email);
-        assert_eq!(result.token_generation, current.token_generation);
+        assert!(!inspected.to_string().contains("fixture-private-access"));
+        let compatible =
+            run_fixture_python(REMOTE_AUTH_COMPATIBILITY_SCRIPT, &fixture.home, "oauth");
+        assert_eq!(compatible["compatible"], true);
+        std::fs::write(
+            fixture.home.join("config.toml"),
+            "[model_providers.openai]\nbase_url = 'https://example.test'\n",
+        )
+        .unwrap();
+        let incompatible =
+            run_fixture_python(REMOTE_AUTH_COMPATIBILITY_SCRIPT, &fixture.home, "oauth");
+        assert_eq!(incompatible["compatible"], false);
+        std::fs::write(fixture.home.join("config.toml"), "forced_login_method = 'api'\n").unwrap();
+        let api = run_fixture_python(REMOTE_AUTH_COMPATIBILITY_SCRIPT, &fixture.home, "apikey");
+        assert_eq!(api["compatible"], true);
+        let oauth = run_fixture_python(REMOTE_AUTH_COMPATIBILITY_SCRIPT, &fixture.home, "oauth");
+        assert_eq!(oauth["compatible"], false);
+    }
+
+    #[cfg(unix)]
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_creates_a_private_home_without_changing_another_profile() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = Fixture::new();
+        let existing_home = fixture.home.clone();
+        let existing_auth = br#"{"fixture":"existing"}"#;
+        std::fs::write(existing_home.join("auth.json"), existing_auth).unwrap();
+        fixture.home = fixture.root.join("new profile");
+        assert!(!fixture.home.exists());
+        let new_auth = br#"{"fixture":"new"}"#;
+        let output = fixture.complete(1, new_auth);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(fixture.home.join("auth.json")).unwrap(), new_auth);
+        assert_eq!(
+            std::fs::metadata(&fixture.home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read(existing_home.join("auth.json")).unwrap(),
+            existing_auth
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing_home.join("config.toml")).unwrap(),
+            "# fixture must remain byte-identical\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_auth_only_atomic_secure_write_leaves_no_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let output = fixture.complete(20, br#"{"fixture":"new"}"#);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "transferring\ncredentials_synced\nreloading\napplied\n"
+        );
+        assert_eq!(
+            std::fs::read(fixture.home.join("auth.json")).unwrap(),
+            br#"{"fixture":"new"}"#
+        );
+        assert_eq!(
+            std::fs::metadata(fixture.home.join("auth.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.home.join("config.toml")).unwrap(),
+            "# fixture must remain byte-identical\n"
+        );
+        let files: Vec<_> = std::fs::read_dir(&fixture.home)
+            .unwrap()
+            .map(|p| p.unwrap().file_name())
+            .collect();
+        assert_eq!(files.len(), 2); // only the existing config and auth
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_listener_syncs_files_and_initializes_missing_home() {
+        let fixture = Fixture::new();
+        let failed = fixture.complete(1, br#"{"fixture":true}"#);
+        assert!(failed.status.success());
+        let stages = String::from_utf8_lossy(&failed.stdout);
+        assert!(stages.contains("credentials_synced"));
+        assert!(stages.contains("applied"));
+        std::fs::remove_dir_all(&fixture.home).unwrap();
+        let missing = fixture.complete(2, br#"{"fixture":true}"#);
+        assert!(missing.status.success());
+        assert_eq!(
+            std::fs::read(fixture.home.join("auth.json")).unwrap(),
+            br#"{"fixture":true}"#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_remote_waiter_cannot_apply_after_new_credentials() {
+        use std::io::{BufRead, BufReader as StdBufReader};
+        let fixture = Fixture::new();
+        let mut holder = std::process::Command::new("python3")
+            .args(["-u", "-c", "import fcntl,os,sys; fd=os.open(sys.argv[1],os.O_RDONLY); fcntl.flock(fd,fcntl.LOCK_EX); print('locked',flush=True); sys.stdin.read()"])
+            .arg(&fixture.home)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut line = String::new();
+        StdBufReader::new(holder.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "locked");
+        let mut old = fixture.start(1, br#"{"fixture":"old"}"#);
+        drop(old.stdin.take());
+        let output = old.wait_with_output().unwrap();
+        drop(holder.stdin.take());
+        holder.wait().unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("credentials_synced"));
+        let new = fixture.complete(2, br#"{"fixture":"new"}"#);
+        assert!(new.status.success());
+        assert_eq!(std::fs::read(fixture.home.join("auth.json")).unwrap(), br#"{"fixture":"new"}"#);
     }
 }

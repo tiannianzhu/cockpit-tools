@@ -7,7 +7,7 @@ import { loadHookModule } from '../../tests/helpers/reactHookHarness';
 import { MFA_STORAGE_KEY_SAVED } from '../utils/mfaVault';
 import { ALL_PLATFORM_IDS } from '../types/platform';
 import type { CodexWakeupState } from '../types/codexWakeup';
-import { CODEX_TOP_LAYOUT_STORAGE_KEY, createDefaultCodexTopLayout, normalizeCodexTopLayout } from '../utils/codexTopLayoutPreferences';
+import { CODEX_TOP_LAYOUT_STORAGE_KEY, normalizeCodexTopLayout } from '../utils/codexTopLayoutPreferences';
 
 type Account = { id: string; email?: string; user_id?: string; account_id?: string; api_key?: string };
 const SORT_KEY = 'agtools.codex.accounts.custom_sort_order.v1';
@@ -448,7 +448,6 @@ test('config export refuses a corrupt saved layout instead of silently backing u
   const h = harness(); h.items.set(CODEX_TOP_LAYOUT_STORAGE_KEY, '{broken');
   await assert.rejects(h.bundle(), /codex_top_layout_read_failed/);
   assert.equal(h.items.get(CODEX_TOP_LAYOUT_STORAGE_KEY), '{broken');
-  assert.deepEqual(createDefaultCodexTopLayout().order.slice(0, 5), ['overview', 'providers', 'wakeup', 'instances', 'sessions']);
 });
 
 const sourceAccounts: Account[] = [

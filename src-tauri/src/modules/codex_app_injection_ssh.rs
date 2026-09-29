@@ -18,18 +18,28 @@ fn current(account: &CodexAccount) -> bool {
     })
 }
 
-async fn resolve_endpoint(
-    host: &str,
-    explicit: Option<&SshServer>,
-) -> Result<identity::Endpoint, String> {
+fn endpoint_command(host: &str, explicit: Option<&SshServer>) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("ssh");
     command.args(["-G", "-o", "CanonicalizeHostname=no"]);
     if let Some(server) = explicit {
-        command.args(["-l", &server.username, "-p", &server.port.to_string()]);
+        if !server.username.is_empty() {
+            command.args(["-l", &server.username]);
+        }
+        if server.port > 0 {
+            command.args(["-p", &server.port.to_string()]);
+        }
     }
     command.args(["--", host]);
     #[cfg(target_os = "windows")]
     command.creation_flags(0x0800_0000);
+    command
+}
+
+async fn resolve_endpoint(
+    host: &str,
+    explicit: Option<&SshServer>,
+) -> Result<identity::Endpoint, String> {
+    let command = endpoint_command(host, explicit);
     let output =
         crate::modules::ssh_server::command_output(command, Duration::from_secs(3), None).await?;
     if !output.status.success() {
@@ -209,4 +219,28 @@ pub(super) async fn refresh(
     })
     .await
     .map_err(|_| "timeout".to_string())?
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use crate::models::ssh_server::SshAuthConfig;
+
+    #[test]
+    fn endpoint_lookup_preserves_inherited_and_explicit_ssh_identity() {
+        let mut server = SshServer {
+            id: "fixture".into(), name: "fixture-alias".into(), host: "fixture-alias".into(),
+            username: String::new(), port: 0, codex_home: "~/.codex".into(),
+            auth: SshAuthConfig::Agent, sync_on_codex_switch: true,
+            created_at: 1, updated_at: 1, last_sync: None,
+        };
+        let inherited = endpoint_command(&server.host, Some(&server));
+        assert_eq!(inherited.as_std().get_args().collect::<Vec<_>>(),
+            ["-G", "-o", "CanonicalizeHostname=no", "--", "fixture-alias"]);
+        server.username = "fixture-user".into();
+        server.port = 2222;
+        let explicit = endpoint_command(&server.host, Some(&server));
+        assert_eq!(explicit.as_std().get_args().collect::<Vec<_>>(),
+            ["-G", "-o", "CanonicalizeHostname=no", "-l", "fixture-user", "-p", "2222", "--", "fixture-alias"]);
+    }
 }
