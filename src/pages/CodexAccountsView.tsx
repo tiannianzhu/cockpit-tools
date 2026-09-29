@@ -16,6 +16,8 @@ import { buildCodexAccountPresentation } from "../presentation/platformAccountPr
 import { CodexOverviewTabsHeader } from "../components/CodexOverviewTabsHeader";
 import { CodexInstancesContent } from "./CodexInstancesPage";
 import { CodexLaunchPreviewModal } from "../components/codex/CodexLaunchPreviewModal";
+import { CodexSshServersPanel } from "../components/codex/CodexSshServersPanel";
+import { CODEX_OPEN_HOSTS_EVENT, takePendingCodexHostsRequest } from "../utils/codexHostNavigation";
 import { CodexSessionManager } from "../components/codex/CodexSessionManager";
 import { CodexCliLaunchDialog } from "../components/codex/CodexCliLaunchDialog";
 import { CodexWakeupContent } from "../components/codex/CodexWakeupContent";
@@ -147,6 +149,14 @@ export function CodexAccountsView(props: CodexAccountsViewProps) {
     window.addEventListener('codex:open-builtin-page', openPage);
     return () => window.removeEventListener('codex:open-builtin-page', openPage);
   }, [pageRegistry, setActiveTab]);
+  useEffect(() => {
+    const openHosts = () => {
+      if (takePendingCodexHostsRequest()) setActiveTab("hosts");
+    };
+    window.addEventListener(CODEX_OPEN_HOSTS_EVENT, openHosts);
+    openHosts();
+    return () => window.removeEventListener(CODEX_OPEN_HOSTS_EVENT, openHosts);
+  }, [setActiveTab]);
   const [proxyAccountId, setProxyAccountId] = useState<string | null>(null);
   const [proxyPreviewId, setProxyPreviewId] = useState<string | null>(null);
   // The shortcut opens a read-only summary; only its explicit action leaves for the page.
@@ -1021,6 +1031,7 @@ export function CodexAccountsView(props: CodexAccountsViewProps) {
         />
       )}
 
+      {activeTab === "hosts" && <CodexSshServersPanel />}
       {activeTab === "sessions" && <CodexSessionManager />}
 
       {(activeTab === "providers" || editingApiKeyCredentialsId) && <CodexModelProviderManager
