@@ -14,6 +14,7 @@ import { resolveCodexProviderCapabilityProfile } from "./codexProviderGateway";
 import { resolveCodexModelProviderForApiKey } from "./codexModelProviderKeyConfig";
 import { resolveCodexModelProviderAccountName } from "./codexModelProviderAccountName";
 import { resolveProviderModelVisionState } from "./codexModelProviderVision";
+import { buildCodexProviderCatalogDefinition, deriveCodexProviderCatalogFields, resolveCodexProviderContextWindows, type CodexProviderCatalogDefinition } from "./codexProviderCatalogDefinition";
 
 export interface CodexModelProviderReference {
   id: string;
@@ -48,6 +49,7 @@ export function mergeCodexModelProviderCredentialInput(
     usageApiKey?: string;
     sourceTag?: string | null;
     modelCatalog?: string[];
+    modelCatalogDefinition?: CodexProviderCatalogDefinition | null;
     modelContextWindows?: Record<string, number>;
     supportsVision?: boolean;
     modelCapabilities?: Record<string, { supportsVision?: boolean }>;
@@ -61,6 +63,17 @@ export function mergeCodexModelProviderCredentialInput(
   },
 ) {
   provider = provider ? resolveCodexModelProviderForApiKey(provider, fallback.apiKey) : null;
+  const modelCatalog = fallback.modelCatalog ?? provider?.modelCatalog;
+  const modelContextWindows = fallback.modelContextWindows ?? provider?.modelContextWindows;
+  const modelCapabilities = provider?.modelCapabilities ?? fallback.modelCapabilities;
+  const definition = fallback.modelCatalogDefinition !== undefined
+    ? fallback.modelCatalogDefinition : provider?.modelCatalogDefinition;
+  const modelCatalogDefinition = definition ? buildCodexProviderCatalogDefinition(
+    modelCatalog ?? definition.models.map(model => model.slug),
+    modelContextWindows ?? deriveCodexProviderCatalogFields(definition).modelContextWindows,
+    modelCapabilities ?? {},
+    definition,
+  ) ?? null : definition;
   return {
     ...fallback,
     providerId: provider?.id ?? fallback.providerId,
@@ -70,11 +83,11 @@ export function mergeCodexModelProviderCredentialInput(
       (item) => item.apiKey.trim() === fallback.apiKey.trim(),
     )?.name ?? fallback.apiKeyName,
     sourceTag: provider?.sourceTag ?? fallback.sourceTag,
-    modelCatalog: fallback.modelCatalog ?? provider?.modelCatalog,
-    modelContextWindows:
-      fallback.modelContextWindows ?? provider?.modelContextWindows,
+    modelCatalog,
+    modelCatalogDefinition,
+    modelContextWindows,
     supportsVision: provider?.supportsVision ?? fallback.supportsVision,
-    modelCapabilities: provider?.modelCapabilities ?? fallback.modelCapabilities,
+    modelCapabilities,
     visionRoutingModel:
       provider?.visionRoutingModel ?? fallback.visionRoutingModel,
     website: provider?.website ?? fallback.website,
@@ -183,7 +196,7 @@ export function buildCodexModelProviderAccountSnapshot(
       presetId === CODEX_API_PROVIDER_CUSTOM_ID ? provider.id : presetId,
     apiProviderName: provider.name,
     apiModelCatalog: provider.modelCatalog,
-    apiModelContextWindows: provider.modelContextWindows,
+    apiModelContextWindows: resolveCodexProviderContextWindows(provider.modelCatalogDefinition, provider.modelContextWindows),
     apiWireApi: wireApi,
     apiAuthScheme: provider.authScheme,
     apiSupportsWebsockets:

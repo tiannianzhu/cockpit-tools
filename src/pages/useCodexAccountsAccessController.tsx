@@ -45,6 +45,7 @@ import { APIKEY_FUN_PREFILL_EVENT, consumeApiKeyFunPrefill, type ApiKeyFunPrefil
 import { OPENAI_USAGE_CONFIG_CHANGED_EVENT, findCodexModelProviderById, findCodexModelProviderByBaseUrl, queryCodexModelProviderUsage, saveCodexModelProviderDetectedIntegrationType, type CodexModelProvider, mergeCodexModelProviderApiKeysFromAccounts, upsertCodexModelProviderFromCredential } from "../services/codexModelProviderService";
 import { resolveCodexModelProviderForApiKey } from "../utils/codexModelProviderKeyConfig";
 import { buildCodexModelProviderAccountSnapshot, mergeCodexModelProviderCredentialInput } from "../utils/codexModelProviderAccountSync";
+import { resolveCodexProviderContextWindows } from "../utils/codexProviderCatalogDefinition";
 import { CODEX_API_KEY_USAGE_REFRESHED_EVENT, readCodexApiKeyUsageCache, writeCodexApiKeyUsageCache, type CodexApiKeyUsageState } from "../services/codexApiKeyUsageRefreshService";
 import { isModelProviderUsageUnavailableError, listModelProviderModels } from "../services/modelProviderUsageService";
 import { upsertSavedMfaRecord } from "../utils/mfaVault";
@@ -2416,7 +2417,7 @@ export function useCodexAccountsAccessController(context: CodexAccountsAccessCon
             selectedQuickSwitchProvider.name,
             selectedQuickSwitchApiKey.name,
           ),
-          effective.modelContextWindows,
+          resolveCodexProviderContextWindows(effective.modelCatalogDefinition, effective.modelContextWindows),
           effective.authScheme ?? "x-api-key",
         );
         setMessage({
@@ -2573,7 +2574,7 @@ export function useCodexAccountsAccessController(context: CodexAccountsAccessCon
           finalProviderPayload.apiWireApi,
           finalProviderPayload.apiSupportsWebsockets,
           apiSyncModelCatalogToCodex,
-          parsedWindows.windows,
+          finalProviderPayload.apiModelContextWindows,
           selectedManagedProvider?.authScheme,
         );
         await fetchAccounts();

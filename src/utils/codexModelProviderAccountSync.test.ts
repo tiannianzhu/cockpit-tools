@@ -3,7 +3,7 @@ import test from "node:test";
 
 import type { CodexModelProvider } from "../services/codexModelProviderService.ts";
 import type { CodexAccount } from "../types/codex.ts";
-import { buildCodexModelProviderAccountSnapshot, findCodexAccountsReferencingModelProvider, findCodexAccountsForModelProviderDeletion } from "./codexModelProviderAccountSync.ts";
+import { buildCodexModelProviderAccountSnapshot, findCodexAccountsReferencingModelProvider, findCodexAccountsForModelProviderDeletion, mergeCodexModelProviderCredentialInput } from "./codexModelProviderAccountSync.ts";
 
 test('official providers keep built-in account behavior and match implicit/default endpoint aliases', () => {
   const provider: CodexModelProvider = { id: 'official', name: 'OpenAI Official', baseUrl: 'https://api.openai.com/',
@@ -160,4 +160,38 @@ test('key-owned catalogs cannot inherit metadata or vision routing for models ou
   assert.deepEqual(snapshot.apiModelContextWindows, { allowed: 128000 });
   assert.deepEqual(snapshot.apiModelVisionSupport, { allowed: false });
   assert.equal(snapshot.apiVisionRoutingModel, undefined);
+});
+
+test('account snapshots export declared input budgets without saving them as manual overrides', () => {
+  const provider: CodexModelProvider = {
+    id: 'provider', name: 'Relay', baseUrl: 'https://relay.example/v1',
+    supportsWebsockets: false, createdAt: 1, updatedAt: 1,
+    apiKeys: [{ id: 'key', name: '', apiKey: 'key', createdAt: 1, updatedAt: 1,
+      modelCatalog: ['declared', 'manual', 'total-only'],
+      modelContextWindows: { manual: 18000 },
+      modelCatalogDefinition: { models: [
+        { slug: 'declared', total_context_window: 40000, max_input_tokens: 24000, max_output_tokens: 12000 },
+        { slug: 'manual', context_window: 18000, max_input_tokens: 24000, auto_compact_token_limit: 15000 },
+        { slug: 'total-only', total_context_window: 40000, max_output_tokens: 12000 },
+      ] },
+    }],
+  };
+  const before = structuredClone(provider);
+  assert.deepEqual(buildCodexModelProviderAccountSnapshot(provider, '', 'key').apiModelContextWindows,
+    { declared: 24000, manual: 18000 });
+  assert.deepEqual(provider, before);
+});
+
+test('credential edits reconcile explicit windows in the retained definition without changing declared limits', () => {
+  const provider: CodexModelProvider = {
+    id: 'provider', name: 'Relay', baseUrl: 'https://relay.example/v1', supportsWebsockets: false,
+    createdAt: 1, updatedAt: 1, apiKeys: [], modelCatalog: ['declared'], modelContextWindows: {},
+    modelCatalogDefinition: { models: [{ slug: 'declared', max_input_tokens: 24000, total_context_window: 40000 }] },
+  };
+  const input = mergeCodexModelProviderCredentialInput(provider, {
+    apiBaseUrl: provider.baseUrl, apiKey: 'key', modelCatalog: ['declared'], modelContextWindows: { declared: 18000 },
+  });
+  assert.equal(input.modelCatalogDefinition?.models[0].context_window, 18000);
+  assert.equal(input.modelCatalogDefinition?.models[0].max_input_tokens, 24000);
+  assert.equal(provider.modelCatalogDefinition?.models[0].context_window, undefined);
 });

@@ -91,12 +91,13 @@ import {
   CODEX_API_KEY_USAGE_REFRESHED_EVENT,
   readCodexApiKeyUsageCache,
 } from "../../services/codexApiKeyUsageRefreshService";
-import { formatModelProviderUsageMoney } from "../../services/modelProviderUsageService";
+import { listModelProviderModels, formatModelProviderUsageMoney } from "../../services/modelProviderUsageService";
 import { useSponsorStore } from "../../stores/useSponsorStore";
 import { useCodexAccountStore } from "../../stores/useCodexAccountStore";
 import type { Sponsor } from "../../types/sponsor";
 import {
   CODEX_API_PROVIDER_CUSTOM_ID,
+  DEEPSEEK_API_PROVIDER_ID,
   findCodexApiProviderPresetById,
   resolveCodexApiProviderPresetId,
 } from "../../utils/codexProviderPresets";
@@ -133,8 +134,19 @@ import {
 } from "../../utils/codexModelProviderAccountName";
 import { resolveCodexModelProviderForApiKey } from "../../utils/codexModelProviderKeyConfig";
 import { buildCodexModelProviderAccountSnapshot, findCodexAccountsReferencingModelProvider, findCodexAccountsForModelProviderDeletion } from "../../utils/codexModelProviderAccountSync";
-import { buildProviderModelVisionCapabilities } from "../../utils/codexModelProviderVision";
 import { isImageGenerationModelId, selectProviderBatchTestModelId } from "../../utils/codexTestModel";
+import {
+  buildProviderModelVisionCapabilities,
+  resolveProviderModelVisionState,
+} from "../../utils/codexModelProviderVision";
+import {
+  deriveCodexProviderCatalogFields,
+  buildCodexProviderCatalogDefinition,
+  patchCodexProviderModel,
+  buildUpstreamModelDefinitions,
+  resolveCodexProviderContextWindows,
+  type CodexProviderCatalogDefinition,
+} from "../../utils/codexProviderCatalogDefinition";
 import { CodexModelProviderManagerView } from "./CodexModelProviderManagerView";
 import { CodexModelProviderEditor } from "./CodexModelProviderEditor";
 
@@ -397,6 +409,7 @@ interface ProviderFormState {
   name: string;
   baseUrl: string;
   modelCatalogText: string;
+  modelCatalogDefinition?: CodexProviderCatalogDefinition;
   modelContextWindowsDraft: Record<string, string>;
   supportsVision: boolean;
   visionModelText: string;
@@ -606,6 +619,8 @@ export function useCodexModelProviderManagerController({
   const [showModal, setShowModal] = useState(false);
   const [showQuickConfigModal, setShowQuickConfigModal] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [fetchingProviderModels, setFetchingProviderModels] = useState(false);
+  const modelFetchGeneration = useRef(0);
   const [enablingProviderId, setEnablingProviderId] = useState<string | null>(
     null,
   );
@@ -1637,7 +1652,12 @@ export function useCodexModelProviderManagerController({
       null,
     [selectedSponsorTemplateId, sponsorProviderTemplates],
   );
+  const cancelProviderModelsFetch = useCallback(() => {
+    modelFetchGeneration.current += 1;
+    setFetchingProviderModels(false);
+  }, []);
   const openCreateModal = useCallback(() => {
+    cancelProviderModelsFetch();
     setAccountEditor(null);
     setEditorModelKeyId(null);
     setNotice(null);
@@ -1654,7 +1674,7 @@ export function useCodexModelProviderManagerController({
     setSelectedPresetId(CODEX_API_PROVIDER_CUSTOM_ID);
     setSelectedSponsorTemplateId(null);
     setShowModal(true);
-  }, []);
+  }, [cancelProviderModelsFetch]);
 
   const toggleProviderSelected = useCallback((providerId: string) => {
     setSelectedProviderIds((previous) => {
@@ -1685,6 +1705,7 @@ export function useCodexModelProviderManagerController({
   }, []);
 
   const openEditModal = useCallback((provider: CodexModelProvider, account?: CodexAccount) => {
+    cancelProviderModelsFetch();
     setNotice(null);
     setFormError(null);
     setExistingApiKeySearchQuery("");
@@ -1692,7 +1713,8 @@ export function useCodexModelProviderManagerController({
     const resolvedWireApi = resolveProviderWireApi(provider);
     const selectedKey = account ? provider.apiKeys.find(key => key.apiKey.trim() === account.openai_api_key?.trim()) : undefined;
     const modelConfig = selectedKey ? resolveCodexModelProviderForApiKey(provider, selectedKey.apiKey) : account ? {
-      ...provider, modelCatalog: account.api_model_catalog, modelContextWindows: account.api_model_context_windows,
+      ...provider, modelCatalog: account.api_model_catalog, modelCatalogDefinition: undefined,
+      modelContextWindows: account.api_model_context_windows,
       supportsVision: account.api_supports_vision === true,
       modelCapabilities: Object.fromEntries(Object.entries(account.api_model_vision_support ?? {}).map(([model, supportsVision]) => [model, { supportsVision }])),
       visionRoutingModel: account.api_vision_routing_model ?? undefined,
@@ -1704,6 +1726,7 @@ export function useCodexModelProviderManagerController({
       name: provider.name,
       baseUrl: provider.baseUrl,
       modelCatalogText: (modelConfig.modelCatalog ?? []).join("\n"),
+      modelCatalogDefinition: modelConfig.modelCatalogDefinition,
       modelContextWindowsDraft: contextWindowDraftsFromRecord(
         modelConfig.modelContextWindows,
         modelConfig.modelCatalog ?? [],
@@ -1732,7 +1755,7 @@ export function useCodexModelProviderManagerController({
     setSelectedPresetId(resolveCodexApiProviderPresetId(provider.baseUrl));
     setSelectedSponsorTemplateId(null);
     setShowModal(true);
-  }, []);
+  }, [cancelProviderModelsFetch]);
 
   useEffect(() => {
     if (!editingAccountId) { openedAccountEditorRef.current = null; return; }
@@ -1758,15 +1781,17 @@ export function useCodexModelProviderManagerController({
 
   const selectEditorModelKey = useCallback((keyId: string) => {
     if (!currentEditingProvider) return;
+    cancelProviderModelsFetch();
     const key = currentEditingProvider.apiKeys.find(item => item.id === keyId);
     const config = key ? resolveCodexModelProviderForApiKey(currentEditingProvider, key.apiKey) : currentEditingProvider;
     setEditorModelKeyId(key?.id ?? (keyId === "__new__" ? "__new__" : null));
     setFormError(null);
     setForm(current => ({ ...current, modelCatalogText: (config.modelCatalog ?? []).join("\n"),
+      modelCatalogDefinition: config.modelCatalogDefinition,
       modelContextWindowsDraft: contextWindowDraftsFromRecord(config.modelContextWindows, config.modelCatalog ?? []),
       supportsVision: config.supportsVision === true, visionModelText: visionModelTextFromCapabilities(config.modelCapabilities),
       visionModelStates: visionModelStatesFromCapabilities(config.modelCapabilities), visionRoutingModel: config.visionRoutingModel ?? "" }));
-  }, [currentEditingProvider]);
+  }, [currentEditingProvider, cancelProviderModelsFetch]);
 
   const selectAccountEditorProvider = useCallback((providerId: string) => {
     const provider = providers.find(item => item.id === providerId);
@@ -1777,18 +1802,28 @@ export function useCodexModelProviderManagerController({
 
   const closeModal = useCallback(() => {
     if (saving) return;
+    cancelProviderModelsFetch();
     setEditingApiKey(null);
     setShowModal(false);
     setFormError(null);
     setAccountEditor(null);
     onAccountEditorClose?.();
-  }, [saving, onAccountEditorClose]);
+  }, [saving, onAccountEditorClose, cancelProviderModelsFetch]);
 
   useEscClose(showModal, closeModal);
 
   const mutateForm = useCallback((patch: Partial<ProviderFormState>) => {
+    if (patch.baseUrl !== undefined || patch.newApiKey !== undefined || patch.wireApi !== undefined || patch.authScheme !== undefined) {
+      cancelProviderModelsFetch();
+    }
     setFormError(null);
     setForm((prev) => ({ ...prev, ...patch }));
+  }, [cancelProviderModelsFetch]);
+
+  const patchModelDefinition = useCallback((model: string, patch: Record<string, unknown>) => {
+    setForm((previous) => ({ ...previous,
+      modelCatalogDefinition: patchCodexProviderModel(previous.modelCatalogDefinition, model, patch),
+    }));
   }, []);
 
   useEffect(() => {
@@ -1811,6 +1846,7 @@ export function useCodexModelProviderManagerController({
         name: preset.name,
         baseUrl: preset.baseUrls[0] ?? "",
         modelCatalogText: (preset.modelCatalog ?? []).join("\n"),
+        modelCatalogDefinition: undefined,
         modelContextWindowsDraft: contextWindowDraftsFromRecord(
           undefined,
           preset.modelCatalog ?? [],
@@ -1850,6 +1886,7 @@ export function useCodexModelProviderManagerController({
         name: template.name,
         baseUrl: template.baseUrl,
         modelCatalogText: template.modelCatalog.join("\n"),
+        modelCatalogDefinition: undefined,
         modelContextWindowsDraft: contextWindowDraftsFromRecord(
           undefined,
           template.modelCatalog,
@@ -1907,6 +1944,45 @@ export function useCodexModelProviderManagerController({
     },
     [t],
   );
+
+  const providerModelsApiKey = form.newApiKey.trim()
+    || currentEditingProvider?.apiKeys.find((key) => key.id === (editorModelKeyId ?? accountEditor?.apiKeyId))?.apiKey
+    || currentEditingProvider?.apiKeys[0]?.apiKey || '';
+  const fetchProviderModels = useCallback(async () => {
+    if (fetchingProviderModels || !providerModelsApiKey || !form.baseUrl.trim()) return;
+    const generation = ++modelFetchGeneration.current;
+    setFetchingProviderModels(true);
+    setFormError(null);
+    try {
+      const result = await listModelProviderModels({ baseUrl: form.baseUrl.trim(), apiKey: providerModelsApiKey,
+        wireApi: form.wireApi, authScheme: form.authScheme });
+      if (modelFetchGeneration.current !== generation) return;
+      if (!result.models.length) throw new Error(t("codex.api.modelCatalog.fetchEmpty"));
+      // Validate refreshed capabilities before updating state; preserve the latest
+      // explicit limits even if the user edited them while discovery was pending.
+      buildUpstreamModelDefinitions(result.models);
+      setForm((previous) => {
+        if (modelFetchGeneration.current !== generation || previous.baseUrl.trim() !== form.baseUrl.trim()) return previous;
+        const definition = buildUpstreamModelDefinitions(result.models, previous.modelCatalogDefinition);
+        const fields = deriveCodexProviderCatalogFields(definition);
+        const contextDrafts = contextWindowDraftsFromRecord(fields.modelContextWindows, fields.modelCatalog);
+        const previousDrafts = new Map(Object.entries(previous.modelContextWindowsDraft)
+          .map(([model, value]) => [model.toLowerCase(), value]));
+        const visionStates = Object.fromEntries(Object.entries(fields.modelCapabilities)
+          .map(([slug, value]) => [slug, value.supportsVision]));
+        return { ...previous, modelCatalogText: fields.modelCatalog.join('\n'), modelCatalogDefinition: definition,
+          modelContextWindowsDraft: Object.fromEntries(fields.modelCatalog.map(model =>
+            [model, previousDrafts.get(model.toLowerCase()) ?? contextDrafts[model] ?? ''])),
+          visionModelStates: visionStates,
+          visionModelText: Object.entries(visionStates).filter(([, enabled]) => enabled).map(([slug]) => slug).join('\n'),
+        };
+      });
+    } catch (error) {
+      if (modelFetchGeneration.current === generation) setFormError(parseServiceError(error));
+    } finally {
+      if (modelFetchGeneration.current === generation) setFetchingProviderModels(false);
+    }
+  }, [fetchingProviderModels, providerModelsApiKey, form.baseUrl, form.wireApi, form.authScheme, parseServiceError, t]);
 
   const formatProviderTestFailure = useCallback(
     (failure: CodexLocalAccessTestFailure): string => {
@@ -2317,6 +2393,39 @@ export function useCodexModelProviderManagerController({
       modelCatalog,
       form.supportsVision,
     );
+    let modelCatalogDefinition: CodexProviderCatalogDefinition | null = null;
+    if (
+      form.modelCatalogDefinition ||
+      (form.wireApi === "responses" &&
+        selectedPresetId !== "openai_official" &&
+        selectedPresetId !== DEEPSEEK_API_PROVIDER_ID)
+    ) {
+      try {
+        // The catalog drives Codex's image UI, so resolve provider defaults there
+        // while keeping modelCapabilities limited to explicit provider overrides.
+        const catalogCapabilities = Object.fromEntries(
+          modelCatalog.map((model) => [
+            model.toLowerCase(),
+            {
+              supportsVision: resolveProviderModelVisionState(
+                model,
+                form.visionModelStates,
+                form.supportsVision,
+              ),
+            },
+          ]),
+        );
+        modelCatalogDefinition = buildCodexProviderCatalogDefinition(
+          modelCatalog,
+          parsedWindows.windows,
+          catalogCapabilities,
+          form.modelCatalogDefinition,
+        ) ?? null;
+      } catch (error) {
+        setFormError(error instanceof Error ? error.message : String(error));
+        return;
+      }
+    }
     const visionRoutingModel = form.visionRoutingModel.trim();
     const providerToUpdate = currentEditingProvider ?? (accountEditor
       ? providers.find(provider => normalizeCodexModelProviderBaseUrl(provider.baseUrl) === normalizedBaseUrl) : undefined);
@@ -2366,7 +2475,7 @@ export function useCodexModelProviderManagerController({
       setFormError(t("codex.quickSwitch.validation.apiKeyRequired"));
       return;
     }
-    const modelConfig = { modelCatalog, modelContextWindows: parsedWindows.windows,
+    const modelConfig = { modelCatalog, modelCatalogDefinition, modelContextWindows: parsedWindows.windows,
       supportsVision: form.supportsVision, modelCapabilities, visionRoutingModel: visionRoutingModel || null };
     const boundCatalog = selectedAccountKey && selectedAccountKey.id !== editorModelKeyId
       ? selectedAccountKey.modelCatalog ?? (editorModelKeyId ? providerToUpdate?.modelCatalog : modelCatalog)
@@ -2386,6 +2495,7 @@ export function useCodexModelProviderManagerController({
           baseUrl,
           sourceTag: selectedSponsorTemplate?.id,
           modelCatalog,
+          modelCatalogDefinition: modelCatalogDefinition ?? undefined,
           modelContextWindows: parsedWindows.windows,
           supportsVision: form.supportsVision,
           modelCapabilities,
@@ -2511,6 +2621,7 @@ export function useCodexModelProviderManagerController({
     reloadProviders,
     saving,
     selectedSponsorTemplate?.id,
+    selectedPresetId,
     t,
   ]);
 
@@ -3133,7 +3244,7 @@ export function useCodexModelProviderManagerController({
           wireApi,
           provider.supportsWebsockets,
           undefined,
-          effective.modelContextWindows,
+          resolveCodexProviderContextWindows(effective.modelCatalogDefinition, effective.modelContextWindows),
           effective.authScheme,
         );
         await updateCodexApiKeyBoundOAuthAccount(
@@ -3743,6 +3854,10 @@ export function useCodexModelProviderManagerController({
     handleRenameApiKey,
     handleSaveApiKeyEdit,
     handleSaveProvider,
+    patchModelDefinition,
+    fetchProviderModels,
+    fetchingProviderModels,
+    canFetchProviderModels: Boolean(providerModelsApiKey && form.baseUrl.trim()),
     handleSelectPresetEndpoint,
     handleSelectProviderPreset,
     handleSelectSponsorTemplate,

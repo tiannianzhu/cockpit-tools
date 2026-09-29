@@ -601,6 +601,14 @@ fn summarize_model_provider_models(body: &serde_json::Value) -> (Option<String>,
     (first, output)
 }
 
+// Provider context_length is total capacity, not a Codex input allowance.
+fn provider_token_limit(item: &Value, field: &str) -> Option<u64> {
+    item.pointer(&format!("/info/meta/{field}"))
+        .or_else(|| item.get(field))
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0 && *value <= 9_007_199_254_740_991)
+}
+
 fn list_model_provider_models(body: &serde_json::Value) -> Vec<CodexModelProviderModel> {
     let mut seen = std::collections::HashSet::new();
     body.get("data")
@@ -619,9 +627,22 @@ fn list_model_provider_models(body: &serde_json::Value) -> Vec<CodexModelProvide
                     }
                     Some(CodexModelProviderModel {
                         id: id.to_string(),
+                        context_window: None,
+                        total_context_window: provider_token_limit(item, "context_length"),
+                        max_input_tokens: provider_token_limit(item, "max_input_tokens"),
+                        max_output_tokens: provider_token_limit(item, "max_output_tokens"),
+                        supports_vision: item.pointer("/info/meta/capabilities/vision").and_then(|v| v.as_bool()),
+                        reasoning_efforts: item.pointer("/info/meta/reasoning_effort_modes")
+                            .and_then(|v| v.as_str()).map(|value| {
+                                let mut seen = std::collections::HashSet::new();
+                                value.split(',').map(str::trim).filter(|v| !v.is_empty())
+                                    .filter(|v| seen.insert((*v).to_string())).map(str::to_string).collect()
+                            }).unwrap_or_default(),
                         display_name: item
                             .get("display_name")
                             .or_else(|| item.get("displayName"))
+                            .or_else(|| item.get("name"))
+                            .or_else(|| item.pointer("/info/name"))
                             .and_then(|value| value.as_str())
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
@@ -645,6 +666,15 @@ pub struct CodexModelProviderUsageDetail {
 #[serde(rename_all = "camelCase")]
 pub struct CodexModelProviderModel {
     pub id: String,
+    pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    pub supports_vision: Option<bool>,
+    pub reasoning_efforts: Vec<String>,
     pub display_name: Option<String>,
 }
 
@@ -1736,14 +1766,32 @@ pub fn codex_cancel_model_provider_chat_test(run_id: String) -> Result<bool, Str
 #[tauri::command]
 pub async fn codex_list_model_provider_models(base_url: String, api_key: String, wire_api: Option<String>, auth_scheme: Option<String>) -> Result<CodexModelProviderModelsResult, String> {
     if let Ok(Some(remote)) = crate::modules::codex_remote_service::discover(&base_url, api_key.trim(), false).await {
-        let names:std::collections::HashMap<String,String>=remote.model_catalog.as_ref().and_then(|c|c["models"].as_array())
-            .into_iter().flatten().filter_map(|m|Some((m["slug"].as_str()?.into(),m["display_name"].as_str()?.into()))).collect();
-        let priorities:std::collections::HashMap<String,i64>=remote.model_catalog.as_ref().and_then(|c|c["models"].as_array())
-            .into_iter().flatten().filter_map(|m|Some((m["slug"].as_str()?.into(),m["priority"].as_i64().unwrap_or(i64::MAX)))).collect();
+        let entries: std::collections::HashMap<&str, &Value> = remote.model_catalog.as_ref()
+            .and_then(|catalog| catalog["models"].as_array())
+            .into_iter().flatten()
+            .filter_map(|model| Some((model["slug"].as_str()?, model))).collect();
         let mut ids=remote.models;
-        ids.sort_by_key(|id|priorities.get(id).copied().unwrap_or(i64::MAX));
+        ids.sort_by_key(|id| entries.get(id.as_str())
+            .and_then(|model| model["priority"].as_i64()).unwrap_or(i64::MAX));
         return Ok(CodexModelProviderModelsResult { models: ids.into_iter().map(|id| {
-            let display_name=names.get(&id).cloned();CodexModelProviderModel { id, display_name }
+            let entry = entries.get(id.as_str()).copied();
+            let mut seen = std::collections::HashSet::new();
+            let reasoning_efforts = entry.and_then(|model| model["supported_reasoning_levels"].as_array())
+                .into_iter().flatten().filter_map(|level| level["effort"].as_str())
+                .map(str::trim).filter(|effort| !effort.is_empty())
+                .filter(|effort| seen.insert(*effort)).map(str::to_owned).collect();
+            CodexModelProviderModel {
+                display_name: entry.and_then(|model| model["display_name"].as_str()).map(str::to_owned),
+                context_window: entry.and_then(|model| model["context_window"].as_u64())
+                    .filter(|value| *value > 0 && *value <= 9_007_199_254_740_991),
+                supports_vision: entry.and_then(|model| model["input_modalities"].as_array())
+                    .map(|modalities| modalities.iter().any(|modality| modality == "image")),
+                reasoning_efforts,
+                total_context_window: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                id,
+            }
         }).collect(), latency_ms: 0 });
     }
     if api_key.trim().is_empty() { return Err("MISSING_API_KEY".into()); }
@@ -1762,6 +1810,9 @@ pub async fn codex_list_model_provider_models(base_url: String, api_key: String,
         let response = request.send().await.map_err(|_| "PROVIDER_MODELS_NETWORK_FAILED".to_string())?;
         if !response.status().is_success() { return Err(format!("PROVIDER_MODELS_HTTP_{}",response.status().as_u16())); }
         let body: serde_json::Value = response.json().await.map_err(|_| "PROVIDER_MODELS_PARSE_FAILED".to_string())?;
+        if !body.get("data").is_some_and(serde_json::Value::is_array) {
+            return Err("PROVIDER_MODELS_PARSE_FAILED: expected data array".to_string());
+        }
         for model in list_model_provider_models(&body) { if seen.insert(model.id.clone()) { models.push(model); } }
         if body["has_more"] != true { break; }
         let Some(last) = body["last_id"].as_str().filter(|s|!s.is_empty()) else { break; };
@@ -2063,6 +2114,66 @@ async fn query_sub2api_model_provider_usage(
     let parsed = serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|e| format!("PROVIDER_USAGE_PARSE_FAILED: {}", e))?;
     Ok(summarize_model_provider_usage(&parsed, latency_ms))
+}
+
+#[cfg(test)]
+mod remote_provider_models_tests {
+    use super::*;
+
+    #[test]
+    fn discovered_total_capacity_does_not_become_codex_input() {
+        let models = list_model_provider_models(&serde_json::json!({"data": [
+            {"id":"declared", "info":{"meta":{"context_length":393216,
+                "max_input_tokens":262144, "max_output_tokens":131072}}},
+            {"id":"total-only", "info":{"meta":{"context_length":393216,
+                "max_output_tokens":131072}}},
+            {"id":"invalid", "info":{"meta":{"max_input_tokens":-1}}}
+        ]}));
+        let values = serde_json::to_value(models).unwrap();
+        assert_eq!(values[0]["contextWindow"], Value::Null);
+        assert_eq!(values[0]["totalContextWindow"], 393216);
+        assert_eq!(values[0]["maxInputTokens"], 262144);
+        assert_eq!(values[0]["maxOutputTokens"], 131072);
+        assert_eq!(values[1]["totalContextWindow"], 393216);
+        assert!(values[1].get("maxInputTokens").is_none());
+        assert_eq!(values[1]["contextWindow"], Value::Null);
+        assert!(values[2].get("maxInputTokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn discovered_provider_models_keep_catalog_metadata_and_advertised_order() {
+        let base = format!("https://{}.invalid/v1", uuid::Uuid::new_v4());
+        let connection = serde_json::from_value(serde_json::json!({
+            "product":"cockpit-tools", "protocolVersion":1, "serviceId":"fixture",
+            "serviceName":"Fixture", "keyLabel":"Fixture key", "status":"active",
+            "models":["missing-metadata", "text-model", "vision-model"],
+            "modelCatalog":{"models":[
+                {"slug":"not-advertised", "priority":0, "context_window":999},
+                {"slug":"text-model", "priority":2, "context_window":65536,
+                 "input_modalities":["text"], "supported_reasoning_levels":[{"effort":"none"}]},
+                {"slug":"vision-model", "display_name":"Vision model", "priority":1,
+                 "context_window":262144, "input_modalities":["text", "image"],
+                 "supported_reasoning_levels":[{"effort":"low"}, {"effort":"high"}, {"effort":"high"}]}
+            ]},
+            "capabilities":{"responses":true, "images":false, "imageEdits":false,
+                "hostedImages":false, "usage":true, "websockets":false},
+            "imageModels":[], "tokenLimit":null, "tokenUsed":0,
+            "budget":{"policy":{"period":"lifetime"}, "usedMicrousd":0}, "updatedAt":1
+        })).unwrap();
+        crate::modules::codex_remote_service::remember_test_connection(&base, "fixture-key", connection);
+
+        let result = codex_list_model_provider_models(
+            base, "fixture-key".into(), Some("responses".into()), None,
+        ).await.unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap()["models"], serde_json::json!([
+            {"id":"vision-model", "displayName":"Vision model", "contextWindow":262144,
+             "supportsVision":true, "reasoningEfforts":["low", "high"]},
+            {"id":"text-model", "displayName":null, "contextWindow":65536,
+             "supportsVision":false, "reasoningEfforts":["none"]},
+            {"id":"missing-metadata", "displayName":null, "contextWindow":null,
+             "supportsVision":null, "reasoningEfforts":[]}
+        ]));
+    }
 }
 
 #[cfg(test)]

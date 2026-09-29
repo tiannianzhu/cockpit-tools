@@ -8,6 +8,7 @@ import { contextWindowDraftsFromRecord, parseContextWindowDrafts } from '../util
 import { resolveCodexModelProviderForApiKey } from '../utils/codexModelProviderKeyConfig';
 import { resolveCodexProviderCapabilityProfile } from '../utils/codexProviderGateway';
 import { resolveCodexModelProviderAccountName } from '../utils/codexModelProviderAccountName';
+import { resolveCodexProviderContextWindows } from '../utils/codexProviderCatalogDefinition';
 
 function handler(name: string, state: Record<string, any>) {
   const file = 'useCodexAccountsAccessController.tsx';
@@ -59,7 +60,7 @@ function harness() {
     buildApiProviderPayload: () => ({ apiProviderMode: 'custom', apiProviderId: 'provider', apiProviderName: 'Relay',
       apiWireApi: 'responses', apiSupportsWebsockets: true }),
     buildCodexModelProviderAccountSnapshot, findCodexAccountsReferencingModelProvider, mergeCodexModelProviderCredentialInput,
-    parseContextWindowDrafts, resolveCodexModelProviderForApiKey, contextWindowDraftsFromRecord, isSameHttpBaseUrl: (a: string, b: string) => a === b,
+    parseContextWindowDrafts, resolveCodexModelProviderForApiKey, resolveCodexProviderContextWindows, contextWindowDraftsFromRecord, isSameHttpBaseUrl: (a: string, b: string) => a === b,
     isRelayApiProviderTemplateId: () => false, resolveManagedProviderIdForAccount: () => 'provider',
     upsertCodexModelProviderFromCredential: async (input: any) => {
       writes.push(input);
@@ -92,12 +93,39 @@ test('explicit WebSocket false overrides the canonical provider when changing cr
   assert.equal(input.supportsWebsockets, false);
 });
 
+test('adding a managed provider account uses the projected input budget and keeps its saved map manual-only', async () => {
+  const h = harness();
+  Object.assign(h.state.selectedManagedProvider, {
+    modelCatalog: ['declared'], modelContextWindows: {},
+    modelCatalogDefinition: { models: [{ slug: 'declared', max_input_tokens: 24000, total_context_window: 40000 }] },
+  });
+  Object.assign(h.state, {
+    apiModelCatalogDraft: ['declared'], apiModelContextWindowsInput: {}, apiSyncModelCatalogToCodex: false,
+    isCodexApiKeyAccount: (account: any) => account.auth_mode === 'apikey',
+    setApiModelCatalogError() {},
+    selectedManagedProviderApiKey: h.state.selectedManagedProvider.apiKeys[0],
+    managedProviderId: 'provider', newManagedProviderNameInput: '',
+    page: { setAddStatus(value: string) { h.state.status = value; }, setAddMessage(value: string) { h.state.message = value; } },
+    async fetchAccounts() {}, async fetchCurrentAccount() {}, async assignCodexAccountsToTargetGroup() {}, async syncImportedAccountsToApiService() {},
+    resolveCodexAccountDisplayName: () => 'Fixture', maskAccountText: (value: string) => value,
+    setApiKeyInput() {}, setApiBaseUrlInput() {}, setApiProviderPresetId() {}, setManagedProviderId() {}, setManagedProviderApiKeyId() {}, setNewManagedProviderNameInput() {},
+    defaultApiProviderPresetId: 'custom', setTimeout() {}, closeAddModal() {},
+  });
+  h.state.codexService.addCodexAccountWithApiKey = async (...args: any[]) => { h.snapshots.push(args); return h.state.accounts[0]; };
+  await handler('handleApiKeyLogin', h.state)();
+  assert.equal(h.state.status, 'success', h.state.message);
+  assert.deepEqual(h.snapshots[0][13], { declared: 24000 });
+  assert.deepEqual(h.writes[0].modelContextWindows, {});
+  assert.equal(h.writes[0].modelCatalogDefinition.models[0].context_window, undefined);
+});
+
 for (const scheme of ['bearer', 'x-api-key', undefined] as const) {
   test(`quick switch persists the target authentication (${scheme ?? 'default'})`, async () => {
     const h = harness();
     Object.assign(h.state, {
       quickSwitchAccount: { ...h.state.accounts[0], api_auth_scheme: scheme === 'bearer' ? 'x-api-key' : 'bearer' },
-      selectedQuickSwitchProvider: { ...h.state.selectedManagedProvider, wireApi: 'anthropic', authScheme: scheme },
+      selectedQuickSwitchProvider: { ...h.state.selectedManagedProvider, wireApi: 'anthropic', authScheme: scheme,
+        modelCatalogDefinition: { models: [{ slug: 'declared', max_input_tokens: 24000, total_context_window: 40000 }] } },
       selectedQuickSwitchApiKey: h.state.selectedManagedProvider.apiKeys[0],
       setQuickSwitchSubmitting() {}, setQuickSwitchError(value: unknown) { h.state.error = value; },
       setQuickSwitchAccountId(value: unknown) { h.state.modalId = value; },
@@ -106,6 +134,7 @@ for (const scheme of ['bearer', 'x-api-key', undefined] as const) {
     await handler('handleSubmitQuickSwitch', h.state)();
     assert.equal(h.snapshots[0][10], 'anthropic');
     assert.equal(h.snapshots[0][15], scheme ?? 'x-api-key');
+    assert.deepEqual(h.snapshots[0][14], { declared: 24000 });
     assert.equal(h.state.modalId, null);
     assert.equal(h.state.error, null);
   });

@@ -215,6 +215,35 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(model["input_modalities"], ["text"])
         self.assertFalse(model["use_responses_lite"])
 
+    def test_declared_input_budget_is_exported_without_subtracting_output(self):
+        definition = api([{"slug": "served-model", "total_context_window": 393216,
+                           "max_input_tokens": 262144, "max_output_tokens": 131072}])
+        definition["model_catalog_definition"]["models"][0].pop("context_window")
+        model = json.loads(self.prepare(definition)[bundle.CATALOG_NAME])["models"][0]
+        self.assertEqual((model["context_window"], model["max_context_window"]), (262144, 262144))
+        self.assertEqual(model["auto_compact_token_limit"], 235929)
+        for field in ("total_context_window", "max_input_tokens", "max_output_tokens"):
+            self.assertNotIn(field, model)
+        self.assertEqual(definition["model_catalog_definition"]["models"][0]["total_context_window"], 393216)
+        prepared = self.prepare(definition)
+        for name, content in prepared.items():
+            (self.home / name).write_bytes(content)
+        self.effective = json.loads(prepared[bundle.CATALOG_NAME])
+        bundle.validate_api_bundle(self.home, definition, prepared)
+
+        override = definition["model_catalog_definition"]["models"][0]
+        override.update(context_window=200000, auto_compact_token_limit=180000)
+        manual = json.loads(self.prepare(definition)[bundle.CATALOG_NAME])["models"][0]
+        self.assertEqual(manual["context_window"], 200000)
+        self.assertEqual(manual["auto_compact_token_limit"], 180000)
+
+    def test_total_and_output_only_cannot_establish_an_input_budget(self):
+        definition = api([{"slug": "served-model", "total_context_window": 393216,
+                           "max_output_tokens": 131072}])
+        definition["model_catalog_definition"]["models"][0].pop("context_window")
+        with self.assertRaisesRegex(ValueError, "positive context_window"):
+            self.prepare(definition)
+
     def test_auto_rejects_incomplete_explicit_model_parameters(self):
         self.bundled = [{**TEMPLATE, "supported_in_api": True,
                          "visibility": "list", "shell_type": "shell_command",

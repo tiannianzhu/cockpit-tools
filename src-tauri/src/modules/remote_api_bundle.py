@@ -120,17 +120,27 @@ def _automatic_template(models: list) -> dict:
     return min(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
 
 
+def _input_window(override: dict):
+    # Explicit Codex overrides win; total/output capacity cannot establish input.
+    context = override.get("context_window")
+    return context if context is not None else override.get("max_input_tokens")
+
+
 def _validate_auto_overrides(overrides: list[dict]) -> None:
     """Require user-specified capabilities that cannot be inferred for auto models."""
     for override in overrides:
         if not isinstance(override, dict):
             raise ValueError("each model override must be an object")
-        context = override.get("context_window")
+        for field in ("total_context_window", "max_input_tokens", "max_output_tokens"):
+            value = override.get(field)
+            if value is not None and (type(value) is not int or not 0 < value <= 2**53 - 1):
+                raise ValueError(f"{field} must be a positive safe integer")
+        context = _input_window(override)
         levels = override.get("supported_reasoning_levels")
         default = override.get("default_reasoning_level")
         if type(context) is not int or context <= 0:
             raise ValueError(
-                "auto models require a positive context_window; configure model parameters in the provider"
+                "auto models require a positive context_window or max_input_tokens; configure the input limit in the provider"
             )
         if (
             not isinstance(levels, list) or not levels
@@ -164,10 +174,20 @@ def _models(template: dict, overrides: list[dict]) -> list[dict]:
         for key, value in override.items():
             if not isinstance(key, str) or not key:
                 raise ValueError("model override keys must be nonempty strings")
+            if key in ("total_context_window", "max_input_tokens", "max_output_tokens"):
+                continue  # Discovery metadata belongs to the provider, not Codex ModelInfo.
             if value is None:
                 model.pop(key, None)
             else:
                 model[key] = copy.deepcopy(value)
+        context = _input_window(override)
+        if override.get("context_window") is None and type(context) is int and context > 0:
+            model["context_window"] = context
+            if "max_context_window" not in override:
+                model["max_context_window"] = context
+            if "auto_compact_token_limit" not in override:
+                # Same 90% rule as codex_protocol::derived_auto_compact_token_limit.
+                model["auto_compact_token_limit"] = context * 90 // 100
         # Official migration targets do not apply to third-party model IDs,
         # including when an imported definition contains stale upgrade metadata.
         # Codex serializes a missing upgrade as null in its effective catalog.

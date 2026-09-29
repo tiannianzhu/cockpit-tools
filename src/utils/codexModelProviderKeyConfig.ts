@@ -1,8 +1,10 @@
 import type { CodexModelProvider } from "../services/codexModelProviderService";
+import type { CodexProviderCatalogDefinition } from "./codexProviderCatalogDefinition";
 
 /** Optional per-credential model settings. Missing fields inherit legacy provider defaults. */
 export interface CodexProviderModelConfig {
   modelCatalog?: string[];
+  modelCatalogDefinition?: CodexProviderCatalogDefinition | null;
   modelContextWindows?: Record<string, number>;
   supportsVision?: boolean;
   modelCapabilities?: Record<string, { supportsVision?: boolean }>;
@@ -12,6 +14,9 @@ export interface CodexProviderModelConfig {
 export function cloneCodexProviderModelConfig(config: CodexProviderModelConfig): CodexProviderModelConfig {
   return {
     ...(config.modelCatalog !== undefined ? { modelCatalog: [...config.modelCatalog] } : {}),
+    ...(config.modelCatalogDefinition !== undefined ? {
+      modelCatalogDefinition: config.modelCatalogDefinition ? structuredClone(config.modelCatalogDefinition) : null,
+    } : {}),
     ...(config.modelContextWindows !== undefined ? { modelContextWindows: { ...config.modelContextWindows } } : {}),
     ...(config.supportsVision !== undefined ? { supportsVision: config.supportsVision } : {}),
     ...(config.modelCapabilities !== undefined ? {
@@ -39,7 +44,12 @@ export function resolveCodexModelProviderForApiKey(
     : config.modelCapabilities ?? provider.modelCapabilities;
   const inheritedVisionModel = provider.visionRoutingModel && (!modelIds || modelIds.has(provider.visionRoutingModel.toLowerCase()))
     ? provider.visionRoutingModel : undefined;
+  // A key-specific catalog needs a corresponding saved definition; otherwise the
+  // provider definition could describe a different set of models.
+  const modelCatalogDefinition = config.modelCatalogDefinition !== undefined
+    ? config.modelCatalogDefinition ?? undefined
+    : modelIds ? undefined : provider.modelCatalogDefinition;
   // Empty arrays/maps and an explicit null routing model are preserved opt-outs.
-  return { ...provider, ...config, modelContextWindows: contexts, modelCapabilities: capabilities,
+  return { ...provider, ...config, modelCatalogDefinition, modelContextWindows: contexts, modelCapabilities: capabilities,
     visionRoutingModel: config.visionRoutingModel === null ? undefined : config.visionRoutingModel ?? inheritedVisionModel };
 }
