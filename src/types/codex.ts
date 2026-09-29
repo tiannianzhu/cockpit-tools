@@ -476,6 +476,8 @@ export interface CodexSessionLocation {
 }
 
 export interface CodexSessionRecord {
+  parentThreadId?: string | null;
+  archived?: boolean;
   sessionId: string;
   /** conversation | external | subagent */
   sessionKind?: string;
@@ -510,7 +512,6 @@ export interface CodexSessionUsageTotals {
 }
 
 export interface CodexSessionUsageBreakdownRow {
-  estimatedCostUsd?: number | null;
   key: string;
   label: string;
   inputTokens: number;
@@ -518,6 +519,7 @@ export interface CodexSessionUsageBreakdownRow {
   outputTokens: number;
   totalTokens: number;
   requestCount: number;
+  estimatedCostUsd?: number | null;
 }
 
 export interface CodexSessionUsageInstanceOption {
@@ -571,15 +573,12 @@ export interface CodexInstanceTargetThreadSyncSummary {
 }
 
 export interface CodexSessionTrashSummary {
+  failures?: string[];
   requestedSessionCount: number;
   trashedSessionCount: number;
   trashedInstanceCount: number;
   /** 运行中、删除后可能需要在客户端刷新才可见的实例数。 */
   runningInstanceCount?: number;
-  /** 官方删除未完成、已回退到文件方式删除的实例数。 */
-  officialDeleteFallbackInstanceCount?: number;
-  /** 官方侧边栏索引重建失败的实例数。 */
-  metadataRebuildFailedInstanceCount?: number;
   trashDirs: string[];
   message: string;
 }
@@ -590,6 +589,8 @@ export interface CodexTrashedSessionLocation {
 }
 
 export interface CodexTrashedSessionRecord {
+  parentThreadId?: string | null;
+  sessionKind?: string;
   sessionId: string;
   title: string;
   cwd: string;

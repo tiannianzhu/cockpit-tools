@@ -60,6 +60,8 @@ pub struct CodexSessionUsageBreakdownRow {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub request_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2016,6 +2018,7 @@ fn query_breakdown(
                 output_tokens: output,
                 total_tokens: input.saturating_add(output),
                 request_count: requests,
+                estimated_cost_usd: None,
             })
         })
         .map_err(|error| format!("遍历会话用量分组失败: {error}"))?;
@@ -2071,6 +2074,7 @@ fn query_day_breakdown(
             output_tokens: totals.output_tokens,
             total_tokens: totals.total_tokens,
             request_count: totals.request_count,
+            estimated_cost_usd: None,
         })
         .collect())
 }
@@ -2100,6 +2104,26 @@ mod tests {
 
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD_ID: &str = "00000000-0000-4000-8000-000000000002";
+
+    #[test]
+    fn breakdown_transport_preserves_optional_model_cost() {
+        let payload = json!({
+            "key": "fixture-model", "label": "Fixture model",
+            "inputTokens": 100, "cachedInputTokens": 80,
+            "outputTokens": 10, "totalTokens": 110, "requestCount": 1,
+        });
+        let mut row: CodexSessionUsageBreakdownRow =
+            serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(row.estimated_cost_usd, None);
+        assert_eq!(serde_json::to_value(&row).unwrap(), payload);
+
+        row.estimated_cost_usd = Some(0.125);
+        let priced = serde_json::to_value(&row).unwrap();
+        assert_eq!(priced["estimatedCostUsd"], 0.125);
+        assert_eq!(priced["totalTokens"], 110);
+        let restored: CodexSessionUsageBreakdownRow = serde_json::from_value(priced).unwrap();
+        assert_eq!(restored.estimated_cost_usd, Some(0.125));
+    }
 
     fn write_jsonl(path: &Path, values: &[JsonValue]) {
         if let Some(parent) = path.parent() {
