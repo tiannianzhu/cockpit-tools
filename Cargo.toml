@@ -5,7 +5,7 @@ members = [
     "crates/cockpit-cli",
 ]
 resolver = "2"
-exclude = ["vendor/tao"]
+exclude = ["vendor/tao", "crates/cockpit-session-usage"]
 
 [workspace.dependencies]
 # Common dependencies with shared versions
