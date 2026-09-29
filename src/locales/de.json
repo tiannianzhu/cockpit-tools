@@ -4271,7 +4271,29 @@
       "importConfigPlaceholder": "Nutze „Konfiguration kopieren“ auf der Anbieterkarte und füge den Inhalt hier ein",
       "importConfigAction": "Konfiguration importieren",
       "importConfigFromClipboard": "Zwischenablage lesen",
-      "settingsRestartHint": "Anbietereinstellungen aktualisiert. Starten Sie laufende Codex-Instanzen oder API-Dienste mit diesem Anbieter neu, um sie anzuwenden."
+      "settingsRestartHint": "Anbietereinstellungen aktualisiert. Starten Sie laufende Codex-Instanzen oder API-Dienste mit diesem Anbieter neu, um sie anzuwenden.",
+      "modelEditor": {
+        "add": "Modell hinzufügen",
+        "context": "Kontextfenster",
+        "defaultLevel": "Standardstufe",
+        "displayName": "Anzeigename",
+        "duplicate": "Modell-ID ist bereits vorhanden",
+        "empty": "Noch keine Modelle hinzugefügt.",
+        "fetch": "Modelle abrufen",
+        "fetching": "Wird abgerufen…",
+        "hint": "Legen Sie Kontext sowie Bild- und Reasoning-Funktionen pro Modell fest. Der vollständige Katalog wird beim Anwenden auf einen Remote-Host erstellt.",
+        "invalidId": "Modell-IDs dürfen keine Leer- oder Kommazeichen enthalten",
+        "modelId": "Modell-ID",
+        "modelIdPlaceholder": "Modell-ID eingeben",
+        "noUpstreamModels": "Der Anbieter hat keine verfügbaren Modelle zurückgegeben. Fügen Sie eine Modell-ID manuell hinzu.",
+        "reasoning": "Reasoning-Stufen",
+        "remove": "Modell entfernen",
+        "supportedLevels": "Unterstützte Stufen",
+        "title": "Modelle",
+        "unconfigured": "Nicht konfiguriert",
+        "unset": "Nicht festgelegt",
+        "vision": "Bildeingabe"
+      }
     },
     "quickSwitch": {
       "action": "Anbieter schnell wechseln",

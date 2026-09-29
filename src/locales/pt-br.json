@@ -4271,7 +4271,29 @@
       "importConfigPlaceholder": "Use Copiar configuração no cartão do provedor e cole o conteúdo aqui",
       "importConfigAction": "Importar configuração",
       "importConfigFromClipboard": "Ler área de transferência",
-      "settingsRestartHint": "Configurações do provedor atualizadas. Reinicie as instâncias do Codex ou o serviço de API em execução que usam este provedor para aplicá-las."
+      "settingsRestartHint": "Configurações do provedor atualizadas. Reinicie as instâncias do Codex ou o serviço de API em execução que usam este provedor para aplicá-las.",
+      "modelEditor": {
+        "add": "Adicionar modelo",
+        "context": "Janela de contexto",
+        "defaultLevel": "Nível padrão",
+        "displayName": "Nome de exibição",
+        "duplicate": "O ID do modelo já existe",
+        "empty": "Nenhum modelo adicionado ainda.",
+        "fetch": "Buscar modelos",
+        "fetching": "Buscando…",
+        "hint": "Defina contexto e recursos de imagem e raciocínio para cada modelo. O catálogo completo é gerado quando aplicado a um host remoto.",
+        "invalidId": "IDs de modelo não podem conter espaços ou vírgulas",
+        "modelId": "ID do modelo",
+        "modelIdPlaceholder": "Informe o ID do modelo",
+        "noUpstreamModels": "O provedor não retornou modelos disponíveis. Adicione um ID de modelo manualmente.",
+        "reasoning": "Níveis de raciocínio",
+        "remove": "Remover modelo",
+        "supportedLevels": "Níveis compatíveis",
+        "title": "Modelos",
+        "unconfigured": "Não configurado",
+        "unset": "Não definido",
+        "vision": "Entrada de imagem"
+      }
     },
     "quickSwitch": {
       "action": "Troca rápida de provedor",

@@ -4271,7 +4271,29 @@
       "importConfigPlaceholder": "Utilisez « Copier la configuration » sur la carte, puis collez le contenu ici",
       "importConfigAction": "Importer la configuration",
       "importConfigFromClipboard": "Lire le presse-papiers",
-      "settingsRestartHint": "Paramètres du fournisseur mis à jour. Redémarrez les instances Codex ou le service API utilisant ce fournisseur pour les appliquer."
+      "settingsRestartHint": "Paramètres du fournisseur mis à jour. Redémarrez les instances Codex ou le service API utilisant ce fournisseur pour les appliquer.",
+      "modelEditor": {
+        "add": "Ajouter un modèle",
+        "context": "Fenêtre de contexte",
+        "defaultLevel": "Niveau par défaut",
+        "displayName": "Nom d’affichage",
+        "duplicate": "Cet ID de modèle existe déjà",
+        "empty": "Aucun modèle ajouté pour le moment.",
+        "fetch": "Récupérer les modèles",
+        "fetching": "Récupération…",
+        "hint": "Définissez le contexte ainsi que les capacités d’image et de raisonnement de chaque modèle. Le catalogue complet est généré lors de son application à un hôte distant.",
+        "invalidId": "Les ID de modèle ne peuvent contenir d’espaces ni de virgules",
+        "modelId": "ID du modèle",
+        "modelIdPlaceholder": "Saisir l’ID du modèle",
+        "noUpstreamModels": "Le fournisseur n’a renvoyé aucun modèle disponible. Ajoutez un ID manuellement.",
+        "reasoning": "Niveaux de raisonnement",
+        "remove": "Supprimer le modèle",
+        "supportedLevels": "Niveaux pris en charge",
+        "title": "Modèles",
+        "unconfigured": "Non configuré",
+        "unset": "Non défini",
+        "vision": "Entrée d’image"
+      }
     },
     "quickSwitch": {
       "action": "Changer rapidement de fournisseur",

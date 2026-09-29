@@ -4271,7 +4271,29 @@
       "importConfigPlaceholder": "Dùng Sao chép cấu hình trên thẻ rồi dán nội dung vào đây",
       "importConfigAction": "Nhập cấu hình",
       "importConfigFromClipboard": "Đọc clipboard",
-      "settingsRestartHint": "Đã cập nhật cài đặt nhà cung cấp. Hãy khởi động lại phiên Codex hoặc dịch vụ API đang dùng nhà cung cấp này để áp dụng."
+      "settingsRestartHint": "Đã cập nhật cài đặt nhà cung cấp. Hãy khởi động lại phiên Codex hoặc dịch vụ API đang dùng nhà cung cấp này để áp dụng.",
+      "modelEditor": {
+        "add": "Thêm mô hình",
+        "context": "Cửa sổ ngữ cảnh",
+        "defaultLevel": "Mức mặc định",
+        "displayName": "Tên hiển thị",
+        "duplicate": "ID mô hình đã tồn tại",
+        "empty": "Chưa thêm mô hình nào.",
+        "fetch": "Lấy mô hình",
+        "fetching": "Đang lấy…",
+        "hint": "Đặt ngữ cảnh, khả năng xử lý hình ảnh và suy luận cho từng mô hình. Danh mục đầy đủ được tạo khi áp dụng cho máy chủ từ xa.",
+        "invalidId": "ID mô hình không được chứa khoảng trắng hoặc dấu phẩy",
+        "modelId": "ID mô hình",
+        "modelIdPlaceholder": "Nhập ID mô hình",
+        "noUpstreamModels": "Nhà cung cấp không trả về mô hình nào. Hãy thêm ID mô hình theo cách thủ công.",
+        "reasoning": "Mức suy luận",
+        "remove": "Xóa mô hình",
+        "supportedLevels": "Các mức được hỗ trợ",
+        "title": "Mô hình",
+        "unconfigured": "Chưa cấu hình",
+        "unset": "Chưa đặt",
+        "vision": "Đầu vào hình ảnh"
+      }
     },
     "quickSwitch": {
       "action": "Chuyển nhanh nhà cung cấp",

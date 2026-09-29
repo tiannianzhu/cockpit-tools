@@ -4271,7 +4271,29 @@
       "importConfigPlaceholder": "Použijte „Kopírovat konfiguraci“ na kartě a vložte obsah sem",
       "importConfigAction": "Importovat konfiguraci",
       "importConfigFromClipboard": "Číst schránku",
-      "settingsRestartHint": "Nastavení poskytovatele byla aktualizována. Použijete je restartováním běžící instance Codex nebo služby API, která tohoto poskytovatele používá."
+      "settingsRestartHint": "Nastavení poskytovatele byla aktualizována. Použijete je restartováním běžící instance Codex nebo služby API, která tohoto poskytovatele používá.",
+      "modelEditor": {
+        "add": "Přidat model",
+        "context": "Kontextové okno",
+        "defaultLevel": "Výchozí úroveň",
+        "displayName": "Zobrazovaný název",
+        "duplicate": "ID modelu již existuje",
+        "empty": "Zatím nebyly přidány žádné modely.",
+        "fetch": "Načíst modely",
+        "fetching": "Načítání…",
+        "hint": "Nastavte kontext, práci s obrázky a schopnosti uvažování pro každý model. Úplný katalog se vytvoří při použití na vzdáleném hostiteli.",
+        "invalidId": "ID modelů nesmí obsahovat mezery ani čárky",
+        "modelId": "ID modelu",
+        "modelIdPlaceholder": "Zadejte ID modelu",
+        "noUpstreamModels": "Poskytovatel nevrátil žádné dostupné modely. Přidejte ID modelu ručně.",
+        "reasoning": "Úrovně uvažování",
+        "remove": "Odebrat model",
+        "supportedLevels": "Podporované úrovně",
+        "title": "Modely",
+        "unconfigured": "Nenastaveno",
+        "unset": "Nenastaveno",
+        "vision": "Vstup obrázků"
+      }
     },
     "quickSwitch": {
       "action": "Rychle přepnout poskytovatele",

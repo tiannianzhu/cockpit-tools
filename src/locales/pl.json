@@ -4271,7 +4271,29 @@
       "importConfigPlaceholder": "Użyj „Kopiuj konfigurację” na karcie i wklej treść tutaj",
       "importConfigAction": "Importuj konfigurację",
       "importConfigFromClipboard": "Czytaj schowek",
-      "settingsRestartHint": "Zaktualizowano ustawienia dostawcy. Aby je zastosować, uruchom ponownie działające instancje Codex lub usługę API korzystającą z tego dostawcy."
+      "settingsRestartHint": "Zaktualizowano ustawienia dostawcy. Aby je zastosować, uruchom ponownie działające instancje Codex lub usługę API korzystającą z tego dostawcy.",
+      "modelEditor": {
+        "add": "Dodaj model",
+        "context": "Okno kontekstu",
+        "defaultLevel": "Poziom domyślny",
+        "displayName": "Nazwa wyświetlana",
+        "duplicate": "Identyfikator modelu już istnieje",
+        "empty": "Nie dodano jeszcze żadnych modeli.",
+        "fetch": "Pobierz modele",
+        "fetching": "Pobieranie…",
+        "hint": "Ustaw kontekst oraz obsługę obrazów i rozumowania dla każdego modelu. Pełny katalog jest generowany podczas stosowania konfiguracji do hosta zdalnego.",
+        "invalidId": "Identyfikatory modeli nie mogą zawierać spacji ani przecinków",
+        "modelId": "Identyfikator modelu",
+        "modelIdPlaceholder": "Wpisz identyfikator modelu",
+        "noUpstreamModels": "Dostawca nie zwrócił dostępnych modeli. Dodaj identyfikator modelu ręcznie.",
+        "reasoning": "Poziomy rozumowania",
+        "remove": "Usuń model",
+        "supportedLevels": "Obsługiwane poziomy",
+        "title": "Modele",
+        "unconfigured": "Nie skonfigurowano",
+        "unset": "Nie ustawiono",
+        "vision": "Wejście obrazu"
+      }
     },
     "quickSwitch": {
       "action": "Szybka zmiana dostawcy",
