@@ -3516,7 +3516,9 @@
       "updatedAt": "更新済み",
       "labels": {
         "sessionId": "セッション ID",
-        "tokenUsage": "Token 使用量"
+        "tokenUsage": "Token 使用量",
+        "sessionCostHint": "モデルと記録されたサービス階層の料金から米ドルで推計します。キャッシュ入力と長いコンテキストの料金を含み、過去の階層が不明な場合は標準料金を使用します。この会話のみを対象とし、子エージェントは別集計です。実際のサブスクリプションやプロバイダーの請求額ではありません。",
+        "sessionCostUnavailable": "費用を推計できません"
       },
       "locationRunning": "（実行中）",
       "untitled": "無題のセッション",

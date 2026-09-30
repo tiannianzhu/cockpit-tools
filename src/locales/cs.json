@@ -3516,7 +3516,9 @@
       "updatedAt": "Aktualizováno",
       "labels": {
         "sessionId": "ID relace",
-        "tokenUsage": "Využití tokenů"
+        "tokenUsage": "Využití tokenů",
+        "sessionCostHint": "Odhad v USD podle cen modelů a zaznamenaných úrovní služby, včetně cachovaného vstupu a dlouhého kontextu. Chybějící historické úrovně se odhadují jako Standard. Jen tato relace; subagenti jsou samostatní. Nejde o skutečnou fakturu za předplatné ani od poskytovatele.",
+        "sessionCostUnavailable": "Cena není dostupná"
       },
       "locationRunning": " (spuštěno)",
       "untitled": "Nepojmenovaná relace",

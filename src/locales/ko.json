@@ -3516,7 +3516,9 @@
       "updatedAt": "업데이트됨",
       "labels": {
         "sessionId": "세션 ID",
-        "tokenUsage": "토큰 사용량"
+        "tokenUsage": "토큰 사용량",
+        "sessionCostHint": "기록된 모델 및 서비스 등급 가격을 기준으로 한 USD 추정 비용입니다. 캐시 입력과 긴 컨텍스트 요금이 포함됩니다. 과거 등급 정보가 없으면 Standard로 추정합니다. 이 세션만 포함하며 하위 에이전트는 별도입니다. 실제 구독 또는 제공업체 청구 금액이 아닙니다.",
+        "sessionCostUnavailable": "비용을 사용할 수 없음"
       },
       "locationRunning": " (실행 중)",
       "untitled": "제목 없는 세션",

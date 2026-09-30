@@ -3516,7 +3516,9 @@
       "updatedAt": "Mis à jour",
       "labels": {
         "sessionId": "ID de session",
-        "tokenUsage": "Utilisation des tokens"
+        "tokenUsage": "Utilisation des tokens",
+        "sessionCostHint": "Estimation en USD selon les tarifs enregistrés du modèle et du niveau de service, avec entrée en cache et contexte long. Les niveaux historiques manquants sont estimés au tarif Standard. Cette session uniquement ; les sous-agents sont comptés à part. Ce n’est pas la facture réelle de l’abonnement ou du fournisseur.",
+        "sessionCostUnavailable": "Coût indisponible"
       },
       "locationRunning": " (en cours d’exécution)",
       "untitled": "Session sans titre",

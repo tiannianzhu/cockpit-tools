@@ -3694,7 +3694,9 @@
       "updatedAt": "Diperbarui",
       "labels": {
         "sessionId": "ID sesi",
-        "tokenUsage": "Penggunaan token"
+        "tokenUsage": "Penggunaan token",
+        "sessionCostHint": "Perkiraan USD berdasarkan harga model dan tingkat layanan yang tercatat, termasuk input cache dan tarif konteks panjang. Tingkat historis yang tidak tersedia memakai perkiraan Standar. Hanya sesi ini; agen anak dihitung terpisah. Bukan tagihan langganan atau penyedia sebenarnya.",
+        "sessionCostUnavailable": "Biaya tidak tersedia"
       },
       "locationRunning": " (berjalan)",
       "untitled": "Sesi tanpa judul",
