@@ -3356,6 +3356,8 @@
       "updatedAt": "最近更新",
       "labels": {
         "sessionId": "會話 ID",
+        "sessionCostHint": "按模型標準單價估算美元費用，包含快取輸入計價。僅本會話，不含子代理；不代表訂閱或服務商實際帳單。",
+        "sessionCostUnavailable": "費用未知",
         "tokenUsage": "Token 使用"
       },
       "locationRunning": "（執行中）",

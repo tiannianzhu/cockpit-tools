@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   formatSessionUsageCostUsd,
+  formatSessionCostEstimate,
   formatSessionUsageTokensShort,
   hasTrustedSessionUsageCache,
   resolveSessionUsageSummaryStatus,
@@ -42,4 +43,13 @@ test("shows scanning before the first sync and updating only with cache", () => 
   assert.equal(resolveSessionUsageSummaryStatus("ready", true), null);
   assert.equal(resolveSessionUsageSummaryStatus("failed", false), null);
   assert.equal(resolveSessionUsageSummaryStatus("scanning", true), null);
+});
+
+
+test("session estimates distinguish missing prices from zero", () => {
+  for (const value of [undefined, null, NaN, Infinity, -1]) {
+    assert.equal(formatSessionCostEstimate(value), null);
+  }
+  assert.equal(formatSessionCostEstimate(0), "≈$0.0000");
+  assert.equal(formatSessionCostEstimate(1.23456), "≈$1.2346");
 });

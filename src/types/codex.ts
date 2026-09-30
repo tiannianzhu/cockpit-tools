@@ -454,6 +454,9 @@ export interface CodexSessionSearchOptions {
 }
 
 export interface CodexSessionTokenStats {
+  /** Lifetime estimate for this session only, excluding child agents. */
+  estimatedCostUsd?: number | null;
+  byModel?: CodexSessionUsageBreakdownRow[];
   sessionId: string;
   inputTokens: number;
   outputTokens: number;

@@ -1912,10 +1912,18 @@ pub fn estimate_model_token_cost_usd(
     cached_input_tokens: u64,
     output_tokens: u64,
 ) -> f64 {
-    let Some(pricing) = resolve_base_model_pricing(None, model) else {
-        return 0.0;
-    };
-    calculate_usage_cost_usd_from_tokens(input_tokens, output_tokens, cached_input_tokens, &pricing)
+    try_estimate_model_token_cost_usd(model, input_tokens, cached_input_tokens, output_tokens)
+        .unwrap_or(0.0)
+}
+
+pub fn try_estimate_model_token_cost_usd(
+    model: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+) -> Option<f64> {
+    let pricing = resolve_base_model_pricing(None, model)?;
+    Some(calculate_usage_cost_usd_from_tokens(input_tokens, output_tokens, cached_input_tokens, &pricing))
 }
 
 fn calculate_usage_cost_usd_from_tokens(

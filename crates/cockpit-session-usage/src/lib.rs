@@ -111,13 +111,33 @@ pub struct CodexSessionUsageQuery {
     pub instance_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSessionTokenStats {
     pub session_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub by_model: Vec<CodexSessionUsageBreakdownRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+}
+
+impl CodexSessionTokenStats {
+    /// Price this session only; child sessions retain their own independent rows.
+    /// Missing models or prices must not be presented as a free session.
+    pub fn apply_cost(&mut self, mut price: impl FnMut(&str, u64, u64, u64) -> Option<f64>) {
+        self.estimated_cost_usd = if self.by_model.is_empty() {
+            None
+        } else {
+            self.by_model.iter().try_fold(0.0, |sum, row| {
+                let cost = price(&row.key, row.input_tokens, row.cached_input_tokens, row.output_tokens)?;
+                let total = sum + cost;
+                (cost.is_finite() && cost >= 0.0 && total.is_finite()).then_some(total)
+            })
+        };
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -563,20 +583,33 @@ impl SessionUsageStore {
 const TOKEN_STATS_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 fn query_session_tokens(conn: &Connection) -> Result<Vec<CodexSessionTokenStats>, String> {
-    let mut stmt = conn.prepare("SELECT session_id, SUM(input_tokens), SUM(output_tokens), SUM(input_tokens + output_tokens) FROM session_usage_events GROUP BY session_id ORDER BY session_id")
+    // Lifetime totals per session, independent of the summary's date filters.
+    let mut stmt = conn.prepare("SELECT session_id, model, SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens), COUNT(*) FROM session_usage_events GROUP BY session_id, model ORDER BY session_id, model")
         .map_err(|error| error.to_string())?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(CodexSessionTokenStats {
-                session_id: row.get(0)?,
-                input_tokens: row.get(1)?,
-                output_tokens: row.get(2)?,
-                total_tokens: row.get(3)?,
-            })
-        })
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+    let rows = stmt.query_map([], |row| {
+        let model: String = row.get(1)?;
+        let input = row.get::<_, i64>(2)?.max(0) as u64;
+        let cached = row.get::<_, i64>(3)?.max(0) as u64;
+        let output = row.get::<_, i64>(4)?.max(0) as u64;
+        Ok((row.get::<_, String>(0)?, CodexSessionUsageBreakdownRow {
+            key: model.clone(), label: model,
+            input_tokens: input, cached_input_tokens: cached, output_tokens: output,
+            total_tokens: input.saturating_add(output), request_count: row.get::<_, i64>(5)?.max(0) as u64,
+            estimated_cost_usd: None,
+        }))
+    }).map_err(|error| error.to_string())?;
+    let mut sessions = std::collections::BTreeMap::<String, CodexSessionTokenStats>::new();
+    for row in rows {
+        let (id, model) = row.map_err(|error| error.to_string())?;
+        let session = sessions.entry(id.clone()).or_insert_with(|| CodexSessionTokenStats {
+            session_id: id, ..Default::default()
+        });
+        session.input_tokens = session.input_tokens.saturating_add(model.input_tokens);
+        session.output_tokens = session.output_tokens.saturating_add(model.output_tokens);
+        session.total_tokens = session.total_tokens.saturating_add(model.total_tokens);
+        session.by_model.push(model);
+    }
+    Ok(sessions.into_values().collect())
 }
 
 pub fn read_token_stats_from_rollout_uncached(
@@ -2104,6 +2137,43 @@ mod tests {
 
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD_ID: &str = "00000000-0000-4000-8000-000000000002";
+
+    #[test]
+    fn session_cost_groups_models_and_keeps_child_usage_separate() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE session_usage_events (session_id TEXT, model TEXT,
+            input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER);
+            INSERT INTO session_usage_events VALUES
+            ('parent', 'model-a', 100, 80, 10), ('parent', 'model-a', 50, 20, 5),
+            ('parent', 'model-b', 200, 100, 20), ('child', 'model-a', 30, 10, 3);").unwrap();
+        let mut sessions = query_session_tokens(&conn).unwrap();
+        let price = |model: &str, input: u64, cached: u64, output: u64| {
+            let rate = match model { "model-a" => 2.0, "model-b" => 4.0, _ => return None };
+            Some((input - cached) as f64 * rate + cached as f64 * 0.5 + output as f64 * 10.0)
+        };
+        for session in &mut sessions { session.apply_cost(price); }
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "child");
+        assert_eq!(sessions[0].estimated_cost_usd, Some(75.0));
+        let parent = &mut sessions[1];
+        assert_eq!((parent.input_tokens, parent.output_tokens), (350, 35));
+        assert_eq!(parent.by_model.len(), 2);
+        assert_eq!(parent.estimated_cost_usd, Some(950.0));
+        parent.by_model[1].key = "unknown".into();
+        parent.apply_cost(price);
+        assert_eq!(parent.estimated_cost_usd, None);
+        parent.apply_cost(|_, _, _, _| Some(0.0));
+        assert_eq!(parent.estimated_cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn older_session_stats_do_not_claim_zero_cost() {
+        let mut stats: CodexSessionTokenStats = serde_json::from_value(json!({
+            "sessionId": "old", "inputTokens": 10, "outputTokens": 1, "totalTokens": 11
+        })).unwrap();
+        stats.apply_cost(|_, _, _, _| Some(0.0));
+        assert_eq!(stats.estimated_cost_usd, None);
+    }
 
     #[test]
     fn breakdown_transport_preserves_optional_model_cost() {

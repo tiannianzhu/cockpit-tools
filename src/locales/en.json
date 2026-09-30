@@ -4139,6 +4139,8 @@
       "updatedAt": "Updated",
       "labels": {
         "sessionId": "Session ID",
+        "sessionCostHint": "Estimated USD at standard model prices, including cached-input pricing. This session only; child agents are separate. Not the actual subscription or provider bill.",
+        "sessionCostUnavailable": "Cost unavailable",
         "tokenUsage": "Token Usage"
       },
       "locationRunning": " (running)",
