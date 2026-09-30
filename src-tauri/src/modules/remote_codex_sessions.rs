@@ -631,8 +631,13 @@ pub async fn sync_usage(
     rebuild: bool,
     query: crate::modules::codex_session_usage::CodexSessionUsageQuery,
 ) -> Result<crate::modules::codex_session_usage::CodexSessionUsageSyncResult, String> {
-    serde_json::from_value(usage_request(server_id, "sync", rebuild, &query).await?)
-        .map_err(|e| format!("Invalid remote usage result: {e}"))
+    let mut result: crate::modules::codex_session_usage::CodexSessionUsageSyncResult =
+        serde_json::from_value(usage_request(server_id, "sync", rebuild, &query).await?)
+            .map_err(|e| format!("Invalid remote usage result: {e}"))?;
+    if let Some(report) = result.report.as_mut() {
+        crate::modules::codex_session_usage::apply_report_cost(report);
+    }
+    Ok(result)
 }
 
 pub async fn list(server_id: &str) -> Result<RemoteCodexSessionList, String> {
