@@ -1,3 +1,4 @@
+import { CodexSessionUsageBadge } from './CodexSessionUsageBadge';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { confirm, open as chooseFile } from '@tauri-apps/plugin-dialog';
@@ -11,7 +12,7 @@ import { CodexSessionImportModal, type CodexSessionImportSource } from './CodexS
 import { CodexSessionTransfer, useCodexSessionTransfer } from './CodexSessionTransfer';
 import { CodexSessionToolbar } from './CodexSessionToolbar';
 import { CodexSessionTrashModal, type CodexSessionTrashSource } from './CodexSessionTrashModal';
-import { buildGroups, buildSessionTrees, formatTokenStats } from '../../utils/codexSessionPresentation';
+import { buildGroups, buildSessionTrees } from '../../utils/codexSessionPresentation';
 import { type CodexArchiveFilter, type CodexSessionKindFilter } from '../../utils/codexSessionFilters';
 import type { CodexSessionRecord, CodexSessionUsageReport } from '../../types/codex';
 import * as remote from '../../services/remoteCodexSessionService';
@@ -183,7 +184,7 @@ export function RemoteCodexSessionManager({ serverId, serverName }: { serverId: 
           renderActions={session => <>
             <CodexSessionRowActions sessionId={session.sessionId} disabled={busy} opening={openingId === session.sessionId}
               onOpenLocation={() => void openTarget(session.sessionId, true)} onOpenFile={() => void openTarget(session.sessionId, false)} onError={setError} />
-            {sessionTokens.has(session.sessionId) && <span className="codex-session-row__tokens">{formatTokenStats(sessionTokens.get(session.sessionId))}</span>}
+            <CodexSessionUsageBadge stats={sessionTokens.get(session.sessionId)} />
           </>} />}
     </>}
     <CodexSessionExportModal open={exportOpen} sessionIds={selected} source={exportSource}
