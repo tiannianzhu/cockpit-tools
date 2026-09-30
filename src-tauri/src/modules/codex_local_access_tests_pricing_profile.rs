@@ -1,5 +1,16 @@
 // Codex Local Access 测试：Pricing, profile takeover and local configuration behavior。
 // 测试与生产实现共享 super 作用域，验证真实网关、持久化和请求协议行为。
+    use super::{
+        calculate_usage_cost_usd_from_tokens, compute_effective_unit_prices,
+        default_model_pricing_presets, resolve_base_model_pricing, selected_model_pricing,
+        try_estimate_model_token_cost_usd_for_service_tier,
+        CODEX_LOCAL_ACCESS_LONG_CONTEXT_CACHE_MULTIPLIER,
+        CODEX_LOCAL_ACCESS_LONG_CONTEXT_INPUT_MULTIPLIER,
+        CODEX_LOCAL_ACCESS_LONG_CONTEXT_OUTPUT_MULTIPLIER,
+        CODEX_LOCAL_ACCESS_LONG_CONTEXT_THRESHOLD_TOKENS,
+        HISTORICAL_CODEX_MODEL_PRICE_BOOK,
+    };
+
     #[test]
     fn sidecar_auth_json_marks_personal_access_token_accounts() {
         let mut account = CodexAccount::new(
@@ -1107,7 +1118,10 @@
         assert_eq!(long.output_usd_per_million, 45.0);
         assert_eq!(long.cached_input_usd_per_million, Some(1.0));
 
-        // priority absolute rates then long multipliers (10*2 / 1*2 / 60*1.5)
+        // The selected rate uses this model's configured Fast prices, then
+        // applies the long-context multipliers.
+        let gpt_55_base = resolve_base_model_pricing(None, "gpt-5.5")
+            .expect("gpt-5.5 base pricing");
         let priority = resolve_effective_model_pricing(
             None,
             Some("gpt-5.5"),
@@ -1115,9 +1129,23 @@
             Some("priority"),
         )
         .expect("gpt-5.5 priority long pricing");
-        assert_eq!(priority.input_usd_per_million, 20.0);
-        assert_eq!(priority.output_usd_per_million, 90.0);
-        assert_eq!(priority.cached_input_usd_per_million, Some(2.0));
+        assert_eq!(
+            priority.input_usd_per_million,
+            gpt_55_base.priority_input_usd_per_million.unwrap()
+                * CODEX_LOCAL_ACCESS_LONG_CONTEXT_INPUT_MULTIPLIER
+        );
+        assert_eq!(
+            priority.output_usd_per_million,
+            gpt_55_base.priority_output_usd_per_million.unwrap()
+                * CODEX_LOCAL_ACCESS_LONG_CONTEXT_OUTPUT_MULTIPLIER
+        );
+        assert_eq!(
+            priority.cached_input_usd_per_million,
+            Some(
+                gpt_55_base.priority_cached_input_usd_per_million.unwrap()
+                    * CODEX_LOCAL_ACCESS_LONG_CONTEXT_CACHE_MULTIPLIER
+            )
+        );
 
         // non-5.4/5.5 models do not apply long-context multipliers
         let mini_long =
@@ -1241,6 +1269,193 @@
         assert_eq!(luna_priority_long.input_usd_per_million, 0.4);
         assert_eq!(luna_priority_long.output_usd_per_million, 1.5);
         assert_eq!(luna_priority_long.cached_input_usd_per_million, Some(0.04));
+    }
+
+    #[test]
+    fn estimates_session_cost_using_request_tier_and_context_size() {
+        let explicit_fast = model_pricing(
+            "fixture-model",
+            Some(CODEX_LOCAL_ACCESS_LONG_CONTEXT_THRESHOLD_TOKENS),
+            codex_price(2.0, 0.5, 8.0),
+            None,
+            Some(codex_price(3.0, 0.25, 10.0)),
+            None,
+        );
+        let short_context = UsageCapture {
+            input_tokens: CODEX_LOCAL_ACCESS_LONG_CONTEXT_THRESHOLD_TOKENS,
+            output_tokens: 0,
+            total_tokens: CODEX_LOCAL_ACCESS_LONG_CONTEXT_THRESHOLD_TOKENS,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+            token_breakdown: None,
+        };
+        let fast_price = compute_effective_unit_prices(
+            &explicit_fast,
+            "fixture-model",
+            Some(&short_context),
+            Some("fast"),
+        );
+        assert_eq!(fast_price.input_usd_per_million, 3.0);
+        assert_eq!(fast_price.cached_input_usd_per_million, 0.25);
+        assert_eq!(fast_price.output_usd_per_million, 10.0);
+        assert_ne!(fast_price.input_usd_per_million, explicit_fast.input_usd_per_million * 2.0);
+
+        let fallback_fast_price = compute_effective_unit_prices(
+            &model_pricing(
+                "fallback-fixture-model",
+                None,
+                codex_price(2.0, 0.5, 8.0),
+                None,
+                None,
+                None,
+            ),
+            "fallback-fixture-model",
+            Some(&short_context),
+            Some("priority"),
+        );
+        assert_eq!(fallback_fast_price.input_usd_per_million, 4.0);
+        assert_eq!(fallback_fast_price.cached_input_usd_per_million, 1.0);
+        assert_eq!(fallback_fast_price.output_usd_per_million, 16.0);
+
+        let fast_pricing = selected_model_pricing(&explicit_fast, fast_price);
+        let fixture_cost = calculate_usage_cost_usd_from_tokens(1_000, 500, 400, &fast_pricing);
+        assert!((fixture_cost - 0.0069).abs() < 1e-12);
+
+        // The request context controls the selected long-context unit rates.
+        let long_context = UsageCapture {
+            input_tokens: CODEX_LOCAL_ACCESS_LONG_CONTEXT_THRESHOLD_TOKENS + 1,
+            ..short_context.clone()
+        };
+        let long_fast_price = compute_effective_unit_prices(
+            &explicit_fast,
+            "fixture-model",
+            Some(&long_context),
+            Some("priority"),
+        );
+        assert_eq!(long_fast_price.input_usd_per_million, 6.0);
+        assert_eq!(long_fast_price.cached_input_usd_per_million, 0.5);
+        assert_eq!(long_fast_price.output_usd_per_million, 15.0);
+
+        // Public estimator checks stay relational to the configured price
+        // book so rate updates do not become frozen test values.
+        let configured_model = default_model_pricing_presets()
+            .into_iter()
+            .find(|pricing| pricing.long_context_threshold_tokens.is_some())
+            .expect("a configured long-context model");
+        let model = configured_model.model_id.as_str();
+        let standard = try_estimate_model_token_cost_usd_for_service_tier(
+            model,
+            None,
+            1,
+            100,
+            25,
+            20,
+        )
+        .expect("standard estimate");
+        assert_eq!(standard, calculate_usage_cost_usd_from_tokens(100, 20, 25, &configured_model));
+        for tier in [Some("standard"), Some(" default "), Some(""), Some(" \t ")] {
+            assert_eq!(
+                try_estimate_model_token_cost_usd_for_service_tier(model, tier, 1, 100, 25, 20),
+                Some(standard),
+            );
+        }
+
+        let fast = try_estimate_model_token_cost_usd_for_service_tier(
+            model,
+            Some("fast"),
+            1,
+            100,
+            25,
+            20,
+        )
+        .expect("fast estimate");
+        let priority = try_estimate_model_token_cost_usd_for_service_tier(
+            model,
+            Some(" PRIORITY "),
+            1,
+            100,
+            25,
+            20,
+        )
+        .expect("priority alias estimate");
+        assert_eq!(fast, priority);
+
+        let doubled_group = try_estimate_model_token_cost_usd_for_service_tier(
+            model,
+            Some("fast"),
+            1,
+            200,
+            50,
+            40,
+        )
+        .expect("doubled group estimate");
+        assert!((doubled_group - fast * 2.0).abs() < 1e-12);
+
+        // Identical grouped token counts change cost when the largest
+        // per-request prompt crosses the long-context boundary.
+        let threshold = configured_model.long_context_threshold_tokens.unwrap();
+        let short_request = try_estimate_model_token_cost_usd_for_service_tier(
+            model,
+            None,
+            threshold,
+            100,
+            25,
+            20,
+        )
+        .expect("boundary context estimate");
+        let long_request = try_estimate_model_token_cost_usd_for_service_tier(
+            model,
+            None,
+            threshold + 1,
+            100,
+            25,
+            20,
+        )
+        .expect("long-context estimate");
+        assert!(long_request > short_request);
+
+        assert!(try_estimate_model_token_cost_usd_for_service_tier(
+            "unknown-model-id",
+            None,
+            10,
+            100,
+            0,
+            20,
+        )
+        .is_none());
+        assert!(try_estimate_model_token_cost_usd_for_service_tier(
+            model,
+            Some("unrecognized-tier"),
+            10,
+            100,
+            0,
+            20,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn session_cost_requires_published_context_rates() {
+        let threshold = CODEX_LOCAL_ACCESS_LONG_CONTEXT_THRESHOLD_TOKENS;
+        let estimate = |model, tier, context| {
+            try_estimate_model_token_cost_usd_for_service_tier(
+                model, tier, context, 100, 25, 20,
+            )
+        };
+        let standard_long = estimate("gpt-5.4", None, threshold + 1)
+            .expect("published Standard long-context rate");
+        assert_eq!(estimate("gpt-5.4", Some("fast"), threshold + 1), Some(standard_long));
+        assert!(estimate("gpt-5.5", Some("priority"), threshold).is_some());
+        assert!(estimate("gpt-5.5", Some("fast"), threshold + 1).is_none());
+        assert!(estimate("gpt-5.5", None, threshold + 1).is_some());
+        let unsupported_fast = HISTORICAL_CODEX_MODEL_PRICE_BOOK.iter()
+            .find(|entry| entry.priority.is_none()).unwrap();
+        assert!(estimate(unsupported_fast.model_id, Some("fast"), 1).is_none());
+
+        let ultrafast = estimate("gpt-6-astra", Some("ultrafast"), threshold).unwrap();
+        assert!(ultrafast > estimate("gpt-6-astra", Some("fast"), threshold).unwrap());
+        assert!(estimate("gpt-6-astra", Some("ultrafast"), threshold + 1).unwrap() > ultrafast);
+        assert!(estimate("gpt-5.5", Some("ultrafast"), 1).is_none());
     }
 
     #[test]

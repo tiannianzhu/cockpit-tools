@@ -4269,6 +4269,8 @@
       "updatedAt": "Updated",
       "labels": {
         "sessionId": "Session ID",
+        "sessionCostHint": "Estimated USD at model and recorded service-tier prices, including cached input and long-context rates. Missing historical tiers use Standard estimates. This session only; child agents are separate. Not the actual subscription or provider bill.",
+        "sessionCostUnavailable": "Cost unavailable",
         "tokenUsage": "Token Usage"
       },
       "locationRunning": " (running)",
