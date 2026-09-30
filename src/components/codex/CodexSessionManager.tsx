@@ -1,3 +1,4 @@
+import { CodexSessionUsageBadge } from './CodexSessionUsageBadge';
 import { CodexSessionRowActions } from './CodexSessionRowActions';
 import { CodexSessionList } from './CodexSessionList';
 import { CodexSessionSearch } from './CodexSessionSearch';
@@ -6,7 +7,7 @@ import { CodexSessionExportModal, type CodexSessionExportSource } from './CodexS
 import { CodexSessionImportModal, type CodexSessionImportSource } from './CodexSessionImportModal';
 import { CodexSessionTransfer, useCodexSessionTransfer } from './CodexSessionTransfer';
 import { CodexSessionToolbar } from './CodexSessionToolbar';
-import { buildGroups, buildSessionTrees, formatTokenStats, type SessionGroup } from '../../utils/codexSessionPresentation';
+import { buildGroups, buildSessionTrees, type SessionGroup } from '../../utils/codexSessionPresentation';
 import { type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { confirm as confirmDialog, open as openFileDialog } from '@tauri-apps/plugin-dialog';
@@ -766,19 +767,13 @@ function LocalCodexSessionManager() {
         onToggleGroupSelection={toggleGroupSelection}
         onToggleSession={toggleSession}
         renderActions={(session) => {
-          const tokenText = formatTokenStats(tokenStatsBySessionId[session.sessionId]);
           return <>
             <CodexSessionRowActions sessionId={session.sessionId} disabled={openingSessionLocation}
               opening={openingSessionId === session.sessionId}
               onOpenLocation={event => handleOpenSessionLocation(event, session)}
               onOpenFile={event => handleOpenSessionRollout(event, session)}
               onError={text => setMessage({ text, tone: 'error' })} />
-            {tokenText ? (
-              <span className="codex-session-row__tokens" title={t('codex.sessionManager.labels.tokenUsage', 'Token使用')}>
-                {tokenText}
-              </span>
-            ) : null}
-
+            <CodexSessionUsageBadge stats={tokenStatsBySessionId[session.sessionId]} />
           </>;
         }}
       />

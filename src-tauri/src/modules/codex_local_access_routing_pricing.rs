@@ -1952,6 +1952,15 @@ pub fn estimate_model_token_cost_usd(
         .unwrap_or(0.0)
 }
 
+pub fn try_estimate_model_token_cost_usd(
+    model: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+) -> Option<f64> {
+    estimate_known_model_token_cost_usd(model, input_tokens, cached_input_tokens, output_tokens)
+}
+
 pub fn estimate_known_model_token_cost_usd(
     model: &str, input_tokens: u64, cached_input_tokens: u64, output_tokens: u64,
 ) -> Option<f64> {
