@@ -48,6 +48,13 @@ export function formatSessionUsageCostUsd(value: number | null | undefined): str
   return `$${value.toFixed(4)}`;
 }
 
+/** Unknown pricing is different from a genuinely zero-cost session. */
+export function formatSessionCostEstimate(value: number | null | undefined): string | null {
+  return value != null && Number.isFinite(value) && value >= 0
+    ? `≈${formatSessionUsageCostUsd(value)}`
+    : null;
+}
+
 export const SESSION_USAGE_SUMMARY_PENDING = "—";
 
 export type SessionUsageSummaryLoadState =
