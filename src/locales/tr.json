@@ -3568,7 +3568,9 @@
       "updatedAt": "Güncellendi",
       "labels": {
         "sessionId": "Oturum kimliği",
-        "tokenUsage": "Token kullanımı"
+        "tokenUsage": "Token kullanımı",
+        "sessionCostHint": "Model ve kaydedilen hizmet katmanı fiyatlarına göre, önbelleğe alınan girdi ve uzun bağlam ücretleri dahil, tahmini USD tutarı. Geçmişteki eksik katmanlar Standard tahminlerini kullanır. Yalnızca bu oturum; alt ajanlar ayrıdır. Gerçek abonelik veya sağlayıcı faturası değildir.",
+        "sessionCostUnavailable": "Maliyet kullanılamıyor"
       },
       "locationRunning": " (çalışıyor)",
       "untitled": "Adsız oturum",

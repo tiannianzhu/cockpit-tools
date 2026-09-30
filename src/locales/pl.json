@@ -3568,7 +3568,9 @@
       "updatedAt": "Zaktualizowano",
       "labels": {
         "sessionId": "ID sesji",
-        "tokenUsage": "Zużycie tokenów"
+        "tokenUsage": "Zużycie tokenów",
+        "sessionCostHint": "Szacunkowa kwota w USD według zapisanych cen modelu i poziomu usługi, w tym buforowanego wejścia i stawek za długi kontekst. Dla brakujących historycznych poziomów użyto szacunków Standard. Dotyczy tylko tej sesji; agenci podrzędni są osobno. To nie jest rzeczywisty rachunek za subskrypcję ani od dostawcy.",
+        "sessionCostUnavailable": "Koszt niedostępny"
       },
       "locationRunning": " (uruchomiona)",
       "untitled": "Sesja bez tytułu",

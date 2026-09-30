@@ -3568,7 +3568,9 @@
       "updatedAt": "Đã cập nhật",
       "labels": {
         "sessionId": "ID phiên",
-        "tokenUsage": "Mức dùng token"
+        "tokenUsage": "Mức dùng token",
+        "sessionCostHint": "Ước tính USD theo giá mô hình và cấp dịch vụ đã ghi nhận, bao gồm đầu vào được lưu trong bộ nhớ đệm và giá cho ngữ cảnh dài. Cấp dịch vụ lịch sử bị thiếu được ước tính theo Standard. Chỉ phiên này; các tác tử con được tính riêng. Đây không phải hóa đơn thực tế của gói thuê bao hoặc nhà cung cấp.",
+        "sessionCostUnavailable": "Không có thông tin chi phí"
       },
       "locationRunning": " (đang chạy)",
       "untitled": "Phiên chưa đặt tên",

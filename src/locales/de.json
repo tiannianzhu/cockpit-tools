@@ -3568,7 +3568,9 @@
       "updatedAt": "Aktualisiert",
       "labels": {
         "sessionId": "Sitzungs-ID",
-        "tokenUsage": "Token-Nutzung"
+        "tokenUsage": "Token-Nutzung",
+        "sessionCostHint": "Geschätzte USD-Kosten anhand der Modell- und aufgezeichneten Service-Level-Preise, einschließlich zwischengespeicherter Eingaben und langem Kontext. Fehlende historische Stufen werden mit Standard geschätzt. Nur diese Sitzung; Unteragenten werden separat berechnet. Keine tatsächliche Abrechnung des Abos oder Anbieters.",
+        "sessionCostUnavailable": "Kosten nicht verfügbar"
       },
       "locationRunning": " (wird ausgeführt)",
       "untitled": "Unbenannte Sitzung",
