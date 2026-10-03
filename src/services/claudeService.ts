@@ -27,6 +27,8 @@ export interface ClaudeCliLaunchInfo {
   accountEmail: string;
   workingDir: string;
   launchCommand: string;
+  configPath: string;
+  syncWarning?: string | null;
 }
 
 function normalizeClaudeDesktopLoginStartResponse(

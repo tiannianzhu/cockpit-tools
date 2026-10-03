@@ -453,6 +453,7 @@ fn import_desktop_profile_snapshot(
         api_key_field: None,
         api_model_catalog: None,
         api_extra_env: None,
+        claude_code_model_settings: None,
         desktop_gateway_auth_scheme: None,
         desktop_gateway_credential_kind: None,
         desktop_gateway_config_id: None,
@@ -968,7 +969,22 @@ fn parse_import_item(value: &Value) -> Result<ClaudeAccount, String> {
                         })
                         .collect::<BTreeMap<_, _>>()
                 });
-            return import_api_key(
+            let imported_model_settings = value
+                .get("claude_code_model_settings")
+                .or_else(|| value.get("claudeCodeModelSettings"))
+                .filter(|profile| !profile.is_null())
+                .map(|profile| {
+                    let mut filtered = json!({});
+                    crate::modules::claude_code_config::apply_model_settings(
+                        &mut filtered,
+                        profile,
+                    )?;
+                    Ok::<_, String>(crate::modules::claude_code_config::model_settings(
+                        &filtered,
+                    ))
+                })
+                .transpose()?;
+            let mut account = import_api_key(
                 api_key,
                 account_name,
                 ClaudeApiKeyProviderConfig {
@@ -1017,7 +1033,12 @@ fn parse_import_item(value: &Value) -> Result<ClaudeAccount, String> {
                     api_model_catalog,
                     api_extra_env,
                 },
-            );
+            )?;
+            if let Some(profile) = imported_model_settings {
+                account.claude_code_model_settings = Some(profile);
+                account = save_account_and_index(account)?;
+            }
+            return Ok(account);
         }
     }
 
@@ -2831,6 +2852,7 @@ fn managed_env_keys_for_settings(settings_path: &Path) -> BTreeSet<String> {
 
 fn clear_api_key_env_from_claude_code_settings(config_dir: &Path) -> Result<(), String> {
     let settings_path = get_claude_code_settings_path(config_dir);
+    capture_outgoing_code_account(&settings_path, None)?;
     let recorded_keys = read_settings_managed_env_keys();
     let has_recorded_keys = recorded_keys.contains_key(&managed_env_store_key(&settings_path));
     if !settings_path.exists() {
@@ -2845,10 +2867,9 @@ fn clear_api_key_env_from_claude_code_settings(config_dir: &Path) -> Result<(), 
         return Ok(());
     }
 
-    let mut settings = read_config_file(&settings_path)?.unwrap_or_else(|| json!({}));
-    if !settings.is_object() {
-        settings = json!({});
-    }
+    let snapshot = crate::modules::claude_code_config::read_settings_at(&settings_path)?;
+    let mut settings: Value = serde_json::from_str(&snapshot.content)
+        .map_err(|_| "Claude settings.json 结构非法".to_string())?;
 
     if let Some(env_object) = settings
         .get_mut("env")
@@ -2859,7 +2880,14 @@ fn clear_api_key_env_from_claude_code_settings(config_dir: &Path) -> Result<(), 
         }
     }
 
-    write_config_file(&settings_path, &settings)?;
+    crate::modules::claude_code_config::apply_model_settings(&mut settings, &json!({}))?;
+    let content = serde_json::to_string_pretty(&settings)
+        .map_err(|_| "序列化 Claude settings.json 失败".to_string())?;
+    crate::modules::claude_code_config::save_settings_at(
+        &settings_path,
+        &content,
+        &snapshot.revision,
+    )?;
     record_settings_managed_env_keys(&settings_path, BTreeSet::new())
 }
 
@@ -2909,34 +2937,27 @@ fn inject_api_key_to_claude_code_settings(
 ) -> Result<(), String> {
     let config_dir = get_effective_claude_code_config_dir(config_dir)?;
     let settings_path = get_claude_code_settings_path(&config_dir);
-    let env = build_api_key_cli_env_map(account)?;
-    let managed_keys = env.keys().cloned().collect::<BTreeSet<_>>();
+    capture_outgoing_code_account(&settings_path, Some(&account.id))?;
 
     fs::create_dir_all(&config_dir).map_err(|e| format!("创建 Claude Code 配置目录失败: {}", e))?;
-    let mut settings = read_config_file(&settings_path)?.unwrap_or_else(|| json!({}));
-    if !settings.is_object() {
-        settings = json!({});
-    }
+    let snapshot = crate::modules::claude_code_config::read_settings_at(&settings_path)?;
+    let mut settings: Value = serde_json::from_str(&snapshot.content)
+        .map_err(|_| "Claude settings.json 结构非法".to_string())?;
 
     let keys_to_clear = managed_env_keys_for_settings(&settings_path);
-    let object = settings
-        .as_object_mut()
-        .ok_or_else(|| "Claude settings.json 结构非法".to_string())?;
-    let env_value = object.entry("env".to_string()).or_insert_with(|| json!({}));
-    if !env_value.is_object() {
-        *env_value = json!({});
-    }
-    let env_object = env_value
-        .as_object_mut()
-        .ok_or_else(|| "Claude settings.json env 结构非法".to_string())?;
-    for key in keys_to_clear {
-        env_object.remove(&key);
-    }
-    for (key, value) in env {
-        env_object.insert(key, Value::String(value));
-    }
+    let managed_keys = crate::modules::claude_code_config::apply_api_account_settings(
+        &mut settings,
+        account,
+        &keys_to_clear,
+    )?;
 
-    write_config_file(&settings_path, &settings)?;
+    let content = serde_json::to_string_pretty(&settings)
+        .map_err(|_| "序列化 Claude settings.json 失败".to_string())?;
+    crate::modules::claude_code_config::save_settings_at(
+        &settings_path,
+        &content,
+        &snapshot.revision,
+    )?;
     record_settings_managed_env_keys(&settings_path, managed_keys)
 }
 
