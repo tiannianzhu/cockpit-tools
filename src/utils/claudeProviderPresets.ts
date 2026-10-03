@@ -5,6 +5,7 @@ import {
   APIKEY_FUN_REGISTER_URL,
   APIKEY_FUN_SOURCE_TAG,
 } from './apikeyFunLinks';
+import { CMPDC_API_BASE_URL, CMPDC_API_PROVIDER } from './cmpdcProvider';
 
 export type ClaudeApiKeyField = 'ANTHROPIC_AUTH_TOKEN' | 'ANTHROPIC_API_KEY';
 
@@ -551,6 +552,11 @@ const CC_SWITCH_DIRECT_CLAUDE_PROVIDER_PRESETS: readonly ClaudeApiProviderPreset
 ];
 
 export const CLAUDE_API_PROVIDER_PRESETS: readonly ClaudeApiProviderPreset[] = [
+  {
+    ...CMPDC_API_PROVIDER,
+    baseUrls: [CMPDC_API_BASE_URL],
+    apiKeyField: 'ANTHROPIC_AUTH_TOKEN',
+  },
   {
     id: CLAUDE_APIKEY_FUN_PROVIDER_ID,
     name: 'APIKEY.FUN',
