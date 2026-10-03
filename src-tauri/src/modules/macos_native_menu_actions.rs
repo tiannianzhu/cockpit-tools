@@ -408,7 +408,7 @@ fn spawn_switch_account(platform: PlatformId, account_id: String) {
                     .map(|_| ())
             }
             PlatformId::Claude => {
-                commands::claude::switch_claude_account(app, account_id).map(|_| ())
+                commands::claude::switch_claude_account(app, account_id).await.map(|_| ())
             }
             PlatformId::GitHubCopilot => {
                 commands::github_copilot::inject_github_copilot_to_vscode(app, account_id)

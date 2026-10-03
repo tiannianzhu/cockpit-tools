@@ -109,6 +109,23 @@ fn claude_desktop_gateway_models_url(base_url: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
+fn parse_desktop_gateway_context_window(item: &Value) -> Option<u64> {
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+    [
+        item.pointer("/info/meta/context_length"),
+        item.get("context_window"),
+        item.get("context_length"),
+        item.get("contextWindow"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        value
+            .as_u64()
+            .filter(|context_window| *context_window > 0 && *context_window <= MAX_SAFE_INTEGER)
+    })
+}
+
 fn parse_desktop_gateway_models(body: &Value) -> Vec<ClaudeDesktopGatewayModel> {
     let mut seen = BTreeSet::new();
     body.get("data")
@@ -130,10 +147,13 @@ fn parse_desktop_gateway_models(body: &Value) -> Vec<ClaudeDesktopGatewayModel> 
                         display_name: item
                             .get("display_name")
                             .or_else(|| item.get("displayName"))
+                            .or_else(|| item.get("name"))
+                            .or_else(|| item.pointer("/info/name"))
                             .and_then(Value::as_str)
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
                             .map(str::to_string),
+                        context_window: parse_desktop_gateway_context_window(item),
                     })
                 })
                 .collect()
@@ -152,7 +172,11 @@ async fn list_desktop_gateway_models_with_scheme(
         .build()
         .map_err(|e| format!("CREATE_HTTP_CLIENT_FAILED: {}", e))?;
     let started = Instant::now();
-    let mut request = client.get(&url).header(ACCEPT, "application/json");
+    let mut request = client
+        .get(&url)
+        .query(&[("limit", 1000)])
+        .header(ACCEPT, "application/json")
+        .header("anthropic-version", "2023-06-01");
     if auth_scheme == "x-api-key" {
         request = request.header("x-api-key", api_key);
     } else {
@@ -500,6 +524,7 @@ fn derive_account_from_snapshots(
         api_key_field: None,
         api_model_catalog: None,
         api_extra_env: None,
+        claude_code_model_settings: None,
         desktop_gateway_auth_scheme: None,
         desktop_gateway_credential_kind: None,
         desktop_gateway_config_id: None,
@@ -603,11 +628,30 @@ pub fn import_api_key(
         normalize_non_empty(provider_config.api_provider_api_key_url.as_deref());
     let api_model_catalog = normalize_model_catalog(provider_config.api_model_catalog);
     let api_extra_env = normalize_api_extra_env(provider_config.api_extra_env);
-    let id = build_api_key_account_id(&api_key, api_base_url.as_deref());
+    let identity = build_api_key_account_id(&api_key, api_base_url.as_deref());
+    // Gear edits preserve account IDs even when credentials change. Re-import by credentials,
+    // and do not reuse a former hash ID that now belongs to another credential pair.
+    let existing = list_accounts_checked()?.into_iter().find(|account| {
+        account.auth_mode == ClaudeAuthMode::ApiKey
+            && build_api_key_account_id(
+                account.api_key.as_deref().unwrap_or_default(),
+                account.api_base_url.as_deref(),
+            ) == identity
+    });
+    let id = existing
+        .as_ref()
+        .map(|account| account.id.clone())
+        .unwrap_or_else(|| {
+            if load_account_file(&identity).is_some() {
+                format!("{}_{}", identity, uuid::Uuid::new_v4())
+            } else {
+                identity
+            }
+        });
     let display_name =
         build_api_key_display_name(&api_key, account_name, api_provider_name.as_deref());
     let now = now_ts_ms();
-    let mut account = load_account_file(&id).unwrap_or_else(|| ClaudeAccount {
+    let mut account = existing.unwrap_or_else(|| ClaudeAccount {
         id: id.clone(),
         email: display_name.clone(),
         auth_mode: ClaudeAuthMode::ApiKey,
@@ -632,6 +676,7 @@ pub fn import_api_key(
         api_key_field: None,
         api_model_catalog: None,
         api_extra_env: None,
+        claude_code_model_settings: None,
         desktop_gateway_auth_scheme: None,
         desktop_gateway_credential_kind: None,
         desktop_gateway_config_id: None,
@@ -926,6 +971,7 @@ fn save_desktop_gateway(
         api_key_field: None,
         api_model_catalog: None,
         api_extra_env: None,
+        claude_code_model_settings: None,
         desktop_gateway_auth_scheme: None,
         desktop_gateway_credential_kind: None,
         desktop_gateway_config_id: None,
@@ -1003,4 +1049,3 @@ fn save_desktop_gateway(
     account.last_used = now;
     save_account_and_index(account)
 }
-

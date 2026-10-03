@@ -1,0 +1,156 @@
+.claude-code-config-modal .claude-code-config-path {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.claude-code-config-path code {
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.claude-code-config-modal .modal-body > .claude-code-config-path {
+  margin-bottom: 0;
+}
+
+.claude-code-config-modal .claude-code-config-path .icon-only {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+}
+
+.claude-code-config-modal .oauth-url-box.claude-secret-input {
+  flex-direction: row;
+}
+
+.claude-code-config-modal .claude-secret-input .codex-secret-toggle-btn {
+  height: 40px;
+  flex-shrink: 0;
+}
+
+.claude-code-config-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.claude-code-config-modal .form-group { margin-bottom: 0; }
+
+.claude-code-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.claude-code-config-models { display: flex; flex-direction: column; gap: 8px; }
+.claude-code-config-models .btn { flex-shrink: 0; }
+
+.claude-code-config-model-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.claude-code-config-model-input .form-input { min-width: 0; flex: 1; }
+.claude-code-config-model-input .claude-code-config-model-picker { width: 40px; flex-shrink: 0; }
+.claude-code-config-model-picker .single-select-dropdown-trigger { min-height: 42px; padding: 0; justify-content: center; }
+.claude-code-config-model-picker .single-select-dropdown-value { display: none; }
+.claude-code-config-model-menu .single-select-dropdown-item { padding: 8px 12px; }
+.claude-code-config-model-menu .single-select-dropdown-item-label { white-space: normal; overflow-wrap: anywhere; }
+.claude-code-config-modal .form-error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: color-mix(in srgb, var(--danger) 70%, var(--text-primary));
+}
+
+.claude-code-config-modal .claude-code-config-json {
+  min-height: 220px;
+  font-family: var(--font-mono);
+  resize: vertical;
+}
+
+.claude-code-config-modal .form-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.claude-code-config-remote {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.claude-code-config-remote .claude-code-config-path { width: 100%; margin-bottom: 0; }
+
+.claude-code-config-hosts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+
+.claude-code-config-modal .claude-code-config-host {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.claude-code-config-host:has(input:checked) {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 8%, var(--bg-card));
+}
+
+.claude-code-config-host:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
+.claude-code-config-host:has(input:focus-visible) { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+.claude-code-config-host-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.claude-code-config-host input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  flex-shrink: 0;
+  accent-color: var(--primary);
+  cursor: inherit;
+}
+
+.claude-code-config-host input[type="checkbox"]:focus { box-shadow: none; }
+
+.claude-code-config-host span {
+  overflow-wrap: anywhere;
+}
+
+@media (min-width: 721px) {
+  .claude-code-config-modal .claude-gateway-auth-segmented { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 560px) {
+  .claude-code-config-grid,
+  .claude-code-config-hosts { grid-template-columns: minmax(0, 1fr); }
+}
