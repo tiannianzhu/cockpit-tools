@@ -412,6 +412,7 @@ interface ProviderFormState {
 }
 
 interface EditingApiKeyState {
+  mode: "credentials" | "rename";
   providerId: string;
   apiKeyId: string;
   originalApiKey: string;
@@ -2559,7 +2560,7 @@ export function useCodexModelProviderManagerController({
   );
 
   const handleSaveApiKeyEdit = useCallback(async () => {
-    if (!editingApiKey || saving) return;
+    if (!editingApiKey || editingApiKey.mode !== "credentials" || saving) return;
     const provider = providers.find((item) => item.id === editingApiKey.providerId);
     if (!provider) return;
 
@@ -2657,12 +2658,31 @@ export function useCodexModelProviderManagerController({
   }, [accounts, editingApiKey, providers, reloadProviders, saving, t]);
 
   const handleRenameApiKey = useCallback(
-    async (provider: CodexModelProvider, apiKey: CodexModelProviderApiKey) => {
-      const next = window.prompt(
-        t("codex.modelProviders.renameApiKeyPrompt", "重命名 API Key"),
-        apiKey.name || "",
-      );
-      if (next === null) return;
+    (provider: CodexModelProvider, apiKey: CodexModelProviderApiKey) => {
+      if (saving) return;
+      setFormError(null);
+      setNotice(null);
+      setEditingApiKey({
+        mode: "rename",
+        providerId: provider.id,
+        apiKeyId: apiKey.id,
+        originalApiKey: apiKey.apiKey,
+        apiKey: apiKey.apiKey,
+        name: apiKey.name,
+      });
+    },
+    [saving],
+  );
+
+  const handleSaveApiKeyRename = useCallback(
+    async () => {
+      if (!editingApiKey || editingApiKey.mode !== "rename" || saving) return;
+      const provider = providers.find((item) => item.id === editingApiKey.providerId);
+      const apiKey = provider?.apiKeys.find((item) => item.id === editingApiKey.apiKeyId);
+      if (!provider || !apiKey) return;
+      const next = editingApiKey.name.trim();
+      setFormError(null);
+      setSaving(true);
       try {
         const previousName = apiKey.name;
         await renameApiKeyOnCodexModelProvider(provider.id, apiKey.id, next);
@@ -2695,21 +2715,23 @@ export function useCodexModelProviderManagerController({
           });
         }
         await reloadProviders();
+        setEditingApiKey(null);
         setNotice({
           tone: "success",
           text: t("codex.modelProviders.renameApiKeySuccess", "API Key 已重命名"),
         });
       } catch (err) {
-        setNotice({
-          tone: "error",
-          text: t("codex.modelProviders.renameApiKeyFailed", {
+        setFormError(
+          t("codex.modelProviders.renameApiKeyFailed", {
             defaultValue: "重命名 API Key 失败：{{error}}",
             error: parseServiceError(err),
           }),
-        });
+        );
+      } finally {
+        setSaving(false);
       }
     },
-    [accounts, parseServiceError, reloadProviders, t],
+    [accounts, editingApiKey, parseServiceError, providers, reloadProviders, saving, t],
   );
 
   const handleBatchDeleteProviders = useCallback(async () => {
@@ -3703,6 +3725,7 @@ export function useCodexModelProviderManagerController({
     handleProviderSortByChange,
     handleRenameApiKey,
     handleSaveApiKeyEdit,
+    handleSaveApiKeyRename,
     handleSaveProvider,
     patchModelDefinition,
     fetchProviderModels,
