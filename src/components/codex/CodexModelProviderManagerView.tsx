@@ -83,6 +83,7 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
     handleProviderSortByChange,
     handleRenameApiKey,
     handleSaveApiKeyEdit,
+    handleSaveApiKeyRename,
     handleSaveProvider,
     patchModelDefinition,
     fetchProviderModels,
@@ -2126,14 +2127,32 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
                           const isEditing = editingApiKey?.apiKeyId === item.id;
                           if (isEditing && editingApiKey) {
                             return (
-                              <div
+                              <form
                                 className="codex-provider-key-row is-editing"
                                 key={item.id}
+                                onSubmit={(event) => {
+                                  event.preventDefault();
+                                  void (editingApiKey.mode === "rename"
+                                    ? handleSaveApiKeyRename()
+                                    : handleSaveApiKeyEdit());
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Escape") {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    if (!saving) setEditingApiKey(null);
+                                  }
+                                }}
                               >
                                 <div className="codex-provider-key-edit-fields">
                                   <input
                                     className="form-input"
                                     type="text"
+                                    autoFocus
+                                    aria-label={t(
+                                      "codex.modelProviders.renameApiKeyPrompt",
+                                      "重命名 API Key",
+                                    )}
                                     value={editingApiKey.name}
                                     onChange={(event) =>
                                       setEditingApiKey((current) =>
@@ -2148,30 +2167,31 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
                                     )}
                                     disabled={saving}
                                   />
-                                  <input
-                                    className="form-input"
-                                    type="password"
-                                    value={editingApiKey.apiKey}
-                                    onChange={(event) =>
-                                      setEditingApiKey((current) =>
-                                        current
-                                          ? { ...current, apiKey: event.target.value }
-                                          : current,
-                                      )
-                                    }
-                                    placeholder={t(
-                                      "codex.modelProviders.fields.apiKey",
-                                      "API Key",
-                                    )}
-                                    autoComplete="off"
-                                    disabled={saving}
-                                  />
+                                  {editingApiKey.mode === "credentials" && (
+                                    <input
+                                      className="form-input"
+                                      type="password"
+                                      value={editingApiKey.apiKey}
+                                      onChange={(event) =>
+                                        setEditingApiKey((current) =>
+                                          current
+                                            ? { ...current, apiKey: event.target.value }
+                                            : current,
+                                        )
+                                      }
+                                      placeholder={t(
+                                        "codex.modelProviders.fields.apiKey",
+                                        "API Key",
+                                      )}
+                                      autoComplete="off"
+                                      disabled={saving}
+                                    />
+                                  )}
                                 </div>
                                 <div className="codex-provider-key-edit-actions">
                                   <button
-                                    type="button"
+                                    type="submit"
                                     className="action-btn success"
-                                    onClick={() => void handleSaveApiKeyEdit()}
                                     disabled={saving}
                                     title={t("common.save", "Save")}
                                   >
@@ -2187,7 +2207,7 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
                                     <X size={12} />
                                   </button>
                                 </div>
-                              </div>
+                              </form>
                             );
                           }
                           return (
@@ -2207,6 +2227,7 @@ export function CodexModelProviderManagerView(props: CodexModelProviderManagerVi
                             className="action-btn"
                             onClick={() =>
                               setEditingApiKey({
+                                mode: "credentials",
                                 providerId: currentEditingProvider.id,
                                 apiKeyId: item.id,
                                 originalApiKey: item.apiKey,
