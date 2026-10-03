@@ -36,6 +36,7 @@ function render(wireApi: string, selectedPresetId = 'custom') {
 test('the shared editor selects the full Responses catalog and retains Anthropic controls', () => {
   const responses = render('responses');
   assert.match(responses, /data-testid="full-catalog"/);
+  assert.match(responses, />CMPDC<\/span>/);
   assert.doesNotMatch(responses, /data-testid="anthropic"/);
   const anthropic = render('anthropic');
   assert.match(anthropic, /data-testid="anthropic"/);

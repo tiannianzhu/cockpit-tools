@@ -14,10 +14,10 @@ import { resolveProviderModelVisionState } from "../../utils/codexModelProviderV
 import type { useCodexModelProviderManagerController } from './CodexModelProviderManager';
 
 type Props = Pick<ReturnType<typeof useCodexModelProviderManagerController>,
-  'accountEditor' | 'setAccountEditor' | 'accounts' | 'providers' | 'editorModelKeyId' | 'selectEditorModelKey' | 'selectAccountEditorProvider' | 'maskAccountText' | 'closeModal' | 'currentEditingProvider' | 'editingApiKey' | 'existingApiKeySearchQuery' | 'form' | 'formError' | 'handleDeleteApiKey' | 'handleSaveApiKeyEdit' | 'handleSaveProvider' | 'handleSelectPresetEndpoint' | 'handleSelectProviderPreset' | 'handleSelectSponsorTemplate' | 'maskApiKey' | 'mutateForm' | 'parseModelCatalogText' | 'patchModelDefinition' | 'fetchProviderModels' | 'fetchingProviderModels' | 'canFetchProviderModels' | 'previewPaths' | 'resolveEnableModePreferenceForWireApi' | 'saving' | 'selectedPreset' | 'selectedPresetId' | 'selectedSponsorTemplate' | 'selectedSponsorTemplateId' | 'setEditingApiKey' | 'setExistingApiKeySearchQuery' | 'showModal' | 'sponsorProviderTemplates' | 't'>;
+  'accountEditor' | 'setAccountEditor' | 'accounts' | 'providers' | 'editorModelKeyId' | 'selectEditorModelKey' | 'selectAccountEditorProvider' | 'maskAccountText' | 'closeModal' | 'currentEditingProvider' | 'editingApiKey' | 'existingApiKeySearchQuery' | 'form' | 'formError' | 'handleDeleteApiKey' | 'handleRenameApiKey' | 'handleSaveApiKeyEdit' | 'handleSaveApiKeyRename' | 'handleSaveProvider' | 'handleSelectPresetEndpoint' | 'handleSelectProviderPreset' | 'handleSelectSponsorTemplate' | 'maskApiKey' | 'mutateForm' | 'parseModelCatalogText' | 'patchModelDefinition' | 'fetchProviderModels' | 'fetchingProviderModels' | 'canFetchProviderModels' | 'previewPaths' | 'resolveEnableModePreferenceForWireApi' | 'saving' | 'selectedPreset' | 'selectedPresetId' | 'selectedSponsorTemplate' | 'selectedSponsorTemplateId' | 'setEditingApiKey' | 'setExistingApiKeySearchQuery' | 'showModal' | 'sponsorProviderTemplates' | 't'>;
 
 export function CodexModelProviderEditor(props: Props) {
-  const { accountEditor, setAccountEditor, accounts, providers, editorModelKeyId, selectEditorModelKey, selectAccountEditorProvider, maskAccountText, closeModal, currentEditingProvider, editingApiKey, existingApiKeySearchQuery, form, formError, handleDeleteApiKey, handleSaveApiKeyEdit, handleSaveProvider, handleSelectPresetEndpoint, handleSelectProviderPreset, handleSelectSponsorTemplate, maskApiKey, mutateForm, parseModelCatalogText, patchModelDefinition, fetchProviderModels, fetchingProviderModels, canFetchProviderModels, previewPaths, resolveEnableModePreferenceForWireApi, saving, selectedPreset, selectedPresetId, selectedSponsorTemplate, selectedSponsorTemplateId, setEditingApiKey, setExistingApiKeySearchQuery, showModal, sponsorProviderTemplates, t } = props;
+  const { accountEditor, setAccountEditor, accounts, providers, editorModelKeyId, selectEditorModelKey, selectAccountEditorProvider, maskAccountText, closeModal, currentEditingProvider, editingApiKey, existingApiKeySearchQuery, form, formError, handleDeleteApiKey, handleRenameApiKey, handleSaveApiKeyEdit, handleSaveApiKeyRename, handleSaveProvider, handleSelectPresetEndpoint, handleSelectProviderPreset, handleSelectSponsorTemplate, maskApiKey, mutateForm, parseModelCatalogText, patchModelDefinition, fetchProviderModels, fetchingProviderModels, canFetchProviderModels, previewPaths, resolveEnableModePreferenceForWireApi, saving, selectedPreset, selectedPresetId, selectedSponsorTemplate, selectedSponsorTemplateId, setEditingApiKey, setExistingApiKeySearchQuery, showModal, sponsorProviderTemplates, t } = props;
   useModalScrollLock(showModal);
   const selectedKey = currentEditingProvider?.apiKeys.find(key => key.id === (editorModelKeyId ?? accountEditor?.apiKeyId));
   const queryKey = form.newApiKey || selectedKey?.apiKey || currentEditingProvider?.apiKeys[0]?.apiKey || "";
@@ -598,14 +598,29 @@ export function CodexModelProviderEditor(props: Props) {
                           const isEditing = editingApiKey?.apiKeyId === item.id;
                           if (isEditing && editingApiKey) {
                             return (
-                              <div
+                              <form
                                 className="codex-provider-key-row is-editing"
                                 key={item.id}
+                                onSubmit={(event) => {
+                                  event.preventDefault();
+                                  void (editingApiKey.mode === "rename"
+                                    ? handleSaveApiKeyRename()
+                                    : handleSaveApiKeyEdit());
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Escape") {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    if (!saving) setEditingApiKey(null);
+                                  }
+                                }}
                               >
                                 <div className="codex-provider-key-edit-fields">
                                   <input
                                     className="form-input"
                                     type="text"
+                                    autoFocus
+                                    aria-label={t("codex.modelProviders.renameApiKeyPrompt", "重命名 API Key")}
                                     value={editingApiKey.name}
                                     onChange={(event) =>
                                       setEditingApiKey((current) =>
@@ -620,7 +635,7 @@ export function CodexModelProviderEditor(props: Props) {
                                     )}
                                     disabled={saving}
                                   />
-                                  <input
+                                  {editingApiKey.mode === "credentials" && <input
                                     className="form-input"
                                     type="password"
                                     value={editingApiKey.apiKey}
@@ -637,13 +652,12 @@ export function CodexModelProviderEditor(props: Props) {
                                     )}
                                     autoComplete="off"
                                     disabled={saving}
-                                  />
+                                  />}
                                 </div>
                                 <div className="codex-provider-key-edit-actions">
                                   <button
-                                    type="button"
+                                    type="submit"
                                     className="action-btn success"
-                                    onClick={() => void handleSaveApiKeyEdit()}
                                     disabled={saving}
                                     title={t("common.save", "Save")}
                                   >
@@ -659,7 +673,7 @@ export function CodexModelProviderEditor(props: Props) {
                                     <X size={12} />
                                   </button>
                                 </div>
-                              </div>
+                              </form>
                             );
                           }
                           return (
@@ -679,6 +693,7 @@ export function CodexModelProviderEditor(props: Props) {
                             className="action-btn"
                             onClick={() =>
                               setEditingApiKey({
+                                mode: "credentials",
                                 providerId: currentEditingProvider.id,
                                 apiKeyId: item.id,
                                 originalApiKey: item.apiKey,
@@ -697,10 +712,7 @@ export function CodexModelProviderEditor(props: Props) {
                           <button
                             type="button"
                             className="action-btn"
-                            onClick={() =>
-                              setEditingApiKey({ providerId: currentEditingProvider.id, apiKeyId: item.id,
-                                originalApiKey: item.apiKey, apiKey: item.apiKey, name: item.name })
-                            }
+                            onClick={() => handleRenameApiKey(currentEditingProvider, item)}
                             disabled={saving}
                             title={t("common.rename", "重命名")}
                           >
