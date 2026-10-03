@@ -67,6 +67,9 @@ pub struct ClaudeAccount {
     pub api_model_catalog: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_extra_env: Option<BTreeMap<String, String>>,
+    /// Account-owned native model settings; permissions, hooks and other global settings stay local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_model_settings: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_gateway_auth_scheme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,6 +220,8 @@ pub struct ClaudeDesktopGatewayModel {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

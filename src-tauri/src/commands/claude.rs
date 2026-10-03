@@ -10,7 +10,115 @@ use crate::models::claude::{
     ClaudeAccount, ClaudeAuthMode, ClaudeDesktopGatewayModelMapping,
     ClaudeDesktopGatewayModelsResult, ClaudeDesktopLoginStartResponse, ClaudeOAuthStartResponse,
 };
-use crate::modules::{claude_account, logger};
+use crate::modules::{claude_account, claude_code_config, claude_code_remote, logger};
+
+// Keep default configuration changes and their follow-up sync in the same order.
+static DEFAULT_CONFIG_OPERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeCodeSettingsSaved {
+    settings: claude_code_config::ClaudeCodeSettings,
+    sync_results: Vec<claude_code_remote::ClaudeCodeSyncResult>,
+    sync_error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn claude_code_read_settings(
+    account_id: Option<String>,
+) -> Result<claude_code_config::ClaudeCodeSettings, String> {
+    let _guard = DEFAULT_CONFIG_OPERATION.lock().await;
+    claude_account::read_code_settings(account_id.as_deref())
+}
+
+#[tauri::command]
+pub fn claude_code_read_sync_preferences(
+) -> Result<claude_code_remote::ClaudeCodeSyncPreferences, String> {
+    claude_code_remote::read_sync_preferences()
+}
+
+async fn sync_followed_settings() -> Result<Vec<claude_code_remote::ClaudeCodeSyncResult>, String> {
+    let preferences = claude_code_remote::read_sync_preferences()?;
+    if preferences.server_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let settings = claude_code_config::read_settings()?;
+    claude_code_remote::sync_settings(&settings, &preferences.server_ids).await
+}
+
+fn sync_warning(
+    results: &Result<Vec<claude_code_remote::ClaudeCodeSyncResult>, String>,
+) -> Option<String> {
+    let failed = match results {
+        Ok(results) => results
+            .iter()
+            .any(|result| !result.verified || result.error.is_some()),
+        Err(_) => true,
+    };
+    failed.then(|| "远程配置同步失败，请在 Claude Code 配置中重试。".to_string())
+}
+
+#[tauri::command]
+pub async fn claude_code_save_settings(
+    content: String,
+    expected_revision: String,
+    server_ids: Vec<String>,
+    account_id: Option<String>,
+) -> Result<ClaudeCodeSettingsSaved, String> {
+    let _guard = DEFAULT_CONFIG_OPERATION.lock().await;
+    let settings =
+        claude_account::save_code_settings(&content, &expected_revision, account_id.as_deref())?;
+    let previous =
+        crate::modules::provider_current_state::get_current_account_id("claude_code_account")
+            .ok()
+            .flatten();
+    let previous_was_api = previous
+        .as_deref()
+        .and_then(claude_account::load_account)
+        .is_some_and(|account| account.auth_mode == ClaudeAuthMode::ApiKey);
+    let has_api_key = serde_json::from_str::<serde_json::Value>(&settings.content)
+        .ok()
+        .is_some_and(|value| {
+            ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+                .iter()
+                .any(|key| {
+                    value
+                        .get("env")
+                        .and_then(|env| env.get(key))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|key| !key.trim().is_empty())
+                })
+        });
+    if settings.account.is_some() || has_api_key || previous_was_api {
+        crate::modules::provider_current_state::set_current_account_id(
+            "claude_code_account",
+            settings.account.as_ref().map(|account| account.id.as_str()),
+        )?;
+    }
+    // A remote failure must not hide a successful local save or leave the UI revision stale.
+    let synced = match claude_code_remote::save_sync_preferences(server_ids) {
+        Ok(preferences) if preferences.server_ids.is_empty() => Ok(Vec::new()),
+        Ok(preferences) => {
+            claude_code_remote::sync_settings(&settings, &preferences.server_ids).await
+        }
+        Err(error) => Err(error),
+    };
+    let sync_error = synced.as_ref().err().cloned();
+    Ok(ClaudeCodeSettingsSaved {
+        settings,
+        sync_results: synced.unwrap_or_default(),
+        sync_error,
+    })
+}
+
+#[tauri::command]
+pub async fn claude_code_sync_settings(
+    server_ids: Vec<String>,
+) -> Result<Vec<claude_code_remote::ClaudeCodeSyncResult>, String> {
+    let _guard = DEFAULT_CONFIG_OPERATION.lock().await;
+    let settings = claude_code_config::read_settings()?;
+    claude_code_remote::sync_settings(&settings, &server_ids).await
+}
 
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn posix_shell_quote(value: &str) -> String {
@@ -166,9 +274,10 @@ fn build_claude_cli_command(
     env: &BTreeMap<String, String>,
 ) -> Result<String, String> {
     let working_dir = normalize_cli_working_dir(working_dir)?;
+    let config_dir = claude_account::get_default_claude_code_config_dir()?;
     Ok(build_claude_cli_command_for_context(
         Some(&working_dir),
-        None,
+        Some(&config_dir.to_string_lossy()),
         "",
         env,
     ))
@@ -344,14 +453,15 @@ pub struct ClaudeCliLaunchInfo {
     pub account_email: String,
     pub working_dir: String,
     pub launch_command: String,
+    pub config_path: String,
+    pub sync_warning: Option<String>,
 }
 
 fn prepare_claude_cli_launch(
     account_id: &str,
     working_dir: &str,
 ) -> Result<(ClaudeAccount, String, String), String> {
-    let account = claude_account::load_account(account_id)
-        .ok_or_else(|| format!("Claude account not found: {}", account_id))?;
+    let account = claude_account::account_for_code_switch(account_id)?;
     if matches!(
         account.auth_mode,
         ClaudeAuthMode::DesktopOAuth | ClaudeAuthMode::DesktopGateway
@@ -361,7 +471,9 @@ fn prepare_claude_cli_launch(
         );
     }
     let normalized_working_dir = normalize_cli_working_dir(working_dir)?;
-    claude_account::inject_to_claude_config(account_id, None)?;
+    if !claude_code_config::api_account_matches_settings(&account)? {
+        claude_account::inject_to_claude_config(account_id, None)?;
+    }
     let command = build_claude_cli_command(&normalized_working_dir, &BTreeMap::new())?;
     crate::modules::provider_current_state::set_current_account_id(
         "claude_code_account",
@@ -703,11 +815,12 @@ pub fn get_claude_accounts_index_path() -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn claude_get_cli_launch_command(
+pub async fn claude_get_cli_launch_command(
     app: AppHandle,
     account_id: String,
     working_dir: String,
 ) -> Result<ClaudeCliLaunchInfo, String> {
+    let _guard = DEFAULT_CONFIG_OPERATION.lock().await;
     let started_at = Instant::now();
     logger::log_info(&format!(
         "[Claude CLI] 准备启动命令: account_id={}, working_dir={}",
@@ -716,6 +829,7 @@ pub fn claude_get_cli_launch_command(
 
     let (account, normalized_working_dir, command) =
         prepare_claude_cli_launch(&account_id, &working_dir)?;
+    let sync_warning = sync_warning(&sync_followed_settings().await);
     let _ = crate::modules::tray::update_tray_menu(&app);
 
     logger::log_info(&format!(
@@ -730,16 +844,22 @@ pub fn claude_get_cli_launch_command(
         account_email: account.email,
         working_dir: normalized_working_dir,
         launch_command: command,
+        config_path: claude_account::get_default_claude_code_config_dir()?
+            .join("settings.json")
+            .to_string_lossy()
+            .into_owned(),
+        sync_warning,
     })
 }
 
 #[tauri::command]
-pub fn claude_execute_cli_launch_command(
+pub async fn claude_execute_cli_launch_command(
     app: AppHandle,
     account_id: String,
     working_dir: String,
     terminal: Option<String>,
 ) -> Result<String, String> {
+    let _guard = DEFAULT_CONFIG_OPERATION.lock().await;
     let started_at = Instant::now();
     logger::log_info(&format!(
         "[Claude CLI] 开始终端执行: account_id={}, working_dir={}",
@@ -749,6 +869,7 @@ pub fn claude_execute_cli_launch_command(
     let (account, _normalized_working_dir, command) =
         prepare_claude_cli_launch(&account_id, &working_dir)?;
     let result = execute_claude_cli_command(&command, terminal)?;
+    let warning = sync_warning(&sync_followed_settings().await);
     let _ = crate::modules::tray::update_tray_menu(&app);
 
     logger::log_info(&format!(
@@ -757,16 +878,19 @@ pub fn claude_execute_cli_launch_command(
         account.email,
         started_at.elapsed().as_millis()
     ));
-    Ok(result)
+    Ok(warning
+        .map(|warning| format!("{}\n{}", result, warning))
+        .unwrap_or(result))
 }
 
 #[tauri::command]
-pub fn claude_launch_cli(
+pub async fn claude_launch_cli(
     app: AppHandle,
     account_id: String,
     working_dir: String,
     terminal: Option<String>,
 ) -> Result<String, String> {
+    let _guard = DEFAULT_CONFIG_OPERATION.lock().await;
     let started_at = Instant::now();
     logger::log_info(&format!(
         "[Claude CLI] 开始启动: account_id={}, working_dir={}",
@@ -776,6 +900,7 @@ pub fn claude_launch_cli(
     let (account, _normalized_working_dir, command) =
         prepare_claude_cli_launch(&account_id, &working_dir)?;
     let result = execute_claude_cli_command(&command, terminal)?;
+    let warning = sync_warning(&sync_followed_settings().await);
     let _ = crate::modules::tray::update_tray_menu(&app);
 
     logger::log_info(&format!(
@@ -784,20 +909,24 @@ pub fn claude_launch_cli(
         account.email,
         started_at.elapsed().as_millis()
     ));
-    Ok(result)
+    Ok(warning
+        .map(|warning| format!("{}\n{}", result, warning))
+        .unwrap_or(result))
 }
 
 #[tauri::command]
-pub fn switch_claude_account(app: AppHandle, account_id: String) -> Result<String, String> {
+pub async fn switch_claude_account(app: AppHandle, account_id: String) -> Result<String, String> {
+    let _guard = DEFAULT_CONFIG_OPERATION.lock().await;
     let started_at = Instant::now();
     logger::log_info(&format!(
         "[Claude Switch] 开始切换账号: account_id={}",
         account_id
     ));
 
-    let account = claude_account::load_account(&account_id)
-        .ok_or_else(|| format!("Claude account not found: {}", account_id))?;
-    claude_account::inject_to_claude(&account_id)?;
+    let account = claude_account::account_for_code_switch(&account_id)?;
+    if !claude_code_config::api_account_matches_settings(&account)? {
+        claude_account::inject_to_claude(&account_id)?;
+    }
     let current_platform = if matches!(
         account.auth_mode,
         ClaudeAuthMode::DesktopOAuth | ClaudeAuthMode::DesktopGateway
@@ -826,5 +955,10 @@ pub fn switch_claude_account(app: AppHandle, account_id: String) -> Result<Strin
         ClaudeAuthMode::ApiKey => format!("Claude Code API Key 已应用: {}", account.email),
         _ => format!("切换完成: {}", account.email),
     };
+    if current_platform == "claude_code_account" {
+        if let Some(warning) = sync_warning(&sync_followed_settings().await) {
+            return Ok(format!("{}\n{}", message, warning));
+        }
+    }
     Ok(message)
 }
