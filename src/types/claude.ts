@@ -54,6 +54,7 @@ export interface ClaudeAccount {
   api_key_field?: string | null;
   api_model_catalog?: string[] | null;
   api_extra_env?: Record<string, string> | null;
+  claude_code_model_settings?: Record<string, unknown> | null;
   desktop_gateway_auth_scheme?: string | null;
   desktop_gateway_credential_kind?: string | null;
   desktop_gateway_config_id?: string | null;
@@ -113,6 +114,7 @@ export interface ClaudeOAuthStartResponse {
 export interface ClaudeDesktopGatewayModel {
   id: string;
   displayName?: string | null;
+  contextWindow?: number | null;
 }
 
 export type ClaudeDesktopGatewayConnectionMode = 'direct' | 'local_mapping';

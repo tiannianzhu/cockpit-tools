@@ -28,6 +28,7 @@ import {
   RefreshCw,
   RotateCw,
   Search,
+  Settings,
   Star,
   Tag,
   Terminal,
@@ -40,7 +41,6 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import md5 from 'blueimp-md5';
 import { ModalErrorMessage, useModalErrorState } from '../components/ModalErrorMessage';
 import { ExportJsonModal } from '../components/ExportJsonModal';
 import { AccountSelectionToolbar } from '../components/AccountSelectionToolbar';
@@ -50,6 +50,7 @@ import { SingleSelectDropdown } from '../components/SingleSelectDropdown';
 import { TagEditModal } from '../components/TagEditModal';
 import { ClaudeIcon } from '../components/icons/ClaudeIcon';
 import { ClaudeDesktopRuntimeManager } from '../components/claude/ClaudeDesktopRuntimeManager';
+import { ClaudeCodeSettingsModal } from '../components/claude/ClaudeCodeSettingsModal';
 import { ModelProviderUsagePanel } from '../components/model-provider/ModelProviderUsagePanel';
 import { PlatformGroupSwitcher } from '../components/platform/PlatformGroupSwitcher';
 import { useEscClose } from '../hooks/useEscClose';
@@ -66,9 +67,7 @@ import {
 import { compareCurrentAccountFirst } from '../utils/currentAccountSort';
 import { isPrivacyModeEnabledByDefault, maskSensitiveValue, persistPrivacyModeEnabled } from '../utils/privacy';
 import * as claudeService from '../services/claudeService';
-import * as claudeInstanceService from '../services/claudeInstanceService';
 import { useClaudeAccountStore } from '../stores/useClaudeAccountStore';
-import { useClaudeInstanceStore } from '../stores/useClaudeInstanceStore';
 import {
   findGroupByPlatform,
   resolveGroupChildName,
@@ -132,10 +131,8 @@ import {
 import {
   persistLastClaudeCliWorkingDir,
   readLastClaudeCliWorkingDir,
-  sanitizeClaudeCliInstanceName,
 } from '../utils/claudeCliLaunchPreferences';
 import { ClaudeInstancesContent } from './ClaudeInstancesPage';
-import type { InstanceProfile } from '../types/instance';
 
 const CLAUDE_FLOW_NOTICE_COLLAPSED_KEY = 'agtools.claude.flow_notice_collapsed';
 const CLAUDE_ACCOUNTS_VIEW_MODE_KEY = 'agtools.claude.accounts_view_mode';
@@ -263,25 +260,14 @@ interface DeleteConfirmState {
 interface ClaudeCliLaunchModalState {
   accountId: string;
   accountEmail: string;
-  instanceId: string | null;
   workingDir: string;
-  instanceName: string;
+  configPath: string;
   launchCommand: string;
   preparing: boolean;
   copied: boolean;
   executing: boolean;
   executeMessage: string | null;
   executeError: string | null;
-}
-
-function joinFilePath(directory: string, fileName: string): string {
-  if (!directory) return fileName;
-  const separator = directory.includes('\\') ? '\\' : '/';
-  return directory.endsWith(separator) ? `${directory}${fileName}` : `${directory}${separator}${fileName}`;
-}
-
-function normalizePathForCompare(value?: string | null): string {
-  return (value || '').trim();
 }
 
 function formatDate(timestamp: number): string {
@@ -711,7 +697,6 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
   const { terminalOptions, selectedTerminal, setSelectedTerminal } =
     useLaunchTerminalOptions(activeSubPlatform === 'cli');
   const store = useClaudeAccountStore();
-  const claudeInstanceStore = useClaudeInstanceStore();
   const { platformGroups } = usePlatformLayoutStore();
   const remoteHiddenPlatformIds = useRemoteConfigStore((state) => state.hiddenPlatformIds);
   const remoteHiddenPlatformSet = useMemo(
@@ -762,6 +747,7 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
     }
   });
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showCodeSettings, setShowCodeSettings] = useState(false);
   const [addTab, setAddTab] = useState<AddTab>('desktop');
   const [jsonInput, setJsonInput] = useState('');
   const [importing, setImporting] = useState(false);
@@ -1991,51 +1977,13 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
     }
   };
 
-  const resolveClaudeCliInstanceForAccount = async (
-    account: ClaudeAccount,
-    workingDir: string,
-  ): Promise<InstanceProfile> => {
-    const normalizedWorkingDir = normalizePathForCompare(workingDir);
-    const instances = await claudeInstanceService.listInstances();
-    const existing = instances.find(
-      (instance) =>
-        !instance.isDefault &&
-        (instance.launchMode ?? 'app') === 'cli' &&
-        instance.bindAccountId === account.id &&
-        normalizePathForCompare(instance.workingDir) === normalizedWorkingDir,
-    );
-    if (existing) {
-      return existing;
-    }
-
-    const defaults = await claudeInstanceService.getInstanceDefaults();
-    const displayName = getClaudeAccountDisplayEmail(account) || account.email || account.id;
-    const instanceHash = md5(`${account.id}|${normalizedWorkingDir}`).substring(0, 12);
-    const instanceName = sanitizeClaudeCliInstanceName(
-      `${displayName} CLI ${instanceHash.substring(0, 6)}`,
-    );
-    const userDataDir = joinFilePath(defaults.rootDir, `cli-${instanceHash}`);
-
-    return await claudeInstanceService.createInstance({
-      name: instanceName,
-      userDataDir,
-      workingDir: normalizedWorkingDir,
-      extraArgs: '',
-      bindAccountId: account.id,
-      launchMode: 'cli',
-      copySourceInstanceId: '__default__',
-      initMode: 'copy',
-    });
-  };
-
   const handleLaunchClaudeCli = async (account: ClaudeAccount) => {
     setMessage(null);
     setCliLaunchModal({
       accountId: account.id,
       accountEmail: getClaudeAccountDisplayEmail(account),
-      instanceId: null,
       workingDir: readLastClaudeCliWorkingDir(),
-      instanceName: t('instances.messages.launchPrepared', '启动命令已准备'),
+      configPath: '~/.claude/settings.json',
       launchCommand: '',
       preparing: false,
       copied: false,
@@ -2048,7 +1996,7 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
   const prepareClaudeCliLaunch = async (
     modal: ClaudeCliLaunchModalState,
   ): Promise<ClaudeCliLaunchModalState | null> => {
-    if (modal.instanceId && modal.launchCommand.trim()) {
+    if (modal.launchCommand.trim()) {
       return modal;
     }
     const selected = modal.workingDir.trim();
@@ -2095,27 +2043,21 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
         : prev,
     );
     try {
-      const instance = await resolveClaudeCliInstanceForAccount(account, selected);
-      const prepared = await claudeInstanceService.startInstance(instance.id);
-      const launchInfo = await claudeInstanceService.getClaudeInstanceLaunchCommand(prepared.id);
-      await claudeInstanceStore.refreshInstances();
+      const launchInfo = await claudeService.getClaudeCliLaunchCommand(account.id, selected);
       await store.fetchAccounts();
       setCurrentAccountId(account.id);
-      persistLastClaudeCliWorkingDir(prepared.workingDir || selected);
+      persistLastClaudeCliWorkingDir(launchInfo.workingDir);
       const nextModal: ClaudeCliLaunchModalState = {
         accountId: account.id,
         accountEmail: getClaudeAccountDisplayEmail(account),
-        instanceId: prepared.id,
-        workingDir: prepared.workingDir || selected,
-        instanceName: prepared.isDefault
-          ? t('instances.defaultName', '默认实例')
-          : prepared.name || t('instances.defaultName', '默认实例'),
+        workingDir: launchInfo.workingDir,
+        configPath: launchInfo.configPath,
         launchCommand: launchInfo.launchCommand,
         preparing: false,
         copied: false,
         executing: false,
         executeMessage: null,
-        executeError: null,
+        executeError: launchInfo.syncWarning ?? null,
       };
       setCliLaunchModal((prev) => (prev && prev.accountId === modal.accountId ? nextModal : prev));
       return nextModal;
@@ -2143,8 +2085,7 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
         ? {
             ...prev,
             workingDir: value,
-            instanceId: null,
-            instanceName: t('instances.messages.launchPrepared', '启动命令已准备'),
+            configPath: '~/.claude/settings.json',
             launchCommand: '',
             copied: false,
             executeMessage: null,
@@ -2172,7 +2113,7 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
     if (!prepared) return;
     try {
       await navigator.clipboard.writeText(prepared.launchCommand);
-      setCliLaunchModal((prev) => (prev ? { ...prev, copied: true, executeError: null } : prev));
+      setCliLaunchModal((prev) => (prev ? { ...prev, copied: true } : prev));
       window.setTimeout(() => {
         setCliLaunchModal((prev) => (prev ? { ...prev, copied: false } : prev));
       }, 1200);
@@ -2191,7 +2132,7 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
   const handleExecuteCliInTerminal = async () => {
     if (!cliLaunchModal || cliLaunchModal.executing) return;
     const prepared = await prepareClaudeCliLaunch(cliLaunchModal);
-    if (!prepared?.instanceId) return;
+    if (!prepared) return;
     setCliLaunchModal((prev) =>
       prev
         ? {
@@ -2203,12 +2144,12 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
         : prev,
     );
     try {
-      const result = await claudeInstanceService.executeClaudeInstanceLaunchCommand(
-        prepared.instanceId,
+      const result = await claudeService.executeClaudeCliLaunchCommand(
+        prepared.accountId,
+        prepared.workingDir,
         selectedTerminal,
       );
       await store.fetchAccounts();
-      await claudeInstanceStore.refreshInstances();
       setCurrentAccountId(prepared.accountId);
       setCliLaunchModal((prev) =>
         prev
@@ -2959,7 +2900,12 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
                   <Upload size={14} />
                 </button>
               )}
-              {isDesktopSubPlatform && <QuickSettingsPopover type="claude" />}
+              {isDesktopSubPlatform ? <QuickSettingsPopover type="claude" /> : (
+                <button className="btn btn-secondary icon-only" onClick={() => setShowCodeSettings(true)}
+                  title={t('claude.codeConfig.title', 'Claude Code 配置')} aria-label={t('claude.codeConfig.title', 'Claude Code 配置')}>
+                  <Settings size={14} />
+                </button>
+              )}
             </div>
           </div>
 
@@ -4080,11 +4026,16 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
         onCopySavedPath={exportModal.copySavedPath}
       />
 
+      {showCodeSettings && <ClaudeCodeSettingsModal
+        onClose={() => setShowCodeSettings(false)}
+        onApplied={() => { void store.fetchAccounts(); void refreshCurrentAccountId('cli'); }}
+      />}
+
       {cliLaunchModal && (
         <div className="modal-overlay">
           <div className="modal modal-lg" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
-              <h2>{t('instances.launchDialog.title', '启动实例')}</h2>
+              <h2>{t('claude.codeConfig.launchTitle', '启动 Claude Code')}</h2>
               <button
                 className="modal-close"
                 onClick={() => setCliLaunchModal(null)}
@@ -4094,19 +4045,19 @@ export function ClaudeAccountsPage({ subPlatform = 'desktop' }: ClaudeAccountsPa
               </button>
             </div>
             <div className="modal-body">
-              <div className="add-status success">
+              {cliLaunchModal.launchCommand && <div className="add-status success">
                 <Check size={16} />
                 <span>
                   {t('accounts.switched', '已切换至 {{email}}', {
                     email: maskAccountText(cliLaunchModal.accountEmail),
                   })}
                 </span>
-              </div>
+              </div>}
               <div className="form-group">
-                <label>{t('instances.columns.instance', '实例')}</label>
+                <label>{t('claude.codeConfig.file', '配置文件')}</label>
                 <input
                   className="form-input"
-                  value={cliLaunchModal.instanceName}
+                  value={cliLaunchModal.configPath}
                   readOnly
                 />
               </div>

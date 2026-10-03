@@ -7,6 +7,7 @@ include!("claude_account_desktop_profile.rs");
 include!("claude_account_desktop_auth.rs");
 include!("claude_account_cli_sync.rs");
 include!("claude_account_oauth_updates.rs");
+include!("claude_account_code_settings.rs");
 
 #[cfg(test)]
 mod tests {

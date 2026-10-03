@@ -11,6 +11,8 @@ pub mod atomic_write;
 pub mod auto_local_import;
 pub mod backup_storage;
 pub mod claude_account;
+pub mod claude_code_config;
+pub mod claude_code_remote;
 pub mod claude_desktop_gateway;
 pub mod claude_instance;
 pub mod client_version;

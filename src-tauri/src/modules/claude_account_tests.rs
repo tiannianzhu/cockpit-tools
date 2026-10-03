@@ -3,6 +3,76 @@
 use super::*;
 
 #[test]
+fn desktop_gateway_models_read_upstream_display_names() {
+    let models = parse_desktop_gateway_models(&serde_json::json!({
+        "data": [
+            {"id": "first-model", "display_name": " First name ", "displayName": "Ignored", "name": "Ignored"},
+            {"id": "second-model", "displayName": " Second name ", "name": "Ignored"},
+            {"id": "third-model", "name": " Third name ", "info": {"name": "Ignored"}},
+            {"id": "fourth-model", "info": {"name": " Fourth name "}},
+            {"id": "fifth-model"},
+            {"id": "sixth-model", "name": " "}
+        ]
+    }));
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.display_name.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some("First name"),
+            Some("Second name"),
+            Some("Third name"),
+            Some("Fourth name"),
+            None,
+            None,
+        ]
+    );
+    let serialized = serde_json::to_value(&models).expect("serialize model list");
+    assert_eq!(serialized[2]["displayName"], "Third name");
+    assert_eq!(serialized[3]["displayName"], "Fourth name");
+}
+
+#[test]
+fn desktop_gateway_models_read_only_positive_safe_context_windows() {
+    let models = parse_desktop_gateway_models(&serde_json::json!({
+        "data": [
+            {"id": "codex-shape", "info": {"meta": {"context_length": 128000}}},
+            {"id": "snake-window", "context_window": 65536},
+            {"id": "snake-length", "context_length": 32768},
+            {"id": "camel-window", "contextWindow": 16384},
+            {"id": "zero", "context_window": 0},
+            {"id": "negative", "context_length": -1},
+            {"id": "unsafe", "contextWindow": 9007199254740992_u64},
+            {"id": "fraction", "context_window": 42.5},
+            {"id": "boolean", "context_length": true},
+            {"id": "absent"}
+        ]
+    }));
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.context_window)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(128000),
+            Some(65536),
+            Some(32768),
+            Some(16384),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]
+    );
+    let serialized = serde_json::to_value(&models).expect("serialize model list");
+    assert_eq!(serialized[0]["contextWindow"], 128000);
+    assert!(serialized[4].get("contextWindow").is_none());
+}
+
+#[test]
 fn desktop_login_component_cleanup_removes_only_owned_cache_dirs() {
     let data_dir = std::env::temp_dir().join(format!(
         "cockpit-claude-runtime-cleanup-{}-{}",
@@ -568,6 +638,7 @@ fn desktop_login_component_cleanup_removes_only_owned_cache_dirs() {
             api_key_field: None,
             api_model_catalog: None,
             api_extra_env: None,
+            claude_code_model_settings: None,
             desktop_gateway_auth_scheme: None,
             desktop_gateway_credential_kind: None,
             desktop_gateway_config_id: None,
