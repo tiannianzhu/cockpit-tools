@@ -8,6 +8,7 @@ import {
   APIKEY_FUN_REGISTER_URL,
   APIKEY_FUN_SOURCE_TAG,
 } from './apikeyFunLinks';
+import { CMPDC_API_BASE_URL, CMPDC_API_PROVIDER } from './cmpdcProvider';
 
 export type ClaudeDesktopGatewayAuthScheme = 'bearer' | 'x-api-key' | 'auto';
 export type ClaudeDesktopGatewayApiKeyField = 'ANTHROPIC_AUTH_TOKEN' | 'ANTHROPIC_API_KEY';
@@ -117,6 +118,14 @@ function repeatedMappedRoute(
 }
 
 export const CLAUDE_DESKTOP_GATEWAY_PROVIDER_PRESETS: readonly ClaudeDesktopGatewayProviderPreset[] = [
+  {
+    ...CMPDC_API_PROVIDER,
+    baseUrls: [CMPDC_API_BASE_URL],
+    authScheme: 'bearer',
+    apiKeyField: 'ANTHROPIC_AUTH_TOKEN',
+    connectionMode: 'direct',
+    modelMappings: directRoutes(),
+  },
   {
     id: CLAUDE_DESKTOP_GATEWAY_APIKEY_FUN_PROVIDER_ID,
     name: 'APIKEY.FUN',
