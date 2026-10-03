@@ -1,3 +1,5 @@
+import { CMPDC_API_BASE_URL, CMPDC_API_PROVIDER } from "./cmpdcProvider";
+
 export interface CodexApiProviderPreset {
   id: string;
   name: string;
@@ -78,6 +80,10 @@ export const OPENCODE_GO_CODEX_MODEL_CATALOG = [
 const COCKPIT_API_HIDDEN_BASE_URLS = [COCKPIT_API_BASE_URL] as const;
 
 export const CODEX_API_PROVIDER_PRESETS: readonly CodexApiProviderPreset[] = [
+  {
+    ...CMPDC_API_PROVIDER,
+    baseUrls: [`${CMPDC_API_BASE_URL}/v1`],
+  },
   {
     id: "openai_official",
     name: "OpenAI Official",
