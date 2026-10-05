@@ -1076,11 +1076,7 @@ fn api_bundle_for_account(account: &CodexAccount) -> Result<Option<serde_json::V
 fn api_bundle_from_providers(account: &CodexAccount, providers: &[serde_json::Value]) -> Result<serde_json::Value, String> {
     let base_url = account.api_base_url.as_deref().unwrap_or("").trim().trim_end_matches('/');
     let matching: Vec<_> = providers.iter().filter(|provider| {
-        if let Some(id) = account.api_provider_id.as_deref().filter(|id| !id.is_empty()) {
-            provider["id"].as_str() == Some(id)
-        } else {
-            provider["baseUrl"].as_str().is_some_and(|url| url.trim().trim_end_matches('/') == base_url)
-        }
+        provider["baseUrl"].as_str().is_some_and(|url| url.trim().trim_end_matches('/') == base_url)
     }).collect();
     if matching.len() != 1 { return Err("Select one linked model provider before remote API apply".into()); }
     let provider = matching[0];
@@ -1638,12 +1634,12 @@ mod tests {
     }
 
     #[test]
-    fn api_bundle_uses_unique_linked_provider_definition() {
+    fn api_bundle_uses_unique_provider_definition_by_base_url() {
         let mut account = CodexAccount::new("fixture-api".into(), "fixture".into(), CodexTokens {
             id_token: String::new(), access_token: String::new(), refresh_token: None,
         });
-        account.api_provider_id = Some("provider-id".into());
-        account.api_base_url = Some("https://provider.example/v1".into());
+        account.api_provider_id = Some("preset-id".into());
+        account.api_base_url = Some(" https://provider.example/v1/ ".into());
         let provider = serde_json::json!({
             "id": "provider-id", "name": "Example Provider", "baseUrl": "https://provider.example/v1", "wireApi": "responses",
             "modelCatalogDefinition": {"base_model": "official-template", "models": [{"slug": "custom-model"}]},
@@ -1653,7 +1649,18 @@ mod tests {
         assert_eq!(result["model_catalog_definition"]["models"], provider["modelCatalogDefinition"]["models"]);
         assert_eq!(result["provider_name"], "Example Provider");
         assert!(result.get("api_key").is_none());
-        assert!(api_bundle_from_providers(&account, &[provider.clone(), provider.clone()]).is_err());
+        let mut duplicate = provider.clone();
+        duplicate["id"] = serde_json::json!("another-provider-id");
+        duplicate["baseUrl"] = serde_json::json!(" https://provider.example/v1/ ");
+        assert!(api_bundle_from_providers(&account, &[provider.clone(), duplicate]).is_err());
+        let mut unrelated = provider.clone();
+        unrelated["id"] = serde_json::json!("preset-id");
+        unrelated["baseUrl"] = serde_json::json!("https://other.example/v1");
+        assert_eq!(
+            api_bundle_from_providers(&account, &[unrelated.clone(), provider.clone()]).unwrap(),
+            result,
+        );
+        assert!(api_bundle_from_providers(&account, &[unrelated]).is_err());
         let mut missing = provider.clone();
         missing.as_object_mut().unwrap().remove("modelCatalogDefinition");
         assert!(api_bundle_from_providers(&account, &[missing]).is_err());
