@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / 'src-tauri/src/modules/ssh_server.rs').read_text()
 WRAPPER = re.search(r'const REMOTE_SYNC_SCRIPT: &str = r#"(.*?)"#;', SOURCE, re.S)[1]
+RESOLVE_HOME = re.search(r'const REMOTE_RESOLVE_HOME_SCRIPT: &str = r#"(.*?)"#;', SOURCE, re.S)[1]
 STUB = '''
 def prepare_api_bundle(home, api):
     if api.get('prepare_fail'): raise ValueError('invalid fixture definition')
@@ -71,6 +72,38 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual({path.name for path in self.home.iterdir()}, {
             'auth.json', 'config.toml', 'cockpit-model-catalog.json',
         })
+
+    def test_sync_initializes_another_home_without_changing_existing_account(self):
+        existing_home = self.home
+        self.home = self.root / 'another profile'
+        self.assertFalse(self.home.exists())
+        code, out = self.run_sync()
+        self.assertEqual(code, 0)
+        self.assertIn('applied', out)
+        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual({path.name for path in self.home.iterdir()}, {
+            'auth.json', 'config.toml', 'cockpit-model-catalog.json',
+        })
+        for name, content in self.original.items():
+            self.assertEqual((existing_home / name).read_bytes(), content)
+
+    def test_resolves_equivalent_homes_without_creating_directories(self):
+        (self.root / 'profile-link').symlink_to(self.home, target_is_directory=True)
+        for home in ['~/.codex', '~/.codex/', '~/.codex/.', str(self.home), 'profile-link']:
+            with self.subTest(home=home):
+                result = subprocess.run(['python3', '-c', RESOLVE_HOME],
+                    input=json.dumps({'codex_home': home}) + '\n',
+                    env=dict(os.environ, HOME=str(self.root)), cwd=self.root,
+                    capture_output=True, text=True, timeout=5, check=True)
+                self.assertEqual(json.loads(result.stdout), str(self.home.resolve()))
+        missing = self.root / 'new profile'
+        result = subprocess.run(['python3', '-c', RESOLVE_HOME],
+            input=json.dumps({'codex_home': '~/new profile'}) + '\n',
+            env=dict(os.environ, HOME=str(self.root)), cwd=self.root,
+            capture_output=True, text=True, timeout=5, check=True)
+        self.assertEqual(json.loads(result.stdout), str(missing.resolve()))
+        self.assertFalse(missing.exists())
+        self.assert_originals()
 
     def test_legacy_sidecars_retired_only_after_success(self):
         obsolete = ['cockpit-model-definition.json', '.cockpit-api-previous.json', '.cockpit-api-rollback.json', '.cockpit-auth-sync-generation']

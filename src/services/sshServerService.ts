@@ -9,7 +9,7 @@ function toServer(draft: SshServerDraft): SshServer {
     // 0 tells the backend to resolve the SSH config/default port.
     port: draft.port ?? 0,
     username: draft.username,
-    // The backend applies auth.json in an existing CODEX_HOME; it never creates the directory.
+    // Each entry targets one CODEX_HOME; the backend creates it when applying an account.
     codex_home: draft.codex_home?.trim() ?? '',
     auth: draft.auth,
     sync_on_codex_switch: draft.sync_on_codex_switch ?? false,

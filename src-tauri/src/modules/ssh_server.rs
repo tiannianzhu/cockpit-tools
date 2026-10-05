@@ -571,6 +571,28 @@ async fn run_remote_python_on_server(
         .map_err(str::to_string)
 }
 
+const REMOTE_RESOLVE_HOME_SCRIPT: &str = r#"
+import json, os, sys
+request = json.loads(sys.stdin.buffer.readline())
+print(json.dumps(os.path.realpath(os.path.expanduser(request['codex_home']))))
+"#;
+
+async fn resolve_remote_codex_home(server: &SshServer) -> Result<String, String> {
+    let output = run_remote_python_on_server(
+        server,
+        REMOTE_RESOLVE_HOME_SCRIPT,
+        &serde_json::json!({}),
+        REMOTE_PYTHON_TIMEOUT_SECS,
+    )
+    .await?;
+    let home: String = serde_json::from_str(&output)
+        .map_err(|_| "Invalid remote CODEX_HOME response".to_string())?;
+    if !home.starts_with('/') || contains_control_separator(&home) {
+        return Err("Invalid resolved remote CODEX_HOME".into());
+    }
+    Ok(home)
+}
+
 /// Official-account sync touches only auth.json. API sync applies a validated bundle.
 /// A directory flock covers
 /// transfer and app-server reload, including independent SSH aliases. Its
@@ -666,12 +688,11 @@ def stop_desktop_server(home, alive):
 def main():
     request = json.loads(sys.stdin.buffer.readline())
     home = os.path.expanduser(request['home'])
-    if not os.path.isdir(home):
-        raise RuntimeError('existing CODEX_HOME directory required')
     payload = base64.b64decode(request['auth'], validate=True)
     expected = request['sha256']
     if hashlib.sha256(payload).hexdigest() != expected:
         raise RuntimeError('input SHA256 mismatch')
+    os.makedirs(home, mode=0o700, exist_ok=True)
     alive = threading.Event()
     alive.set()
     def lease():
@@ -1237,26 +1258,33 @@ fn next_generation() -> u64 {
 pub fn cancel_pending_syncs_on_account_switch() {
     let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let hosts = HOST_JOBS.lock().unwrap_or_else(|e| e.into_inner());
-    for host in hosts.values() {
-        cancel_local_follow_job(host);
+    for ((_, resolved), host) in hosts.iter() {
+        cancel_local_follow_job(host, *resolved);
     }
 }
 
 // Caller holds STORE_LOCK while checking and updating the latest reservation.
-fn cancel_local_follow_job(host: &HostJobs) {
-    if host.latest.borrow().tied_to_local_account {
+fn cancel_local_follow_job(host: &HostJobs, resolved: bool) {
+    let reservation = *host.latest.borrow();
+    if reservation.tied_to_local_account {
         host.latest.send_replace(HostReservation {
-            generation: next_generation(),
+            // The entry reservation cancels the running job. Keep the directory's
+            // cutoff so a newer independent request still awaiting lookup survives.
+            generation: if resolved { reservation.generation } else { next_generation() },
             tied_to_local_account: false,
         });
     }
 }
 
-static HOST_JOBS: LazyLock<Mutex<HashMap<String, Arc<HostJobs>>>> =
+// Configured paths and resolved directories have separate reservation scopes.
+static HOST_JOBS: LazyLock<Mutex<HashMap<(String, bool), Arc<HostJobs>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn host_key(server: &SshServer) -> String {
-    format!("{}@{}:{}", server.username, server.host, server.port)
+    format!(
+        "{}@{}:{}:{}",
+        server.username, server.host, server.port, server.codex_home
+    )
 }
 
 // Caller holds STORE_LOCK, matching reservation and publication ordering.
@@ -1264,7 +1292,7 @@ fn cancel_server_jobs(server: &SshServer) {
     if let Some(host) = HOST_JOBS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&host_key(server))
+        .get(&(host_key(server), false))
     {
         host.latest.send_replace(HostReservation {
             generation: next_generation(),
@@ -1273,8 +1301,8 @@ fn cancel_server_jobs(server: &SshServer) {
     }
 }
 
-fn host_jobs(server: &SshServer) -> Arc<HostJobs> {
-    let key = host_key(server);
+fn host_jobs(server: &SshServer, resolved: bool) -> Arc<HostJobs> {
+    let key = (host_key(server), resolved);
     HOST_JOBS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1295,7 +1323,10 @@ fn host_jobs(server: &SshServer) -> Arc<HostJobs> {
 struct SyncJob {
     server: SshServer,
     snapshot: AuthSnapshot,
+    // The configured path remains cancellable when an entry is edited or removed.
     host: Arc<HostJobs>,
+    // The resolved directory shares ordering across equivalent configured paths.
+    target: Option<Arc<HostJobs>>,
     generation: u64,
     status: SshCodexSyncStatus,
 }
@@ -1326,7 +1357,7 @@ fn emit_result(result: &SshCodexSyncResult) {
 
 impl SyncJob {
     fn reserve(server: SshServer, snapshot: AuthSnapshot, tied_to_local_account: bool) -> Self {
-        let host = host_jobs(&server);
+        let host = host_jobs(&server, false);
         // Reserve and publish under the same lock as in-memory status updates, so a
         // previous job can never replace a newer job's status.
         let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1355,6 +1386,7 @@ impl SyncJob {
             server,
             snapshot,
             host,
+            target: None,
             generation,
         };
         job.cache_and_emit();
@@ -1363,6 +1395,28 @@ impl SyncJob {
 
     fn is_current(&self) -> bool {
         self.host.latest.borrow().generation == self.generation
+            && self.target.as_ref().map_or(true, |target| {
+                target.latest.borrow().generation == self.generation
+            })
+    }
+
+    fn bind_remote_home(&mut self, home: String) -> bool {
+        let mut server = self.server.clone();
+        server.codex_home = home;
+        let target = host_jobs(&server, true);
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.is_current() {
+            return false;
+        }
+        let reservation = *self.host.latest.borrow();
+        self.target = Some(target.clone());
+        // Keep request order even when an older SSH path lookup finishes later.
+        if target.latest.borrow().generation > self.generation {
+            return false;
+        }
+        target.latest.send_replace(reservation);
+        self.server = server;
+        true
     }
 
     // Caller holds STORE_LOCK.
@@ -1432,6 +1486,12 @@ async fn transfer_and_apply(job: &mut SyncJob) -> Result<(), String> {
     .to_string()
         + "\n";
     let mut changed = job.host.latest.subscribe();
+    let mut target_changed = job
+        .target
+        .as_ref()
+        .ok_or("Remote CODEX_HOME has not been resolved")?
+        .latest
+        .subscribe();
     let exchange = async {
         stdin
             .write_all(payload.as_bytes())
@@ -1451,6 +1511,7 @@ async fn transfer_and_apply(job: &mut SyncJob) -> Result<(), String> {
             tokio::select! {
                 biased;
                 _ = changed.changed() => return Err("superseded".to_string()),
+                _ = target_changed.changed() => return Err("superseded".to_string()),
                 _ = &mut transfer_deadline, if !job.status.verified => return Err("SSH credentials transfer timed out".to_string()),
                 line = stdout.next_line() => {
                     match line.map_err(|_| "SSH result read failed".to_string())?.as_deref() {
@@ -1504,20 +1565,29 @@ async fn transfer_and_apply(job: &mut SyncJob) -> Result<(), String> {
 }
 
 async fn run_job(mut job: SyncJob) -> SshCodexSyncResult {
-    let host = job.host.clone();
-    let _gate = host.gate.lock().await;
-    if !job.is_current() {
-        job.publish(SshSyncStage::Superseded, None);
-    } else if let Err(error) = ensure_remote_auth_compatible(&job.server, &job.snapshot).await {
-        job.publish(SshSyncStage::Failed, Some(error));
-    } else {
-        match transfer_and_apply(&mut job).await {
-            Ok(()) => job.publish(SshSyncStage::Applied, None),
-            Err(error) if !job.is_current() || error == "superseded" => {
-                job.publish(SshSyncStage::Superseded, None)
-            }
-            Err(error) => job.publish(SshSyncStage::Failed, Some(error)),
+    let outcome = async {
+        if !job.is_current() {
+            return Err("superseded".to_string());
         }
+        let home = resolve_remote_codex_home(&job.server).await?;
+        if !job.bind_remote_home(home) {
+            return Err("superseded".to_string());
+        }
+        let target = job.target.as_ref().unwrap().clone();
+        let _gate = target.gate.lock().await;
+        if !job.is_current() {
+            return Err("superseded".to_string());
+        }
+        ensure_remote_auth_compatible(&job.server, &job.snapshot).await?;
+        transfer_and_apply(&mut job).await
+    }
+    .await;
+    match outcome {
+        Ok(()) => job.publish(SshSyncStage::Applied, None),
+        Err(error) if !job.is_current() || error == "superseded" => {
+            job.publish(SshSyncStage::Superseded, None)
+        }
+        Err(error) => job.publish(SshSyncStage::Failed, Some(error)),
     }
     result_from_status(&job.server, job.status)
 }
@@ -1631,6 +1701,19 @@ mod tests {
             updated_at: 1,
             last_sync: None,
         }
+    }
+
+    fn sync_job(server: SshServer) -> SyncJob {
+        let bytes = br#"{"fixture":true}"#.to_vec();
+        let snapshot = AuthSnapshot {
+            account_id: Uuid::new_v4().to_string(),
+            account_email: "fixture@example.test".into(),
+            token_generation: 1,
+            hash: format!("{:x}", Sha256::digest(&bytes)),
+            api_bundle: None,
+            bytes,
+        };
+        SyncJob::reserve(server, snapshot, false)
     }
 
     #[test]
@@ -1747,11 +1830,11 @@ mod tests {
     }
 
     #[test]
-    fn generations_are_monotonic_and_shared_per_host() {
+    fn generations_are_monotonic_and_shared_per_host_and_home() {
         let a = server("ordering-a");
         let b = server("ordering-b");
-        let first = host_jobs(&a);
-        let second = host_jobs(&b);
+        let first = host_jobs(&a, false);
+        let second = host_jobs(&b, false);
         assert!(Arc::ptr_eq(&first, &second));
         let old = next_generation();
         let new = next_generation();
@@ -1768,13 +1851,167 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_homes_supersede_older_jobs_and_preserve_entry_cancellation() {
+        for alias in ["~/.codex/", "~/.codex/.", "/fixture/.codex", "profile-link"] {
+            let mut first_server = server(&Uuid::new_v4().to_string());
+            first_server.host = Uuid::new_v4().to_string();
+            let mut second_server = first_server.clone();
+            second_server.id = Uuid::new_v4().to_string();
+            second_server.codex_home = alias.into();
+            let mut first = sync_job(first_server);
+            assert!(first.bind_remote_home("/fixture/.codex".into()));
+            let changes = first.target.as_ref().unwrap().latest.subscribe();
+            let mut second = sync_job(second_server.clone());
+            assert!(second.bind_remote_home("/fixture/.codex".into()));
+            assert!(!first.is_current());
+            assert!(second.is_current());
+            assert!(changes.has_changed().unwrap());
+            assert!(Arc::ptr_eq(
+                first.target.as_ref().unwrap(),
+                second.target.as_ref().unwrap(),
+            ));
+            assert_eq!(second.server.codex_home, "/fixture/.codex");
+            let entry_changes = second.host.latest.subscribe();
+            let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            cancel_server_jobs(&second_server);
+            assert!(!second.is_current());
+            assert!(entry_changes.has_changed().unwrap());
+        }
+    }
+
+    #[test]
+    fn slower_home_resolution_cannot_replace_a_newer_request() {
+        let mut older_server = server(&Uuid::new_v4().to_string());
+        older_server.host = Uuid::new_v4().to_string();
+        let mut newer_server = older_server.clone();
+        newer_server.id = Uuid::new_v4().to_string();
+        newer_server.codex_home = "~/.codex/".into();
+        let mut older = sync_job(older_server);
+        let mut newer = sync_job(newer_server);
+        assert!(newer.bind_remote_home("/fixture/.codex".into()));
+        assert!(!older.bind_remote_home("/fixture/.codex".into()));
+        assert!(!older.is_current());
+        assert!(newer.is_current());
+        assert_eq!(
+            newer.target.as_ref().unwrap().latest.borrow().generation,
+            newer.generation,
+        );
+    }
+
+    #[test]
+    fn cancelled_home_resolution_cannot_supersede_a_live_target() {
+        let mut live_server = server(&Uuid::new_v4().to_string());
+        live_server.host = Uuid::new_v4().to_string();
+        let mut cancelled_server = live_server.clone();
+        cancelled_server.id = Uuid::new_v4().to_string();
+        cancelled_server.codex_home = "~/.codex/".into();
+        let mut live = sync_job(live_server);
+        assert!(live.bind_remote_home("/fixture/.codex".into()));
+        let mut cancelled = sync_job(cancelled_server.clone());
+        {
+            let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            cancel_server_jobs(&cancelled_server);
+        }
+        assert!(!cancelled.bind_remote_home("/fixture/.codex".into()));
+        assert!(live.is_current());
+    }
+
+    #[test]
+    fn distinct_resolved_homes_remain_independent() {
+        let mut first_server = server(&Uuid::new_v4().to_string());
+        first_server.host = Uuid::new_v4().to_string();
+        let mut second_server = first_server.clone();
+        second_server.id = Uuid::new_v4().to_string();
+        second_server.codex_home = "~/.second-profile".into();
+        let mut first = sync_job(first_server.clone());
+        let mut second = sync_job(second_server);
+        assert!(first.bind_remote_home("/fixture/.codex".into()));
+        assert!(second.bind_remote_home("/fixture/.second-profile".into()));
+        assert!(first.is_current());
+        assert!(second.is_current());
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_server_jobs(&first_server);
+        assert!(!first.is_current());
+        assert!(second.is_current());
+    }
+
+    #[test]
+    fn configured_path_does_not_reserve_a_directory_until_it_is_resolved() {
+        let mut first_server = server(&Uuid::new_v4().to_string());
+        first_server.host = Uuid::new_v4().to_string();
+        let mut second_server = first_server.clone();
+        second_server.id = Uuid::new_v4().to_string();
+        second_server.codex_home = "/fixture/.codex".into();
+        let mut first = sync_job(first_server);
+        assert!(first.bind_remote_home("/fixture/.codex".into()));
+        let mut second = sync_job(second_server);
+        assert!(first.is_current());
+        // The absolute configured path may now be a symlink to another profile.
+        assert!(second.bind_remote_home("/fixture/.second-profile".into()));
+        assert!(first.is_current());
+        assert!(second.is_current());
+    }
+
+    #[test]
+    fn local_switch_preserves_a_newer_independent_job_awaiting_home_resolution() {
+        let mut following_server = server(&Uuid::new_v4().to_string());
+        following_server.host = Uuid::new_v4().to_string();
+        let mut independent_server = following_server.clone();
+        independent_server.id = Uuid::new_v4().to_string();
+        independent_server.codex_home = "~/.codex/".into();
+        let mut following = sync_job(following_server);
+        following.host.latest.send_replace(HostReservation {
+            generation: following.generation,
+            tied_to_local_account: true,
+        });
+        assert!(following.bind_remote_home("/fixture/.codex".into()));
+        let mut independent = sync_job(independent_server);
+        {
+            let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            cancel_local_follow_job(&following.host, false);
+            cancel_local_follow_job(following.target.as_ref().unwrap(), true);
+        }
+        assert!(!following.is_current());
+        assert!(independent.is_current());
+        assert!(independent.bind_remote_home("/fixture/.codex".into()));
+        assert!(independent.is_current());
+    }
+
+    #[test]
+    fn different_homes_on_the_same_host_do_not_supersede_or_cancel_each_other() {
+        let mut first_server = server("first-profile");
+        first_server.host = format!("profiles-{}", Uuid::new_v4());
+        let mut second_server = first_server.clone();
+        second_server.id = "second-profile".into();
+        second_server.codex_home = "~/.second-profile".into();
+        let first = host_jobs(&first_server, false);
+        let second = host_jobs(&second_server, false);
+        assert!(!Arc::ptr_eq(&first, &second));
+        let first_generation = next_generation();
+        let second_generation = next_generation();
+        first.latest.send_replace(HostReservation {
+            generation: first_generation,
+            tied_to_local_account: true,
+        });
+        second.latest.send_replace(HostReservation {
+            generation: second_generation,
+            tied_to_local_account: false,
+        });
+        assert_eq!(first.latest.borrow().generation, first_generation);
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        cancel_server_jobs(&first_server);
+        assert!(first.latest.borrow().generation > first_generation);
+        assert_eq!(second.latest.borrow().generation, second_generation);
+    }
+
+    #[test]
     fn local_account_change_cancels_only_local_follow_jobs() {
         let mut independent_server = server("independent");
         independent_server.host = format!("independent-{}", Uuid::new_v4());
         let mut following_server = server("following");
         following_server.host = format!("following-{}", Uuid::new_v4());
-        let independent = host_jobs(&independent_server);
-        let following = host_jobs(&following_server);
+        let independent = host_jobs(&independent_server, false);
+        let following = host_jobs(&following_server, false);
         let independent_generation = next_generation();
         let following_generation = next_generation();
         independent.latest.send_replace(HostReservation {
@@ -1785,8 +2022,8 @@ mod tests {
             generation: following_generation,
             tied_to_local_account: true,
         });
-        cancel_local_follow_job(&independent);
-        cancel_local_follow_job(&following);
+        cancel_local_follow_job(&independent, false);
+        cancel_local_follow_job(&following, false);
         assert_eq!(
             independent.latest.borrow().generation,
             independent_generation
@@ -1908,6 +2145,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn sync_creates_a_private_home_without_changing_another_profile() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = Fixture::new();
+        let existing_home = fixture.home.clone();
+        let existing_auth = br#"{"fixture":"existing"}"#;
+        std::fs::write(existing_home.join("auth.json"), existing_auth).unwrap();
+        fixture.home = fixture.root.join("new profile");
+        assert!(!fixture.home.exists());
+        let new_auth = br#"{"fixture":"new"}"#;
+        let output = fixture.complete(1, new_auth);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(fixture.home.join("auth.json")).unwrap(), new_auth);
+        assert_eq!(
+            std::fs::metadata(&fixture.home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read(existing_home.join("auth.json")).unwrap(),
+            existing_auth
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing_home.join("config.toml")).unwrap(),
+            "# fixture must remain byte-identical\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remote_auth_only_atomic_secure_write_leaves_no_sidecars() {
         use std::os::unix::fs::PermissionsExt;
         let fixture = Fixture::new();
@@ -1946,7 +2215,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn no_listener_syncs_files_but_missing_home_is_not_created() {
+    fn no_listener_syncs_files_and_initializes_missing_home() {
         let fixture = Fixture::new();
         let failed = fixture.complete(1, br#"{"fixture":true}"#);
         assert!(failed.status.success());
@@ -1955,8 +2224,11 @@ mod tests {
         assert!(stages.contains("applied"));
         std::fs::remove_dir_all(&fixture.home).unwrap();
         let missing = fixture.complete(2, br#"{"fixture":true}"#);
-        assert!(!missing.status.success());
-        assert!(!fixture.home.exists());
+        assert!(missing.status.success());
+        assert_eq!(
+            std::fs::read(fixture.home.join("auth.json")).unwrap(),
+            br#"{"fixture":true}"#
+        );
     }
 
     #[cfg(unix)]
