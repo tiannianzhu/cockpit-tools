@@ -46,18 +46,25 @@ fn collect_usage_instances() -> Result<Vec<UsageInstance>, String> {
 }
 
 pub fn apply_report_cost(report: &mut CodexSessionUsageReport) {
+    let price = |model: &str, usage: &cockpit_session_usage::CodexSessionUsagePricingGroup| {
+        crate::modules::codex_local_access::try_estimate_model_token_cost_usd_for_service_tier(
+            model,
+            usage.service_tier.as_deref(),
+            usage.context_input_tokens,
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+        )
+    };
     for session in report.session_tokens.iter_mut().flatten() {
-        session.apply_cost(crate::modules::codex_local_access::try_estimate_model_token_cost_usd);
+        session.apply_cost(price);
+    }
+    for day in &mut report.by_day {
+        day.apply_cost(price);
     }
     report.totals.estimated_cost_usd = report.by_model.iter_mut().fold(0.0, |sum, row| {
-        let cost = crate::modules::codex_local_access::estimate_model_token_cost_usd(
-            &row.key,
-            row.input_tokens,
-            row.cached_input_tokens,
-            row.output_tokens,
-        );
-        row.estimated_cost_usd = Some(cost);
-        sum + cost
+        row.apply_cost(price);
+        sum + row.estimated_cost_usd.unwrap_or(0.0)
     });
 }
 

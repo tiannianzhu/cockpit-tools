@@ -1,7 +1,7 @@
 //! 从 Codex 会话 JSONL（rollout）汇总真实 Token 用量。
 //!
-//! 算法对齐 cc-switch：优先 `last_token_usage`，按完整快照签名去重，
-//! 缺 last 时回退 `total_token_usage` 高水位差；分叉会话跳过父 rollout
+//! 优先官方 `token_usage_record`，按 response_id 去重；旧日志使用
+//! `last_token_usage` 或累计高水位差。分叉会话跳过父 rollout
 //! 在 fork 时刻之前的重放前缀。
 //!
 //! 数据与官方配额、API 服务 `request_logs` 完全隔离，打开用量面板时才扫描。
@@ -25,6 +25,8 @@ const DEFAULT_INSTANCE_NAME: &str = "默认实例";
 const REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
 const SEGMENT_REQUEST_ID_PREFIX: &str = "codex_session:thread-v2";
 const INSERT_BATCH_SIZE: usize = 500;
+const LONG_CONTEXT_THRESHOLD_TOKENS: u64 = 272_000;
+const USAGE_PARSER_VERSION: i64 = 2;
 
 static REPLAY_CACHE: OnceLock<Mutex<ReplayCaches>> = OnceLock::new();
 
@@ -62,6 +64,40 @@ pub struct CodexSessionUsageBreakdownRow {
     pub request_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pricing_usage: Vec<CodexSessionUsagePricingGroup>,
+}
+
+/// Aggregate only requests that share a service tier and context-length rate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionUsagePricingGroup {
+    /// Mixed-model rows carry the model; model rows retain their key as fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    pub context_input_tokens: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl CodexSessionUsageBreakdownRow {
+    pub fn apply_cost(
+        &mut self,
+        mut price: impl FnMut(&str, &CodexSessionUsagePricingGroup) -> Option<f64>,
+    ) {
+        self.estimated_cost_usd = if self.pricing_usage.is_empty() {
+            None
+        } else {
+            self.pricing_usage.iter().try_fold(0.0, |sum, usage| {
+                let cost = price(usage.model.as_deref().unwrap_or(&self.key), usage)?;
+                let total = sum + cost;
+                (cost.is_finite() && cost >= 0.0 && total.is_finite()).then_some(total)
+            })
+        };
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,12 +163,16 @@ pub struct CodexSessionTokenStats {
 impl CodexSessionTokenStats {
     /// Price this session only; child sessions retain their own independent rows.
     /// Missing models or prices must not be presented as a free session.
-    pub fn apply_cost(&mut self, mut price: impl FnMut(&str, u64, u64, u64) -> Option<f64>) {
+    pub fn apply_cost(
+        &mut self,
+        mut price: impl FnMut(&str, &CodexSessionUsagePricingGroup) -> Option<f64>,
+    ) {
         self.estimated_cost_usd = if self.by_model.is_empty() {
             None
         } else {
-            self.by_model.iter().try_fold(0.0, |sum, row| {
-                let cost = price(&row.key, row.input_tokens, row.cached_input_tokens, row.output_tokens)?;
+            self.by_model.iter_mut().try_fold(0.0, |sum, row| {
+                row.apply_cost(&mut price);
+                let cost = row.estimated_cost_usd?;
                 let total = sum + cost;
                 (cost.is_finite() && cost >= 0.0 && total.is_finite()).then_some(total)
             })
@@ -233,7 +273,8 @@ struct ParsedTokenEvent {
     delta: DeltaTokens,
     event_index: Option<u32>,
     model: String,
-    timestamp: Option<i64>,
+    service_tier: Option<String>,
+    timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]
@@ -252,6 +293,8 @@ struct ParsedCodexFile {
 #[derive(Default)]
 struct TokenParseState {
     current_model: String,
+    current_service_tier: Option<String>,
+    usage_record_ids: HashSet<String>,
     total_high_water: Option<CumulativeTokens>,
     last_signature_by_source: HashMap<Option<String>, TokenUsageSignature>,
     previous_token_signature: Option<TokenUsageSignature>,
@@ -286,7 +329,7 @@ impl SessionUsageStore {
         if let Some(parent) = self.db_path.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("创建会话用量目录失败: {error}"))?;
         }
-        let conn = Connection::open(&self.db_path)
+        let mut conn = Connection::open(&self.db_path)
             .map_err(|error| format!("打开会话用量库失败: {error}"))?;
         conn.execute_batch(
             "
@@ -306,6 +349,7 @@ impl SessionUsageStore {
                 instance_name TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 model TEXT NOT NULL,
+                service_tier TEXT,
                 timestamp INTEGER NOT NULL,
                 input_tokens INTEGER NOT NULL,
                 cached_input_tokens INTEGER NOT NULL,
@@ -333,6 +377,28 @@ impl SessionUsageStore {
             ",
         )
         .map_err(|error| format!("初始化会话用量库失败: {error}"))?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let has_tier: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_usage_events') WHERE name = 'service_tier')",
+                [], |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_tier {
+            tx.execute_batch("ALTER TABLE session_usage_events ADD COLUMN service_tier TEXT;")
+                .map_err(|error| error.to_string())?;
+        }
+        if !has_tier || get_meta_i64(&tx, "usage_parser_version") != Some(USAGE_PARSER_VERSION) {
+            // Reparse once after changing the usage source; retain totals until sync succeeds.
+            tx.execute_batch("
+                DELETE FROM session_log_sync;
+                DELETE FROM session_usage_meta WHERE key = 'last_synced_at';")
+                .map_err(|error| error.to_string())?;
+            set_meta(&tx, "usage_parser_version", &USAGE_PARSER_VERSION.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(conn)
     }
 
@@ -355,7 +421,7 @@ impl SessionUsageStore {
                 "
                 DELETE FROM session_usage_events;
                 DELETE FROM session_log_sync;
-                DELETE FROM session_usage_meta;
+                DELETE FROM session_usage_meta WHERE key != 'usage_parser_version';
                 DELETE FROM session_token_stats;
                 ",
             )
@@ -584,23 +650,9 @@ const TOKEN_STATS_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 fn query_session_tokens(conn: &Connection) -> Result<Vec<CodexSessionTokenStats>, String> {
     // Lifetime totals per session, independent of the summary's date filters.
-    let mut stmt = conn.prepare("SELECT session_id, model, SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens), COUNT(*) FROM session_usage_events GROUP BY session_id, model ORDER BY session_id, model")
-        .map_err(|error| error.to_string())?;
-    let rows = stmt.query_map([], |row| {
-        let model: String = row.get(1)?;
-        let input = row.get::<_, i64>(2)?.max(0) as u64;
-        let cached = row.get::<_, i64>(3)?.max(0) as u64;
-        let output = row.get::<_, i64>(4)?.max(0) as u64;
-        Ok((row.get::<_, String>(0)?, CodexSessionUsageBreakdownRow {
-            key: model.clone(), label: model,
-            input_tokens: input, cached_input_tokens: cached, output_tokens: output,
-            total_tokens: input.saturating_add(output), request_count: row.get::<_, i64>(5)?.max(0) as u64,
-            estimated_cost_usd: None,
-        }))
-    }).map_err(|error| error.to_string())?;
+    let rows = query_pricing_breakdown(conn, "", &[], "session_id")?;
     let mut sessions = std::collections::BTreeMap::<String, CodexSessionTokenStats>::new();
-    for row in rows {
-        let (id, model) = row.map_err(|error| error.to_string())?;
+    for (id, model) in rows {
         let session = sessions.entry(id.clone()).or_insert_with(|| CodexSessionTokenStats {
             session_id: id, ..Default::default()
         });
@@ -610,6 +662,54 @@ fn query_session_tokens(conn: &Connection) -> Result<Vec<CodexSessionTokenStats>
         session.by_model.push(model);
     }
     Ok(sessions.into_values().collect())
+}
+
+fn query_pricing_breakdown(
+    conn: &Connection,
+    where_sql: &str,
+    params: &[rusqlite::types::Value],
+    key_column: &str,
+) -> Result<Vec<(String, CodexSessionUsageBreakdownRow)>, String> {
+    let sql = format!(
+        "SELECT {key_column}, model, service_tier, MAX(input_tokens),
+                SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens), COUNT(*)
+         FROM session_usage_events {where_sql}
+         GROUP BY {key_column}, model, service_tier, input_tokens > {LONG_CONTEXT_THRESHOLD_TOKENS}
+         ORDER BY {key_column}, model, service_tier, MAX(input_tokens)"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            CodexSessionUsagePricingGroup {
+                model: None,
+                service_tier: row.get(2)?,
+                context_input_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                cached_input_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+            },
+            row.get::<_, i64>(7)?.max(0) as u64,
+        ))
+    }).map_err(|error| error.to_string())?;
+    let mut grouped = std::collections::BTreeMap::<(String, String), CodexSessionUsageBreakdownRow>::new();
+    for row in rows {
+        let (id, model, usage, requests) = row.map_err(|error| error.to_string())?;
+        let entry = grouped.entry((id, model.clone())).or_insert_with(|| CodexSessionUsageBreakdownRow {
+            key: model.clone(), label: model,
+            input_tokens: 0, cached_input_tokens: 0, output_tokens: 0,
+            total_tokens: 0, request_count: 0, estimated_cost_usd: None,
+            pricing_usage: Vec::new(),
+        });
+        entry.input_tokens = entry.input_tokens.saturating_add(usage.input_tokens);
+        entry.cached_input_tokens = entry.cached_input_tokens.saturating_add(usage.cached_input_tokens);
+        entry.output_tokens = entry.output_tokens.saturating_add(usage.output_tokens);
+        entry.total_tokens = entry.input_tokens.saturating_add(entry.output_tokens);
+        entry.request_count = entry.request_count.saturating_add(requests);
+        entry.pricing_usage.push(usage);
+    }
+    Ok(grouped.into_iter().map(|((id, _), row)| (id, row)).collect())
 }
 
 pub fn read_token_stats_from_rollout_uncached(
@@ -1081,19 +1181,20 @@ fn sync_segmented_group(
             tx.execute(
                 "INSERT INTO session_usage_events (
                     request_id, instance_id, instance_name, session_id, model,
-                    timestamp, input_tokens, cached_input_tokens, output_tokens, file_path
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    timestamp, input_tokens, cached_input_tokens, output_tokens, file_path, service_tier
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     request_id,
                     instance.id,
                     instance.name,
                     root_id,
                     event.model,
-                    event.timestamp.unwrap_or(0),
+                    event.timestamp.map(|value| value.timestamp()).unwrap_or(0),
                     event.delta.input as i64,
                     event.delta.cached_input as i64,
                     event.delta.output as i64,
-                    path_str
+                    path_str,
+                    event.service_tier,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1318,13 +1419,24 @@ fn sync_single_file(
         let tx = conn
             .unchecked_transaction()
             .map_err(|error| format!("开启会话用量写入事务失败: {error}"))?;
+        if last_offset == 0 {
+            // Request indexes change when formerly omitted compaction calls are included.
+            tx.execute("DELETE FROM session_usage_events WHERE file_path = ?1", params![file_path_str])
+                .map_err(|error| error.to_string())?;
+        }
         {
             let mut statement = tx
                 .prepare_cached(
-                    "INSERT OR IGNORE INTO session_usage_events (
+                    "INSERT INTO session_usage_events (
                         request_id, instance_id, instance_name, session_id, model,
-                        timestamp, input_tokens, cached_input_tokens, output_tokens, file_path
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        timestamp, input_tokens, cached_input_tokens, output_tokens, file_path, service_tier
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    ON CONFLICT(request_id) DO UPDATE SET
+                        model = excluded.model, timestamp = excluded.timestamp,
+                        input_tokens = excluded.input_tokens,
+                        cached_input_tokens = excluded.cached_input_tokens,
+                        output_tokens = excluded.output_tokens,
+                        file_path = excluded.file_path, service_tier = excluded.service_tier",
                 )
                 .map_err(|error| format!("准备会话用量写入失败: {error}"))?;
             for chunk in to_insert.chunks(INSERT_BATCH_SIZE) {
@@ -1337,11 +1449,12 @@ fn sync_single_file(
                             instance.name,
                             root_thread_id,
                             event.model,
-                            event.timestamp.unwrap_or(0),
+                            event.timestamp.map(|value| value.timestamp()).unwrap_or(0),
                             event.delta.input as i64,
                             event.delta.cached_input as i64,
                             event.delta.output as i64,
                             file_path_str,
+                            event.service_tier,
                         ])
                         .map_err(|error| format!("写入会话用量失败: {error}"))?;
                     if changed > 0 {
@@ -1478,10 +1591,11 @@ fn parse_codex_file_with_state(
         let is_event_msg = line.contains("\"event_msg\"");
         let is_turn_context = line.contains("\"turn_context\"");
         let is_session_meta = line.contains("\"session_meta\"");
-        if !is_event_msg && !is_turn_context && !is_session_meta {
+        let is_usage_record = line.contains("\"token_usage_record\"");
+        if !is_event_msg && !is_turn_context && !is_session_meta && !is_usage_record {
             continue;
         }
-        if is_event_msg && !line.contains("\"token_count\"") {
+        if is_event_msg && !line.contains("\"token_count\"") && !line.contains("\"thread_settings_applied\"") {
             continue;
         }
 
@@ -1546,22 +1660,67 @@ fn parse_codex_file_with_state(
                     }
                 }
             }
-            "event_msg" => {
+            "event_msg" | "token_usage_record" => {
                 let Some(payload) = value.get("payload") else {
                     continue;
                 };
-                if payload.get("type").and_then(JsonValue::as_str) != Some("token_count") {
+                let is_usage_record = event_type == "token_usage_record";
+                if !is_usage_record && payload.get("type").and_then(JsonValue::as_str) == Some("thread_settings_applied") {
+                    // Forked histories retain their original settings owner.
+                    let owner = payload.get("thread_id").and_then(JsonValue::as_str);
+                    if owner.is_some() && owner != root_thread_id.as_deref() {
+                        continue;
+                    }
+                    if let Some(settings) = payload.get("thread_settings") {
+                        if let Some(model) = settings.get("model").and_then(JsonValue::as_str) {
+                            state.current_model = normalize_codex_model(model);
+                        }
+                        state.current_service_tier = settings.get("service_tier")
+                            .and_then(JsonValue::as_str)
+                            .map(|tier| tier.trim().to_ascii_lowercase())
+                            .filter(|tier| !tier.is_empty());
+                    }
                     continue;
                 }
-                let Some(info) = payload.get("info").filter(|info| !info.is_null()) else {
-                    continue;
+                let (signature, total, last, response_id) = if is_usage_record {
+                    let Some(response_id) = non_empty_string(payload.get("response_id")) else {
+                        continue;
+                    };
+                    let Some(last) = payload.get("usage").and_then(parse_cumulative_tokens) else {
+                        continue;
+                    };
+                    (
+                        TokenUsageSignature {
+                            total: parse_signature_counters(payload.get("thread_token_usage")),
+                            last: parse_signature_counters(payload.get("usage")),
+                        },
+                        payload.get("thread_token_usage").and_then(parse_cumulative_tokens),
+                        Some(last),
+                        Some(response_id),
+                    )
+                } else {
+                    if payload.get("type").and_then(JsonValue::as_str) != Some("token_count")
+                        || !state.usage_record_ids.is_empty()
+                    {
+                        // Official records precede the UI snapshots of the same requests.
+                        continue;
+                    }
+                    let Some(info) = payload.get("info").filter(|info| !info.is_null()) else {
+                        continue;
+                    };
+                    let Some(signature) = parse_token_signature(info) else {
+                        continue;
+                    };
+                    (
+                        signature,
+                        info.get("total_token_usage").and_then(parse_cumulative_tokens),
+                        info.get("last_token_usage").and_then(parse_cumulative_tokens),
+                        None,
+                    )
                 };
-                let Some(signature) = parse_token_signature(info) else {
-                    continue;
-                };
-                if let Some(model) = info
-                    .get("model")
-                    .or_else(|| info.get("model_name"))
+                if let Some(model) = payload
+                    .get("info")
+                    .and_then(|info| info.get("model").or_else(|| info.get("model_name")))
                     .or_else(|| payload.get("model"))
                     .and_then(JsonValue::as_str)
                 {
@@ -1569,12 +1728,6 @@ fn parse_codex_file_with_state(
                 }
 
                 let snapshot_source = token_snapshot_source(payload);
-                let total = info
-                    .get("total_token_usage")
-                    .and_then(parse_cumulative_tokens);
-                let last = info
-                    .get("last_token_usage")
-                    .and_then(parse_cumulative_tokens);
                 if total.is_none() && last.is_none() {
                     continue;
                 }
@@ -1593,9 +1746,13 @@ fn parse_codex_file_with_state(
                     }
                 }
                 let has_total_snapshot = total.is_some();
-                let duplicate_snapshot = has_total_snapshot
-                    && (state.last_signature_by_source.get(&snapshot_source) == Some(&signature)
-                        || state.previous_token_signature.as_ref() == Some(&signature));
+                let duplicate_snapshot = if let Some(response_id) = response_id {
+                    !state.usage_record_ids.insert(response_id)
+                } else {
+                    has_total_snapshot
+                        && (state.last_signature_by_source.get(&snapshot_source) == Some(&signature)
+                            || state.previous_token_signature.as_ref() == Some(&signature))
+                };
                 if has_total_snapshot {
                     state
                         .last_signature_by_source
@@ -1640,8 +1797,8 @@ fn parse_codex_file_with_state(
                     delta,
                     event_index: nonzero_index,
                     model: state.current_model.clone(),
-                    timestamp: parse_timestamp(value.get("timestamp"))
-                        .map(|value| value.timestamp()),
+                    service_tier: state.current_service_tier.clone(),
+                    timestamp: parse_timestamp(value.get("timestamp")),
                 });
             }
             _ => {}
@@ -1715,44 +1872,17 @@ fn parent_signatures_before(
         }
     }
 
-    let file = File::open(parent_path)
-        .map_err(|error| format!("无法打开父 rollout {}: {error}", parent_path.display()))?;
+    let parsed = parse_codex_file(parent_path, thread_id_from_filename(parent_path))?;
     let mut events = Vec::new();
     let mut has_token_without_timestamp = false;
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<JsonValue>(&line) else {
-            continue;
-        };
-        let timestamp = parse_timestamp(value.get("timestamp"));
-        if value.get("type").and_then(JsonValue::as_str) != Some("event_msg")
-            || value
-                .get("payload")
-                .and_then(|payload| payload.get("type"))
-                .and_then(JsonValue::as_str)
-                != Some("token_count")
-        {
-            continue;
-        }
-        let Some(info) = value
-            .get("payload")
-            .and_then(|payload| payload.get("info"))
-            .filter(|info| !info.is_null())
-        else {
-            continue;
-        };
-        let Some(signature) = parse_token_signature(info) else {
-            continue;
-        };
-        let Some(timestamp) = timestamp else {
+    for event in parsed.token_events {
+        let Some(timestamp) = event.timestamp else {
             has_token_without_timestamp = true;
             continue;
         };
         events.push(TimestampedTokenSignature {
             timestamp,
-            signature,
+            signature: event.signature,
         });
     }
 
@@ -1777,7 +1907,7 @@ fn signatures_before(
 ) -> Result<Vec<TokenUsageSignature>, String> {
     if timeline.has_token_without_timestamp {
         return Err(format!(
-            "父 rollout {} 的 token_count 缺少有效 timestamp",
+            "父 rollout {} 的用量记录缺少有效 timestamp",
             parent_path.display()
         ));
     }
@@ -2010,6 +2140,12 @@ fn query_breakdown(
     label_column: Option<&str>,
     instance_names: &HashMap<String, String>,
 ) -> Result<Vec<CodexSessionUsageBreakdownRow>, String> {
+    if key_column == "model" {
+        let mut rows = query_pricing_breakdown(conn, where_sql, params, "model")?
+            .into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+        rows.sort_by(|left, right| right.total_tokens.cmp(&left.total_tokens).then(left.key.cmp(&right.key)));
+        return Ok(rows);
+    }
     let label_sql = label_column.unwrap_or(key_column);
     let sql = format!(
         "SELECT
@@ -2052,6 +2188,7 @@ fn query_breakdown(
                 total_tokens: input.saturating_add(output),
                 request_count: requests,
                 estimated_cost_usd: None,
+                pricing_usage: Vec::new(),
             })
         })
         .map_err(|error| format!("遍历会话用量分组失败: {error}"))?;
@@ -2065,7 +2202,7 @@ fn query_day_breakdown(
     params: &[rusqlite::types::Value],
 ) -> Result<Vec<CodexSessionUsageBreakdownRow>, String> {
     let sql = format!(
-        "SELECT timestamp, input_tokens, cached_input_tokens, output_tokens
+        "SELECT timestamp, model, service_tier, input_tokens, cached_input_tokens, output_tokens
          FROM session_usage_events {where_sql}"
     );
     let mut statement = conn
@@ -2075,41 +2212,73 @@ fn query_day_breakdown(
         .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?.max(0) as u64,
-                row.get::<_, i64>(2)?.max(0) as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
                 row.get::<_, i64>(3)?.max(0) as u64,
+                row.get::<_, i64>(4)?.max(0) as u64,
+                row.get::<_, i64>(5)?.max(0) as u64,
             ))
         })
         .map_err(|error| format!("遍历会话用量日期失败: {error}"))?;
 
-    let mut grouped: HashMap<String, CodexSessionUsageTotals> = HashMap::new();
+    let mut days = std::collections::BTreeMap::<String, CodexSessionUsageBreakdownRow>::new();
+    let mut groups = std::collections::BTreeMap::<
+        (String, String, Option<String>, bool),
+        CodexSessionUsagePricingGroup,
+    >::new();
     for row in rows {
-        let (timestamp, input, cached, output) =
+        let (timestamp, model, service_tier, input, cached, output) =
             row.map_err(|error| format!("解析会话用量日期失败: {error}"))?;
         let key = local_day_key(timestamp);
-        let entry = grouped.entry(key).or_default();
-        entry.input_tokens = entry.input_tokens.saturating_add(input);
-        entry.cached_input_tokens = entry.cached_input_tokens.saturating_add(cached);
-        entry.output_tokens = entry.output_tokens.saturating_add(output);
-        entry.total_tokens = entry
+        let day = days
+            .entry(key.clone())
+            .or_insert_with(|| CodexSessionUsageBreakdownRow {
+                label: key.clone(),
+                key: key.clone(),
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                request_count: 0,
+                estimated_cost_usd: None,
+                pricing_usage: Vec::new(),
+            });
+        day.input_tokens = day.input_tokens.saturating_add(input);
+        day.cached_input_tokens = day.cached_input_tokens.saturating_add(cached);
+        day.output_tokens = day.output_tokens.saturating_add(output);
+        day.total_tokens = day
             .total_tokens
             .saturating_add(input.saturating_add(output));
-        entry.request_count = entry.request_count.saturating_add(1);
-    }
+        day.request_count = day.request_count.saturating_add(1);
 
-    Ok(grouped
-        .into_iter()
-        .map(|(key, totals)| CodexSessionUsageBreakdownRow {
-            label: key.clone(),
-            key,
-            input_tokens: totals.input_tokens,
-            cached_input_tokens: totals.cached_input_tokens,
-            output_tokens: totals.output_tokens,
-            total_tokens: totals.total_tokens,
-            request_count: totals.request_count,
-            estimated_cost_usd: None,
-        })
-        .collect())
+        // Match model/session grouping: summed tokens cannot select context rates.
+        let group = groups
+            .entry((
+                key,
+                model.clone(),
+                service_tier.clone(),
+                input > LONG_CONTEXT_THRESHOLD_TOKENS,
+            ))
+            .or_insert_with(|| CodexSessionUsagePricingGroup {
+                model: Some(model),
+                service_tier,
+                context_input_tokens: 0,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+            });
+        group.context_input_tokens = group.context_input_tokens.max(input);
+        group.input_tokens = group.input_tokens.saturating_add(input);
+        group.cached_input_tokens = group.cached_input_tokens.saturating_add(cached);
+        group.output_tokens = group.output_tokens.saturating_add(output);
+    }
+    for ((day, _, _, _), usage) in groups {
+        days.get_mut(&day)
+            .expect("pricing group has a daily row")
+            .pricing_usage
+            .push(usage);
+    }
+    Ok(days.into_values().collect())
 }
 
 fn local_day_key(timestamp: i64) -> String {
@@ -2138,18 +2307,181 @@ mod tests {
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD_ID: &str = "00000000-0000-4000-8000-000000000002";
 
+    fn daily_cost_connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_usage_events (
+            timestamp INTEGER, model TEXT, service_tier TEXT,
+            input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER,
+            instance_id TEXT
+        )",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn daily_fixture_price(model: &str, usage: &CodexSessionUsagePricingGroup) -> Option<f64> {
+        let rate = match model {
+            "model-a" => 2.0,
+            "model-b" => 4.0,
+            _ => return None,
+        };
+        let tier = if usage.service_tier.as_deref() == Some("fast") {
+            2.0
+        } else {
+            1.0
+        };
+        let context = if usage.context_input_tokens > LONG_CONTEXT_THRESHOLD_TOKENS {
+            3.0
+        } else {
+            1.0
+        };
+        Some(
+            ((usage.input_tokens - usage.cached_input_tokens) as f64
+                + usage.cached_input_tokens as f64 * 0.25
+                + usage.output_tokens as f64 * 4.0)
+                * rate
+                * tier
+                * context,
+        )
+    }
+
+    #[test]
+    fn daily_cost_preserves_filters_models_tiers_context_and_remote_transport() {
+        let conn = daily_cost_connection();
+        let noon = Local
+            .with_ymd_and_hms(2026, 10, 3, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let next_day = Local
+            .with_ymd_and_hms(2026, 10, 4, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        for (timestamp, model, tier, input, cached, output, instance) in [
+            (noon, "model-a", "default", 150_000, 100_000, 10, "a"),
+            (noon + 1, "model-a", "default", 160_000, 120_000, 20, "a"),
+            (noon + 2, "model-a", "fast", 100, 80, 10, "a"),
+            (noon + 3, "model-a", "default", 272_001, 272_000, 30, "a"),
+            (noon + 4, "model-b", "default", 200, 100, 20, "a"),
+            (next_day, "model-a", "default", 150_000, 100_000, 10, "a"),
+            (noon, "model-a", "default", 150_000, 100_000, 10, "b"),
+        ] {
+            conn.execute(
+                "INSERT INTO session_usage_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![timestamp, model, tier, input, cached, output, instance],
+            )
+            .unwrap();
+        }
+        let params = vec![
+            rusqlite::types::Value::Integer(noon),
+            rusqlite::types::Value::Integer(noon + 4),
+            rusqlite::types::Value::Text("a".into()),
+        ];
+        let filter = "WHERE timestamp >= ?1 AND timestamp <= ?2 AND instance_id = ?3";
+        let days = query_day_breakdown(&conn, filter, &params).unwrap();
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].key, "2026-10-03");
+        assert_eq!(days[0].request_count, 5);
+        assert_eq!(days[0].total_tokens, 582_391);
+        assert_eq!(days[0].pricing_usage.len(), 4);
+        let short = days[0]
+            .pricing_usage
+            .iter()
+            .find(|usage| usage.input_tokens == 310_000)
+            .unwrap();
+        assert_eq!(short.model.as_deref(), Some("model-a"));
+        assert_eq!(short.context_input_tokens, 160_000);
+        assert_eq!(short.service_tier.as_deref(), Some("default"));
+
+        // SSH transports unpriced groups; the desktop applies its price book later.
+        let serialized = serde_json::to_value(&days).unwrap();
+        assert!(serialized[0]["estimatedCostUsd"].is_null());
+        let mut transported: Vec<CodexSessionUsageBreakdownRow> =
+            serde_json::from_value(serialized).unwrap();
+        transported[0].apply_cost(daily_fixture_price);
+        let expected = 145_120.0 * 2.0 + 80.0 * 2.0 * 2.0 + 68_121.0 * 2.0 * 3.0 + 205.0 * 4.0;
+        assert_eq!(transported[0].estimated_cost_usd, Some(expected));
+        let mut models =
+            query_breakdown(&conn, filter, &params, "model", None, &HashMap::new()).unwrap();
+        for model in &mut models {
+            model.apply_cost(daily_fixture_price);
+        }
+        assert_eq!(
+            models
+                .iter()
+                .map(|row| row.estimated_cost_usd.unwrap())
+                .sum::<f64>(),
+            expected
+        );
+        let restored: Vec<CodexSessionUsageBreakdownRow> =
+            serde_json::from_str(&serde_json::to_string(&transported).unwrap()).unwrap();
+        assert_eq!(restored[0].estimated_cost_usd, Some(expected));
+        assert_eq!(restored[0].pricing_usage.len(), 4);
+    }
+
+    #[test]
+    fn daily_cost_distinguishes_unknown_models_from_priced_zero() {
+        let conn = daily_cost_connection();
+        let noon = Local
+            .with_ymd_and_hms(2026, 10, 3, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        conn.execute(
+            "INSERT INTO session_usage_events VALUES (?1, 'model-a', NULL, 0, 0, 0, 'a')",
+            [noon],
+        )
+        .unwrap();
+        let mut day = query_day_breakdown(&conn, "", &[]).unwrap().remove(0);
+        day.apply_cost(daily_fixture_price);
+        assert_eq!(day.estimated_cost_usd, Some(0.0));
+        conn.execute(
+            "INSERT INTO session_usage_events VALUES (?1, 'unknown-model', NULL, 500, 0, 20, 'a')",
+            [noon],
+        )
+        .unwrap();
+        let mut day = query_day_breakdown(&conn, "", &[]).unwrap().remove(0);
+        day.apply_cost(daily_fixture_price);
+        assert_eq!(day.estimated_cost_usd, None);
+        assert_eq!(day.request_count, 2);
+        assert_eq!(day.total_tokens, 520);
+    }
+
+    #[test]
+    fn older_pricing_groups_use_model_row_key_and_unpriced_days_stay_unknown() {
+        let mut model: CodexSessionUsageBreakdownRow = serde_json::from_value(json!({
+            "key": "model-a", "label": "Model A", "inputTokens": 100,
+            "cachedInputTokens": 80, "outputTokens": 10, "totalTokens": 110,
+            "requestCount": 1, "pricingUsage": [{ "contextInputTokens": 100,
+                "inputTokens": 100, "cachedInputTokens": 80, "outputTokens": 10 }]
+        }))
+        .unwrap();
+        assert_eq!(model.pricing_usage[0].model, None);
+        model.apply_cost(daily_fixture_price);
+        assert_eq!(model.estimated_cost_usd, Some(160.0));
+        let mut day = model.clone();
+        day.key = "2026-10-03".into();
+        day.pricing_usage.clear();
+        day.apply_cost(daily_fixture_price);
+        assert_eq!(day.estimated_cost_usd, None);
+    }
+
     #[test]
     fn session_cost_groups_models_and_keeps_child_usage_separate() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE session_usage_events (session_id TEXT, model TEXT,
+            service_tier TEXT,
             input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER);
             INSERT INTO session_usage_events VALUES
-            ('parent', 'model-a', 100, 80, 10), ('parent', 'model-a', 50, 20, 5),
-            ('parent', 'model-b', 200, 100, 20), ('child', 'model-a', 30, 10, 3);").unwrap();
+            ('parent', 'model-a', NULL, 100, 80, 10), ('parent', 'model-a', NULL, 50, 20, 5),
+            ('parent', 'model-b', NULL, 200, 100, 20), ('child', 'model-a', NULL, 30, 10, 3);").unwrap();
         let mut sessions = query_session_tokens(&conn).unwrap();
-        let price = |model: &str, input: u64, cached: u64, output: u64| {
+        let price = |model: &str, usage: &CodexSessionUsagePricingGroup| {
             let rate = match model { "model-a" => 2.0, "model-b" => 4.0, _ => return None };
-            Some((input - cached) as f64 * rate + cached as f64 * 0.5 + output as f64 * 10.0)
+            Some((usage.input_tokens - usage.cached_input_tokens) as f64 * rate
+                + usage.cached_input_tokens as f64 * 0.5 + usage.output_tokens as f64 * 10.0)
         };
         for session in &mut sessions { session.apply_cost(price); }
         assert_eq!(sessions.len(), 2);
@@ -2162,7 +2494,7 @@ mod tests {
         parent.by_model[1].key = "unknown".into();
         parent.apply_cost(price);
         assert_eq!(parent.estimated_cost_usd, None);
-        parent.apply_cost(|_, _, _, _| Some(0.0));
+        parent.apply_cost(|_, _| Some(0.0));
         assert_eq!(parent.estimated_cost_usd, Some(0.0));
     }
 
@@ -2171,8 +2503,224 @@ mod tests {
         let mut stats: CodexSessionTokenStats = serde_json::from_value(json!({
             "sessionId": "old", "inputTokens": 10, "outputTokens": 1, "totalTokens": 11
         })).unwrap();
-        stats.apply_cost(|_, _, _, _| Some(0.0));
+        stats.apply_cost(|_, _| Some(0.0));
         assert_eq!(stats.estimated_cost_usd, None);
+    }
+
+    #[test]
+    fn pricing_groups_preserve_tier_and_per_request_context_size() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE session_usage_events (session_id TEXT, model TEXT,
+            service_tier TEXT, input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER);
+            INSERT INTO session_usage_events VALUES
+            ('parent', 'fixture-model', 'default', 150000, 100000, 10),
+            ('parent', 'fixture-model', 'default', 160000, 120000, 20),
+            ('parent', 'fixture-model', 'fast', 100, 80, 10),
+            ('parent', 'fixture-model', 'default', 272001, 272000, 30),
+            ('child', 'fixture-model', 'fast', 100, 80, 10);").unwrap();
+        let price = |_: &str, usage: &CodexSessionUsagePricingGroup| {
+            let tier = if usage.service_tier.as_deref() == Some("fast") { 2.0 } else { 1.0 };
+            let context = if usage.context_input_tokens > 272_000 { 3.0 } else { 1.0 };
+            Some((usage.input_tokens - usage.cached_input_tokens) as f64 * tier * context
+                + usage.cached_input_tokens as f64 * 0.1 * tier * context
+                + usage.output_tokens as f64 * 10.0 * tier)
+        };
+        let mut sessions = query_session_tokens(&conn).unwrap();
+        for session in &mut sessions { session.apply_cost(price); }
+        let parent = &sessions[1];
+        assert_eq!(parent.by_model.len(), 1);
+        let groups = &parent.by_model[0].pricing_usage;
+        assert_eq!(groups.len(), 3);
+        let short = groups.iter().find(|group| group.input_tokens == 310_000).unwrap();
+        assert_eq!(short.context_input_tokens, 160_000);
+        assert_eq!(sessions[0].estimated_cost_usd, Some(256.0));
+        assert_eq!(parent.estimated_cost_usd, Some(194_459.0));
+
+        let mut summary = query_breakdown(&conn, "WHERE session_id = ?", &[rusqlite::types::Value::Text("parent".into())], "model", None, &HashMap::new()).unwrap();
+        assert_eq!(summary.len(), 1);
+        summary[0].apply_cost(price);
+        assert_eq!(summary[0].estimated_cost_usd, parent.estimated_cost_usd);
+        let transported: Vec<CodexSessionTokenStats> = serde_json::from_str(&serde_json::to_string(&sessions).unwrap()).unwrap();
+        assert_eq!(transported[1].by_model[0].pricing_usage.len(), 3);
+        assert_eq!(transported[1].estimated_cost_usd, parent.estimated_cost_usd);
+    }
+
+    #[test]
+    fn parser_tracks_official_tier_settings_and_ignores_other_threads() {
+        let dir = make_temp_dir("codex-usage-tiers");
+        let file = rollout_path(&dir, PARENT_ID);
+        write_jsonl(&file, &[
+            session_meta(PARENT_ID),
+            thread_settings(PARENT_ID, Some("default")),
+            turn_context("fixture-model"),
+            token_count_with_last(100, 80, 10, 100, 80, 10, "codex", "2026-07-10T03:00:01Z"),
+            thread_settings(PARENT_ID, Some("priority")),
+            turn_context("fixture-model"),
+            thread_settings(CHILD_ID, Some("flex")),
+            token_count_with_last(200, 160, 20, 100, 80, 10, "codex", "2026-07-10T03:00:02Z"),
+            thread_settings(PARENT_ID, None),
+            token_count_with_last(300, 240, 30, 100, 80, 10, "codex", "2026-07-10T03:00:03Z"),
+        ]);
+        let parsed = parse_codex_file(&file, Some(PARENT_ID.to_string())).unwrap();
+        let tiers = parsed.token_events.iter().map(|event| event.service_tier.as_deref()).collect::<Vec<_>>();
+        assert_eq!(tiers, vec![Some("default"), Some("priority"), None]);
+        assert_eq!(nonzero_deltas(&parsed), vec![(100, 80, 10); 3]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_upgrade_recovers_tiers_once_without_losing_cached_totals() {
+        let dir = make_temp_dir("codex-usage-tier-migration");
+        let file = rollout_path(&dir.join("sessions"), PARENT_ID);
+        write_jsonl(&file, &[
+            session_meta(PARENT_ID),
+            thread_settings(PARENT_ID, Some("priority")),
+            token_count_with_last(100, 80, 10, 100, 80, 10, "codex", "2026-07-10T03:00:01Z"),
+        ]);
+        let instances = vec![UsageInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: dir.clone() }];
+        let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
+        assert_eq!(store.sync(false, &instances).unwrap().imported, 1);
+        let conn = store.open_conn().unwrap();
+        conn.execute_batch("ALTER TABLE session_usage_events DROP COLUMN service_tier;").unwrap();
+        drop(conn);
+
+        let cached = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(cached.totals.input_tokens, 100);
+        assert_eq!(cached.totals.request_count, 1);
+        assert_eq!(cached.last_synced_at, None);
+        store.sync(false, &instances).unwrap();
+        let repaired = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(repaired.totals.request_count, 1);
+        assert_eq!(repaired.by_model[0].pricing_usage[0].service_tier.as_deref(), Some("priority"));
+        assert!(repaired.last_synced_at.is_some());
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn thread_settings(thread_id: &str, service_tier: Option<&str>) -> JsonValue {
+        json!({"type": "event_msg", "payload": {
+            "type": "thread_settings_applied", "thread_id": thread_id,
+            "thread_settings": {"model": "fixture-model", "service_tier": service_tier},
+        }})
+    }
+
+    #[test]
+    fn official_records_include_compaction_and_keep_legacy_prefix_without_double_counting() {
+        let dir = make_temp_dir("codex-usage-records");
+        let file = rollout_path(&dir, PARENT_ID);
+        let first = usage_record("response-a", 200, 150, 20, 300, 230, 30, "2026-07-10T03:00:03Z");
+        write_jsonl(&file, &[
+            session_meta(PARENT_ID),
+            turn_context("fixture-model"),
+            token_count_with_last(100, 80, 10, 100, 80, 10, "codex", "2026-07-10T03:00:02Z"),
+            thread_settings(PARENT_ID, Some("priority")),
+            first.clone(),
+            token_count_with_last(300, 230, 30, 200, 150, 20, "codex", "2026-07-10T03:00:03Z"),
+            token_count_with_last(300, 230, 30, 200, 150, 20, "other", "2026-07-10T03:00:03Z"),
+            usage_record("response-compaction", 50, 40, 5, 350, 270, 35, "2026-07-10T03:00:04Z"),
+            json!({"type": "compacted", "payload": {}}),
+            // Equal request usage with a different response ID is a separate request.
+            usage_record("response-b", 200, 150, 20, 550, 420, 55, "2026-07-10T03:00:05Z"),
+            token_count_with_last(500, 380, 50, 200, 150, 20, "codex", "2026-07-10T03:00:05Z"),
+            first,
+        ]);
+        let parsed = parse_codex_file(&file, Some(PARENT_ID.into())).unwrap();
+        assert_eq!(nonzero_deltas(&parsed), vec![(100, 80, 10), (200, 150, 20), (50, 40, 5), (200, 150, 20)]);
+        assert_eq!(parsed.token_events[0].service_tier, None);
+        assert!(parsed.token_events[1..].iter().all(|event| event.service_tier.as_deref() == Some("priority")));
+        assert!(parsed.token_events.last().unwrap().delta.is_zero());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parser_upgrade_replaces_old_indexes_once_and_keeps_incremental_sync() {
+        let dir = make_temp_dir("codex-usage-record-upgrade");
+        let file = rollout_path(&dir.join("sessions"), PARENT_ID);
+        let mut log = vec![
+            session_meta(PARENT_ID),
+            thread_settings(PARENT_ID, Some("priority")),
+            usage_record("response-a", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z"),
+            token_count_with_last(100, 80, 10, 100, 80, 10, "codex", "2026-07-10T03:00:01Z"),
+            usage_record("response-compaction", 50, 40, 5, 150, 120, 15, "2026-07-10T03:00:02Z"),
+            usage_record("response-b", 200, 160, 20, 350, 280, 35, "2026-07-10T03:00:03Z"),
+            token_count_with_last(300, 240, 30, 200, 160, 20, "codex", "2026-07-10T03:00:03Z"),
+        ];
+        write_jsonl(&file, &log);
+        let instances = [UsageInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: dir.clone() }];
+        let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
+        assert_eq!(store.sync(false, &instances).unwrap().imported, 3);
+        let conn = store.open_conn().unwrap();
+        conn.execute("DELETE FROM session_usage_events WHERE request_id = ?1", params![format!("{REQUEST_ID_PREFIX}:{PARENT_ID}:3")]).unwrap();
+        conn.execute("UPDATE session_usage_events SET input_tokens=200, cached_input_tokens=160, output_tokens=20 WHERE request_id = ?1",
+            params![format!("{REQUEST_ID_PREFIX}:{PARENT_ID}:2")]).unwrap();
+        conn.execute("DELETE FROM session_usage_meta WHERE key='usage_parser_version'", []).unwrap();
+        drop(conn);
+
+        let cached = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!((cached.totals.input_tokens, cached.totals.request_count), (300, 2));
+        assert_eq!(cached.last_synced_at, None);
+        assert_eq!(store.sync(false, &instances).unwrap().imported, 3);
+        let repaired = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!((repaired.totals.input_tokens, repaired.totals.output_tokens, repaired.totals.request_count), (350, 35, 3));
+        assert_eq!(repaired.session_tokens.unwrap()[0].input_tokens, 350);
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 0);
+
+        log.push(usage_record("response-c", 70, 60, 7, 420, 340, 42, "2026-07-10T03:00:04Z"));
+        log.push(token_count_with_last(370, 300, 37, 70, 60, 7, "codex", "2026-07-10T03:00:04Z"));
+        write_jsonl(&file, &log);
+        assert_eq!(store.sync(false, &instances).unwrap().imported, 1);
+        let appended = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!((appended.totals.input_tokens, appended.totals.request_count), (420, 4));
+        assert_eq!(store.sync(true, &instances).unwrap().imported, 4);
+        let rebuilt = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert!(rebuilt.last_synced_at.is_some());
+        assert_eq!(rebuilt.files_tracked, 1);
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn official_record_fork_replay_including_compaction_is_not_billed_twice() {
+        let dir = make_temp_dir("codex-usage-record-fork");
+        let first = usage_record("response-a", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z");
+        let compaction = usage_record("response-compaction", 50, 40, 5, 150, 120, 15, "2026-07-10T03:00:02.300Z");
+        write_jsonl(&rollout_path(&dir.join("sessions"), PARENT_ID), &[
+            session_meta(PARENT_ID), turn_context("fixture-model"), first.clone(),
+        ]);
+        let segment_id = "10000000-0000-4000-8000-000000000001";
+        let continuation = dir.join("sessions").join(format!("rollout-2026-07-10T03-00-02-{PARENT_ID}_{segment_id}.jsonl"));
+        write_jsonl(&continuation, &[
+            session_meta_at(PARENT_ID, None, "2026-07-10T03:00:02Z"), first.clone(), compaction.clone(),
+            // Equal counters after the fork must not hide an independent child request.
+            usage_record("response-parent-later", 70, 60, 7, 220, 180, 22, "2026-07-10T03:00:02.900Z"),
+        ]);
+        write_jsonl(&rollout_path(&dir.join("sessions"), CHILD_ID), &[
+            session_meta_at(CHILD_ID, Some(PARENT_ID), "2026-07-10T03:00:02.500Z"),
+            turn_context("fixture-model"), first, compaction,
+            usage_record("response-child", 70, 60, 7, 220, 180, 22, "2026-07-10T03:00:02.600Z"),
+        ]);
+        let instances = [UsageInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: dir.clone() }];
+        let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
+        let sync = store.sync(false, &instances).unwrap();
+        assert_eq!((sync.imported, sync.deferred_files), (4, 0));
+        let report = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!((report.totals.input_tokens, report.totals.output_tokens), (290, 29));
+        let child = report.session_tokens.unwrap().into_iter().find(|session| session.session_id == CHILD_ID).unwrap();
+        assert_eq!((child.input_tokens, child.output_tokens), (70, 7));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn usage_record(
+        response_id: &str, input: u64, cached: u64, output: u64,
+        total_input: u64, total_cached: u64, total_output: u64, timestamp: &str,
+    ) -> JsonValue {
+        json!({"type": "token_usage_record", "timestamp": timestamp, "payload": {
+            "thread_id": PARENT_ID, "response_id": response_id,
+            "usage": {"input_tokens": input, "cached_input_tokens": cached,
+                "output_tokens": output, "reasoning_output_tokens": 0, "total_tokens": input + output},
+            "thread_token_usage": {"input_tokens": total_input, "cached_input_tokens": total_cached,
+                "output_tokens": total_output, "reasoning_output_tokens": 0, "total_tokens": total_input + total_output},
+        }})
     }
 
     #[test]

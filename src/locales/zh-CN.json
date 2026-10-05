@@ -4203,7 +4203,7 @@
       "updatedAt": "最近更新",
       "labels": {
         "sessionId": "会话 ID",
-        "sessionCostHint": "按模型标准单价估算美元费用，包含缓存输入计价。仅本会话，不含子代理；不代表订阅或服务商实际账单。",
+        "sessionCostHint": "按模型及日志记录的服务档位估算美元费用，包含缓存输入和长上下文计价。历史档位未记录时按标准价估算。仅本会话，不含子代理；不代表订阅或服务商实际账单。",
         "sessionCostUnavailable": "费用未知",
         "tokenUsage": "Token使用"
       },

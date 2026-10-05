@@ -9,7 +9,7 @@ export function CodexSessionUsageBadge({ stats }: { stats?: CodexSessionTokenSta
   if (!tokens) return null;
   const cost = formatSessionCostEstimate(stats?.estimatedCostUsd);
   const title = t('codex.sessionManager.labels.sessionCostHint',
-    'Estimated USD at standard model prices, including cached-input pricing. This session only; child agents are separate. Not the actual subscription or provider bill.');
+    'Estimated USD at model and recorded service-tier prices, including cached input and long-context rates. Missing historical tiers use Standard estimates. This session only; child agents are separate. Not the actual subscription or provider bill.');
   return <span className="codex-session-row__tokens" title={title}>
     {tokens} · {cost ?? t('codex.sessionManager.labels.sessionCostUnavailable', 'Cost unavailable')}
   </span>;

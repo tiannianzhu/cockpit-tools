@@ -1212,7 +1212,7 @@ const CODEX_LOCAL_ACCESS_PRICE_BOOK: &[CodexLocalAccessPriceBookEntry] = &[
         model_id: "gpt-5.5",
         session_long_context: true,
         standard: codex_price(5.0, 0.5, 30.0),
-        priority: Some(codex_price(10.0, 1.0, 60.0)),
+        priority: Some(codex_price(12.5, 1.25, 75.0)),
     },
     CodexLocalAccessPriceBookEntry {
         model_id: "codex-auto-review",
@@ -1946,26 +1946,88 @@ fn calculate_usage_cost_usd(
 }
 
 pub fn estimate_model_token_cost_usd(
-    model: &str, input_tokens: u64, cached_input_tokens: u64, output_tokens: u64,
+    model: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
 ) -> f64 {
     estimate_known_model_token_cost_usd(model, input_tokens, cached_input_tokens, output_tokens)
         .unwrap_or(0.0)
 }
 
-pub fn try_estimate_model_token_cost_usd(
+pub fn estimate_known_model_token_cost_usd(
     model: &str,
     input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
 ) -> Option<f64> {
-    estimate_known_model_token_cost_usd(model, input_tokens, cached_input_tokens, output_tokens)
+    let pricing = resolve_base_model_pricing(None, model)?;
+    Some(calculate_usage_cost_usd_from_tokens(
+        input_tokens, output_tokens, cached_input_tokens, &pricing,
+    ))
 }
 
-pub fn estimate_known_model_token_cost_usd(
-    model: &str, input_tokens: u64, cached_input_tokens: u64, output_tokens: u64,
+/// Estimate session usage using the OpenAI API rate for each request's service tier.
+/// `context_input_tokens` is the largest single-request prompt in the group and
+/// controls long-context pricing; grouped token counts are used only for cost.
+pub fn try_estimate_model_token_cost_usd_for_service_tier(
+    model: &str,
+    service_tier: Option<&str>,
+    context_input_tokens: u64,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
 ) -> Option<f64> {
-    let pricing = resolve_base_model_pricing(None, model)?;
-    Some(calculate_usage_cost_usd_from_tokens(input_tokens, output_tokens, cached_input_tokens, &pricing))
+    let mut tier = match service_tier.filter(|tier| !tier.trim().is_empty()) {
+        Some(tier) => Some(normalize_proxy_service_tier(tier)?),
+        None => None,
+    };
+
+    let base = resolve_base_model_pricing(None, model)?;
+    let usage = UsageCapture {
+        input_tokens: context_input_tokens,
+        output_tokens,
+        total_tokens: context_input_tokens.saturating_add(output_tokens),
+        cached_tokens: 0,
+        reasoning_tokens: 0,
+        token_breakdown: None,
+    };
+    if tier == Some("priority") {
+        if !pricing_has_explicit_priority_rates(&base) {
+            return None;
+        }
+        if should_apply_session_long_context(model, &base, Some(&usage)) {
+            match base.model_id.as_str() {
+                // OpenAI processes long GPT-5.4 Fast prompts at Standard rates.
+                "gpt-5.4" => tier = None,
+                // No published Fast long-context rate or documented fallback.
+                "gpt-5.5" => return None,
+                _ => {}
+            }
+        }
+    }
+
+    let selected = if tier == Some("ultrafast") {
+        if normalize_known_openai_codex_model(model).as_deref() != Some("gpt-6-astra") {
+            return None;
+        }
+        let price = if context_input_tokens > CODEX_LOCAL_ACCESS_LONG_CONTEXT_THRESHOLD_TOKENS {
+            codex_price(120.0, 12.0, 450.0)
+        } else {
+            codex_price(60.0, 6.0, 300.0)
+        };
+        selected_model_pricing(&base, price)
+    } else {
+        let selected_price = compute_effective_unit_prices(&base, model, Some(&usage), tier);
+        selected_model_pricing(&base, selected_price)
+    };
+
+    Some(calculate_usage_cost_usd_from_tokens(
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        &selected,
+    ))
 }
 
 fn calculate_usage_cost_usd_from_tokens(
