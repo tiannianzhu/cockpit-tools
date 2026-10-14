@@ -4,9 +4,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 spec=importlib.util.spec_from_file_location('remote_usage',Path(__file__).resolve().parents[1]/'src-tauri/src/modules/remote_usage.py')
 usage=importlib.util.module_from_spec(spec)
@@ -50,5 +51,41 @@ class UsageTransportTest(unittest.TestCase):
         first=usage.source_digest(sources)
         sources['src/lib.rs']+='changed'
         self.assertNotEqual(first,usage.source_digest(sources))
+    def test_desktop_source_bundle_is_hashed_and_installed_completely(self):
+        desktop=Path(__file__).resolve().parents[1]/'src-tauri/src/modules/remote_codex_sessions.rs'
+        manifest=desktop.read_text().split('const USAGE_SOURCES:',1)[1].split('];',1)[0]
+        entries=re.findall(r'"([^"]+)",\s*include_str!\("([^"]+)"\)',manifest)
+        self.assertTrue(entries)
+        contents={name:(desktop.parent/path).read_bytes().decode() for name,path in entries}
+        # Rust hashes declaration order, but transports a key-sorted BTreeMap.
+        version=hashlib.sha256(b''.join(
+            name.encode()+b'\0'+contents[name].encode()+b'\0' for name,_ in entries
+        )).hexdigest()
+        sources=dict(sorted(contents.items()))
+        changed=dict(sources, **{'src/rollout.rs':'changed reader'})
+        self.assertNotEqual(version,usage.source_digest(changed))
+        self.cache.mkdir(parents=True)
+        binary=self.cache/('helper-'+version)
+        def compile_fixture(command, **options):
+            root=options['cwd']
+            self.assertEqual(command,['/fixture/cargo','build','--release','--locked',
+                                      '--manifest-path',str(root/'Cargo.toml')])
+            self.assertEqual({name:(root/name).read_text() for name in sources},sources)
+            built=root/'target/release/cockpit-session-usage'
+            built.parent.mkdir(parents=True)
+            built.write_text('fixture helper')
+            return Mock(**{'wait.return_value':0})
+        with patch.object(usage.shutil,'which',return_value='/fixture/cargo'), \
+             patch.object(usage.subprocess,'Popen',side_effect=compile_fixture) as compile_call:
+            usage.build_helper(self.cache,binary,sources,version)
+            compile_call.assert_called_once()
+        self.assertEqual(binary.read_text(),'fixture helper')
+        incomplete=dict(sources)
+        incomplete.pop('src/rollout.rs')
+        with patch.object(usage.subprocess,'Popen') as compile_call:
+            with self.assertRaisesRegex(ValueError,'校验失败'):
+                usage.build_helper(self.cache,binary,incomplete,version)
+            compile_call.assert_not_called()
+        self.assertEqual(binary.read_text(),'fixture helper')
 
 if __name__=='__main__': unittest.main()

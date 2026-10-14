@@ -45,6 +45,100 @@ fn isolated_export_fixture(
 }
 
 #[test]
+fn compressed_trash_backup_roundtrip_preserves_original_and_recovery() {
+    let base = make_temp_dir("codex-compressed-trash-roundtrip");
+    for directory in ["sessions", "archived_sessions"] {
+        let root = base.join(directory);
+        let logical = root.join(directory).join("rollout-compressed.jsonl");
+        write_rollout(&logical, "compressed", "recoverable");
+        let content = fs::read(&logical).unwrap();
+        let compressed = logical.with_extension("jsonl.zst");
+        let encoded = zstd::stream::encode_all(content.as_slice(), 0).unwrap();
+        fs::write(&compressed, &encoded).unwrap();
+        fs::remove_file(&logical).unwrap();
+        let instance = CodexSyncInstance {
+            id: "fixture".into(), name: "Fixture".into(), data_dir: root.clone(), last_pid: None,
+        };
+        let snapshot = ThreadSnapshot {
+            archived: directory == "archived_sessions", id: "compressed".into(),
+            session_kind: default_session_kind(), parent_thread_id: None,
+            title: "Compressed".into(), cwd: "/project".into(), project_name: None,
+            updated_at: None, rollout_path: logical.clone(),
+            session_index_entry: json!({"id":"compressed"}), source_root: root.clone(),
+        };
+        let trash = root.join("trash");
+        let batch = trash.join("batch");
+        let entry_dir = batch.join("fixture--compressed");
+        copy_snapshot_rollout_to_trash(&instance, &batch, &snapshot).unwrap();
+        // A rejected official deletion must leave the original and remove only its temporary backup.
+        finish_delete_backup(&entry_dir, false).unwrap();
+        assert_eq!(fs::read(&compressed).unwrap(), encoded);
+        assert!(!logical.exists());
+        assert!(!entry_dir.exists());
+        copy_snapshot_rollout_to_trash(&instance, &batch, &snapshot).unwrap();
+        assert!(load_trash_entries_from_roots(&[TrashRoot { path: trash.clone(), optional: false }]).unwrap().is_empty());
+        fs::remove_file(&compressed).unwrap(); // Official thread/delete filesystem effect.
+        finish_delete_backup(&entry_dir, true).unwrap();
+        let entries = load_trash_entries_from_roots(&[TrashRoot { path: trash, optional: false }]).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(fs::read(&entries[0].trashed_rollout_path).unwrap(), encoded);
+        restore_trashed_session_entry_with_registration(&entries[0], |_, id, path, archived, _| {
+            assert_eq!(id, "compressed");
+            assert_eq!(archived, directory == "archived_sessions");
+            assert_eq!(rollout_session_id(path).unwrap().as_deref(), Some("compressed"));
+            let mut restored = Vec::new();
+            rollout::open_reader(path).unwrap().read_to_end(&mut restored).unwrap();
+            assert_eq!(restored, content);
+            Ok(())
+        }).unwrap();
+        assert_eq!(fs::read(&compressed).unwrap(), encoded);
+        assert!(!entry_dir.exists());
+    }
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn rollout_deletion_requires_both_representations_to_be_absent() {
+    let base = make_temp_dir("codex-compressed-delete-confirmation");
+    let plain = base.join("rollout-fixture.jsonl");
+    let compressed = plain.with_extension("jsonl.zst");
+    fs::write(&plain, "plain").unwrap();
+    fs::write(&compressed, "compressed").unwrap();
+    assert!(!rollout_is_missing(&plain));
+    fs::remove_file(&plain).unwrap();
+    assert!(!rollout_is_missing(&plain));
+    fs::remove_file(&compressed).unwrap();
+    assert!(rollout_is_missing(&plain));
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn compressed_trash_restore_checks_existing_plain_sibling() {
+    for existing_id in ["fixture", "other-session"] {
+        let base = make_temp_dir("codex-compressed-restore-conflict");
+        let compressed = base.join("codex-home/sessions/2026/06/02/rollout-fixture.jsonl.zst");
+        let mut entry = make_trash_entry(&base, "fixture", compressed.clone());
+        let encoded = zstd::stream::encode_all(fs::read(&entry.trashed_rollout_path).unwrap().as_slice(), 0).unwrap();
+        fs::remove_file(&entry.trashed_rollout_path).unwrap();
+        entry.trashed_rollout_path = entry.trashed_rollout_path.with_extension("jsonl.zst");
+        fs::write(&entry.trashed_rollout_path, encoded).unwrap();
+        let plain = compressed.with_extension("");
+        write_rollout(&plain, existing_id, "newer live content");
+        let original = fs::read(&plain).unwrap();
+        let result = restore_trashed_session_entry_with_registration(&entry, |_, _, path, _, _| {
+            assert_eq!(existing_id, "fixture", "must not register a conflicting sibling");
+            assert_eq!(path, plain);
+            Ok(())
+        });
+        assert_eq!(result.is_ok(), existing_id == "fixture");
+        assert_eq!(fs::read(&plain).unwrap(), original);
+        assert!(!compressed.exists());
+        assert_eq!(entry.entry_dir.exists(), existing_id != "fixture");
+        fs::remove_dir_all(base).unwrap();
+    }
+}
+
+#[test]
 fn isolated_export_import_trash_restore_roundtrip_keeps_bytes_index_and_package() {
     let base = make_temp_dir("codex-session-transfer-roundtrip");
     let (source, manifest) = isolated_export_fixture(&base, "qa-roundtrip");

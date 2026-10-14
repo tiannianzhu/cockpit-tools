@@ -355,6 +355,15 @@ pub fn delete_instance(instance_id: &str) -> Result<(), String> {
 }
 
 pub fn delete_instance_directory(dir_path: &Path) -> Result<(), String> {
+    delete_instance_directory_with_trash(dir_path, |path| {
+        trash::delete(path).map_err(|err| format!("移动实例目录到回收站失败: {}", err))
+    })
+}
+
+pub(crate) fn delete_instance_directory_with_trash(
+    dir_path: &Path,
+    move_to_trash: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     if !dir_path.exists() {
         return Ok(());
     }
@@ -367,7 +376,7 @@ pub fn delete_instance_directory(dir_path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    trash::delete(dir_path).map_err(|err| format!("移动实例目录到回收站失败: {}", err))
+    move_to_trash(dir_path)
 }
 
 pub fn update_instance_after_start(instance_id: &str, pid: u32) -> Result<InstanceProfile, String> {
