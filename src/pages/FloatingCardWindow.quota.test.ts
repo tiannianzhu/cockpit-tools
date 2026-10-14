@@ -95,10 +95,11 @@ test('Cursor shows its three included quotas and the separate On-Demand quota', 
   await i18n.init({ lng: 'en', resources: { en: { translation: enResources } } });
   const html = renderToStaticMarkup(createElement(I18nextProvider, { i18n }, createElement(FloatingCardWindow)));
   assert.equal((html.match(/class="floating-card-quota-row"/g) ?? []).length, 4);
-  assert.match(html, /Usage[^]*?20%/);
+  assert.match(html, />Usage<\/span>[^]*?20%/);
   assert.match(html, /Cursor Models[^]*?30%/);
   assert.match(html, /Other Models[^]*?40%/);
   assert.match(html, /On-Demand[^]*?10%/);
+  assert.ok(html.includes('$1.00 / $10.00'));
 });
 
 test('Codex retains its existing two-window cap', async () => {

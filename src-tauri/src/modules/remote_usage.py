@@ -11,7 +11,11 @@ import subprocess
 import sys
 import tempfile
 
-SOURCE_NAMES = ('Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/main.rs')
+SOURCE_NAMES = (
+    'Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/main.rs', 'src/rollout.rs',
+    'src/checkpoint.rs', 'src/parent_index.rs', 'src/rewrite.rs',
+    'src/rollup.rs', 'src/segmented.rs', 'src/usage_rollup.rs',
+)
 
 
 def source_digest(sources):

@@ -96,18 +96,6 @@ fn read_index(path: &Path) -> Result<Vec<IndexedSession>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> PathBuf {
-        let home = std::env::temp_dir().join(format!(
-            "cockpit-index-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&home).unwrap();
-        home
-    }
     fn schema(path: &Path, with_name: bool) -> Connection {
         let db = Connection::open(path).unwrap();
         db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, rollout_path TEXT, updated_at INTEGER, source TEXT, archived INTEGER, preview TEXT, has_user_event INTEGER);").unwrap();
@@ -119,7 +107,8 @@ mod tests {
     }
     #[test]
     fn includes_empty_preview_agents_and_preserves_source_and_archive() {
-        let home = fixture();
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path();
         let path = home.join("state_1.sqlite");
         let db = schema(&path, true);
         db.execute(
@@ -130,7 +119,7 @@ mod tests {
         db.execute_batch("INSERT INTO threads VALUES ('root','Old title','/work','/root',11,'vscode',0,'',0,'Renamed');").unwrap();
         drop(db);
         let before = fs::read(&path).unwrap();
-        let rows = read_sessions(&home).unwrap();
+        let rows = read_sessions(home).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows[0].archived);
         assert_eq!(
@@ -142,28 +131,27 @@ mod tests {
         assert_eq!(rows[1].rollout_path, PathBuf::from("/root"));
         assert_eq!(rows[1].updated_at, 11);
         assert_eq!(before, fs::read(&path).unwrap());
-        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn chooses_numeric_latest_index_and_supports_older_title_schema() {
-        let home = fixture();
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path();
         schema(&home.join("state_2.sqlite"), false);
         let db = schema(&home.join("state_10.sqlite"), false);
         db.execute_batch("INSERT INTO threads VALUES ('id','  ','/work','/file',1,'cli',0,'',0);")
             .unwrap();
         drop(db);
-        let rows = read_sessions(&home).unwrap();
+        let rows = read_sessions(home).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "id");
         assert_eq!(rows[0].id, "id");
-        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn missing_index_is_empty_but_corrupt_index_is_an_error() {
-        let home = fixture();
-        assert!(read_sessions(&home).unwrap().is_empty());
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path();
+        assert!(read_sessions(home).unwrap().is_empty());
         fs::write(home.join("state_1.sqlite"), "invalid").unwrap();
-        assert!(read_sessions(&home).is_err());
-        fs::remove_dir_all(home).unwrap();
+        assert!(read_sessions(home).is_err());
     }
 }

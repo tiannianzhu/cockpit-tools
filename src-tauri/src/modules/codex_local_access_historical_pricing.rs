@@ -4,7 +4,7 @@ const HISTORICAL_CODEX_MODEL_PRICE_BOOK: &[CodexLocalAccessPriceBookEntry] = &[
         model_id: "gpt-5.5",
         session_long_context: true,
         standard: codex_price(5.0, 0.5, 30.0),
-        priority: Some(codex_price(10.0, 1.0, 60.0)),
+        priority: Some(codex_price(12.5, 1.25, 75.0)),
     },
     CodexLocalAccessPriceBookEntry {
         model_id: "gpt-5.4",

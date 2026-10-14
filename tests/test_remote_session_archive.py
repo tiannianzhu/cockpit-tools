@@ -62,7 +62,11 @@ for line in sys.stdin:
                     selected.add(sid); changed=True
         for sid in selected:
             t=state['threads'].pop(sid,None)
-            if t: pathlib.Path(t['path']).unlink(missing_ok=True)
+            if t:
+                path=pathlib.Path(t['path'])
+                if path.name.endswith('.jsonl.zst'): path=path.with_suffix('')
+                path.unlink(missing_ok=True)
+                if not state.get('keepCompressedOnDelete'): pathlib.Path(str(path)+'.zst').unlink(missing_ok=True)
         save(); reply(rid)
     elif method=='thread/resume':
         if state.get('resumeError'): reply(rid,error='forced resume failure'); continue
@@ -490,6 +494,81 @@ class ProtocolTest(RemoteFixture):
         self.assertFalse((self.home/'.antigravity_cockpit'/'cockpit-tools-codex-session-trash'/sid).exists())
         self.assertEqual(self.run_action('listTrash')['result'], [])
 
+    def test_compressed_trash_and_restore_preserve_family(self):
+        from compression import zstd
+        root,root_path=self.add(title='Root fixture')
+        child,child_path=self.add(archived=True,parent=root)
+        originals={path:path.read_bytes() for path in (root_path,child_path)}
+        for path,content in originals.items():
+            compressed=path.with_suffix('.jsonl.zst')
+            compressed.write_bytes(zstd.compress(content)); compressed.chmod(0o600); path.unlink()
+        response=self.run_action('trash',root)
+        self.assertTrue(response['ok'],response)
+        self.assertEqual(set(response['result']['sessionIds']),{root,child})
+        entry=self.home/'.antigravity_cockpit'/'cockpit-tools-codex-session-trash'/root
+        self.assertEqual((entry/'rollout.jsonl').read_bytes(),originals[root_path])
+        self.assertEqual((entry/'rollout.jsonl').stat().st_mode & 0o777,0o600)
+        self.assertEqual((entry/f'rollout-{child}.jsonl').read_bytes(),originals[child_path])
+        manifest=json.loads((entry/'manifest.json').read_text())
+        self.assertEqual(manifest['relativePath'],root_path.relative_to(self.home).as_posix())
+        self.assertEqual({row['id'] for row in self.run_action('listTrash')['result']},{root,child})
+        for path in originals:
+            self.assertFalse(path.exists()); self.assertFalse(path.with_suffix('.jsonl.zst').exists())
+        restored=self.run_action('restore',root)
+        self.assertTrue(restored['ok'],restored)
+        for path,content in originals.items(): self.assertEqual(path.read_bytes(),content)
+        self.assertTrue(self.state_file()['threads'][child]['archived'])
+        self.assertFalse(entry.exists())
+        self.assertEqual([c['params']['threadId'] for c in self.calls() if c['method']=='thread/delete'],[root])
+
+    def test_compressed_delete_failure_keeps_original_bytes_and_removes_backup(self):
+        from compression import zstd
+        sid,path=self.add()
+        compressed=path.with_suffix('.jsonl.zst')
+        content=zstd.compress(path.read_bytes()); compressed.write_bytes(content); path.unlink()
+        self.state['deleteError']=True; self.save()
+        response=self.run_action('trash',sid)
+        self.assertFalse(response['ok'])
+        self.assertIn('forced delete failure',response['error'])
+        self.assertIn('original files unchanged',response['error'])
+        self.assertEqual(compressed.read_bytes(),content)
+        self.assertFalse(path.exists())
+        self.assertFalse((self.home/'.antigravity_cockpit'/'cockpit-tools-codex-session-trash'/sid).exists())
+        self.assertEqual(self.run_action('listTrash')['result'],[])
+        self.assertEqual([c['params']['threadId'] for c in self.calls() if c['method']=='thread/delete'],[sid])
+
+    def test_plain_backup_wins_and_compressed_survivor_keeps_deletion_pending(self):
+        from compression import zstd
+        sid,path=self.add(); content=path.read_bytes()
+        compressed=path.with_suffix('.jsonl.zst')
+        stale=json.loads(content); stale['payload']['title']='Stale fixture'
+        compressed_bytes=zstd.compress(json.dumps(stale).encode()); compressed.write_bytes(compressed_bytes)
+        self.state['threads'][sid]['path']=str(compressed)
+        self.state['keepCompressedOnDelete']=True; self.save()
+        response=self.run_action('trash',sid)
+        self.assertFalse(response['ok'])
+        self.assertIn('family cleanup incomplete',response['error'])
+        entry=self.home/'.antigravity_cockpit'/'cockpit-tools-codex-session-trash'/sid
+        self.assertEqual((entry/'rollout.jsonl').read_bytes(),content)
+        self.assertTrue(json.loads((entry/'manifest.json').read_text())['deletionPending'])
+        self.assertEqual(compressed.read_bytes(),compressed_bytes)
+        self.assertEqual(self.run_action('listTrash')['result'],[])
+        self.assertFalse(self.run_action('restore',sid)['ok'])
+
+    def test_restore_rejects_a_different_compressed_sibling(self):
+        from compression import zstd
+        sid,path=self.add()
+        self.assertTrue(self.run_action('trash',sid)['ok'])
+        compressed=path.with_suffix('.jsonl.zst')
+        content=zstd.compress(json.dumps({'type':'session_meta','payload':{'id':sid,'title':'New fixture'}}).encode())
+        compressed.write_bytes(content)
+        response=self.run_action('restore',sid)
+        self.assertFalse(response['ok'])
+        self.assertIn('different content',response['error'])
+        self.assertEqual(compressed.read_bytes(),content)
+        self.assertFalse(path.exists())
+        self.assertTrue((self.home/'.antigravity_cockpit'/'cockpit-tools-codex-session-trash'/sid/'rollout.jsonl').exists())
+
     def test_trash_accepts_continuation_filename_and_rejects_wrong_root(self):
         sid,path=self.add()
         segment=str(uuid.uuid4())
@@ -722,6 +801,60 @@ class ProtocolTest(RemoteFixture):
         self.assertTrue(result['ok'],result)
         self.assertEqual(result['result']['sessions'][0]['id'],sid)
         self.assertEqual(result['result']['sessions'][0]['sizeBytes'],0)
+        self.assertEqual(self.calls(),[])
+
+    def test_compressed_metadata_preserves_family_without_hiding_other_sessions(self):
+        from compression import zstd
+        root,root_path=self.add()
+        child,child_path=self.add(parent=root,source={'subagent':{'other':'guardian'}})
+        missing,missing_path=self.add(source={'subagent':{'other':'guardian'}})
+        corrupt,corrupt_path=self.add(source={'subagent':{'other':'guardian'}})
+        compressed={}
+        for path in (root_path,child_path):
+            target=path.with_suffix('.jsonl.zst')
+            compressed[target]=zstd.compress(path.read_bytes())
+            target.write_bytes(compressed[target]); path.unlink()
+        missing_path.unlink(); corrupt_path.unlink()
+        corrupt_path.with_suffix('.jsonl.zst').write_bytes(b'invalid zstd')
+        index_before=(self.home/'state_5.sqlite').read_bytes()
+        result=self.run_action('list')
+        self.assertTrue(result['ok'],result)
+        rows={row['id']:row for row in result['result']['sessions']}
+        self.assertEqual(set(rows),{root,child})
+        self.assertEqual(rows[child]['parentThreadId'],root)
+        self.assertEqual(rows[root]['sizeBytes'],len(compressed[root_path.with_suffix('.jsonl.zst')]))
+        self.assertEqual(set(self.run_action('existingIds')['result']),{root,child,missing,corrupt})
+        self.assertEqual(self.calls(),[])
+        self.assertFalse(root_path.exists()); self.assertFalse(child_path.exists())
+        self.assertEqual({path:path.read_bytes() for path in compressed},compressed)
+        self.assertEqual((self.home/'state_5.sqlite').read_bytes(),index_before)
+
+    def test_compressed_orphan_is_discovered_and_plain_metadata_takes_precedence(self):
+        from compression import zstd
+        root,_=self.add()
+        child,path=self.add(parent=root,source={'subagent':{'other':'guardian'}})
+        stale=json.loads(path.read_text())
+        stale['payload']['parentThreadId']=str(uuid.uuid4())
+        path.with_suffix('.jsonl.zst').write_bytes(zstd.compress(json.dumps(stale).encode()))
+        orphan,orphan_path=self.add()
+        orphan_path.with_suffix('.jsonl.zst').write_bytes(zstd.compress(orphan_path.read_bytes()))
+        orphan_path.unlink()
+        with sqlite3.connect(self.home/'state_5.sqlite') as db:
+            db.execute('DELETE FROM threads WHERE id=?',(orphan,))
+        rows={row['id']:row for row in self.run_action('list')['result']['sessions']}
+        self.assertEqual(rows[child]['parentThreadId'],root)
+        self.assertIn(orphan,self.run_action('existingIds')['result'])
+        self.assertEqual(self.calls(),[])
+
+    def test_compressed_sibling_cannot_follow_a_symlink(self):
+        sid,path=self.add()
+        content=path.read_bytes(); path.unlink()
+        outside=self.home/'outside.jsonl'; outside.write_bytes(content)
+        path.with_suffix('.jsonl.zst').symlink_to(outside)
+        result=self.run_action('list')
+        self.assertFalse(result['ok'],result)
+        self.assertIn('Symlinked session file',result['error'])
+        self.assertEqual(outside.read_bytes(),content)
         self.assertEqual(self.calls(),[])
 
     def test_absent_index_returns_empty_without_app_server(self):

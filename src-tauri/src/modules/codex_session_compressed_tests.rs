@@ -84,7 +84,7 @@ fn unreadable_compressed_sibling_does_not_hide_a_readable_plain_session() {
     let (source, _) = isolated_export_fixture(base.path(), "readable-plain");
     let compressed = source.rollout_path.with_extension("jsonl.zst");
     fs::write(&compressed, b"invalid zstd frame").unwrap();
-    assert!(read_rollout_session_meta(&compressed).is_err());
+    assert!(rollout_reader::metadata(&compressed).is_err());
 
     let plain = fs::read(&source.rollout_path).unwrap();
     let (_staged, prepared) = prepare_export_session_sources(vec![source.clone()]).unwrap();
