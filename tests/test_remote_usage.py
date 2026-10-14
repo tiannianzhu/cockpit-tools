@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 spec=importlib.util.spec_from_file_location('remote_usage',Path(__file__).resolve().parents[1]/'src-tauri/src/modules/remote_usage.py')
 usage=importlib.util.module_from_spec(spec)
@@ -50,5 +50,37 @@ class UsageTransportTest(unittest.TestCase):
         first=usage.source_digest(sources)
         sources['src/lib.rs']+='changed'
         self.assertNotEqual(first,usage.source_digest(sources))
+    def test_rollout_reader_is_hashed_and_transported_in_complete_source_bundle(self):
+        sources={
+            'Cargo.toml':'fixture manifest', 'Cargo.lock':'fixture lock',
+            'src/lib.rs':'pub mod rollout;', 'src/main.rs':'fixture main',
+            'src/rollout.rs':'fixture reader',
+        }
+        version=usage.source_digest(sources)
+        changed=dict(sources, **{'src/rollout.rs':'changed reader'})
+        self.assertNotEqual(version,usage.source_digest(changed))
+        self.cache.mkdir(parents=True)
+        binary=self.cache/('helper-'+version)
+        def compile_fixture(command, **options):
+            root=options['cwd']
+            self.assertEqual(command,['/fixture/cargo','build','--release','--locked',
+                                      '--manifest-path',str(root/'Cargo.toml')])
+            self.assertEqual({name:(root/name).read_text() for name in sources},sources)
+            built=root/'target/release/cockpit-session-usage'
+            built.parent.mkdir(parents=True)
+            built.write_text('fixture helper')
+            return Mock(**{'wait.return_value':0})
+        with patch.object(usage.shutil,'which',return_value='/fixture/cargo'), \
+             patch.object(usage.subprocess,'Popen',side_effect=compile_fixture) as compile_call:
+            usage.build_helper(self.cache,binary,sources,version)
+            compile_call.assert_called_once()
+        self.assertEqual(binary.read_text(),'fixture helper')
+        incomplete=dict(sources)
+        incomplete.pop('src/rollout.rs')
+        with patch.object(usage.subprocess,'Popen') as compile_call:
+            with self.assertRaisesRegex(ValueError,'校验失败'):
+                usage.build_helper(self.cache,binary,incomplete,version)
+            compile_call.assert_not_called()
+        self.assertEqual(binary.read_text(),'fixture helper')
 
 if __name__=='__main__': unittest.main()
