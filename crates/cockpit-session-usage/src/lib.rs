@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,15 +18,16 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+pub mod rollout;
+
 #[cfg(test)]
 const DEFAULT_INSTANCE_ID: &str = "__default__";
 #[cfg(test)]
 const DEFAULT_INSTANCE_NAME: &str = "默认实例";
 const REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
 const SEGMENT_REQUEST_ID_PREFIX: &str = "codex_session:thread-v2";
-const INSERT_BATCH_SIZE: usize = 500;
 const LONG_CONTEXT_THRESHOLD_TOKENS: u64 = 272_000;
-const USAGE_PARSER_VERSION: i64 = 2;
+const USAGE_PARSER_VERSION: i64 = 4;
 
 static REPLAY_CACHE: OnceLock<Mutex<ReplayCaches>> = OnceLock::new();
 
@@ -273,6 +274,7 @@ struct ParsedTokenEvent {
     delta: DeltaTokens,
     event_index: Option<u32>,
     model: String,
+    model_backfilled: bool,
     service_tier: Option<String>,
     timestamp: Option<DateTime<Utc>>,
 }
@@ -293,6 +295,7 @@ struct ParsedCodexFile {
 #[derive(Default)]
 struct TokenParseState {
     current_model: String,
+    active_model: Option<String>,
     current_service_tier: Option<String>,
     usage_record_ids: HashSet<String>,
     total_high_water: Option<CumulativeTokens>,
@@ -391,7 +394,7 @@ impl SessionUsageStore {
                 .map_err(|error| error.to_string())?;
         }
         if !has_tier || get_meta_i64(&tx, "usage_parser_version") != Some(USAGE_PARSER_VERSION) {
-            // Reparse once after changing the usage source; retain totals until sync succeeds.
+            // Reparse once after parser changes; retain totals until sync succeeds.
             tx.execute_batch("
                 DELETE FROM session_log_sync;
                 DELETE FROM session_usage_meta WHERE key = 'last_synced_at';")
@@ -716,7 +719,24 @@ pub fn read_token_stats_from_rollout_uncached(
     rollout_path: &Path,
     file_len: u64,
 ) -> Option<(u64, u64, u64)> {
-    let mut file = File::open(rollout_path).ok()?;
+    let resolved = rollout::resolve_path(rollout_path).ok()?;
+    if rollout::is_compressed(&resolved) {
+        let mut latest = None;
+        for line in rollout::open_reader(&resolved).ok()?.lines() {
+            // Do not report a partial tail when decoding fails later in the frame.
+            let line = line.ok()?;
+            if let Some(stats) = parse_token_stats_lines(line.as_bytes()) {
+                latest = Some(stats);
+            }
+        }
+        return latest;
+    }
+    let mut file = File::open(&resolved).ok()?;
+    let file_len = if resolved == rollout_path {
+        file_len
+    } else {
+        file.metadata().ok()?.len()
+    };
     let mut offset = file_len;
     let mut pending_prefix = Vec::new();
 
@@ -831,6 +851,10 @@ fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // A cold file can briefly have both representations during publication.
+    files.retain(|path| {
+        path.is_file() && (!rollout::is_compressed(path) || !rollout::logical_path(path).is_file())
+    });
     files.sort();
     files
 }
@@ -865,7 +889,10 @@ fn thread_id_from_filename(path: &Path) -> Option<String> {
 
 fn rollout_identity(path: &Path) -> Option<RolloutIdentity> {
     let file_name = path.file_name()?.to_str()?;
-    let stem = file_name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let plain_name = file_name.strip_suffix(".zst").unwrap_or(file_name);
+    let stem = plain_name
+        .strip_prefix("rollout-")?
+        .strip_suffix(".jsonl")?;
     // UUIDs contain dashes, so use the fixed 36-byte suffix.
     let trailing = stem.get(stem.len().checked_sub(36)?..)?;
     let trailing_id = uuid::Uuid::parse_str(trailing)
@@ -905,11 +932,7 @@ fn build_rollout_index(files: &[PathBuf]) -> RolloutIndex {
     for paths in index.values_mut() {
         paths.sort_by_key(|path| {
             let identity = rollout_identity(path).expect("indexed rollout has a valid name");
-            (
-                identity.order_key,
-                path.file_name().map(|name| name.to_os_string()),
-                path.clone(),
-            )
+            (identity.order_key, logical_rollout_name(path), path.clone())
         });
     }
     index
@@ -953,7 +976,7 @@ fn inherit_archived_cursor(
     {
         return None;
     }
-    let file_name = file_path.file_name()?.to_str()?;
+    let file_name = logical_rollout_name(file_path)?;
     let slash_suffix = format!("/{file_name}");
     let backslash_suffix = format!("\\{file_name}");
     cursors
@@ -967,6 +990,51 @@ fn inherit_archived_cursor(
         .map(|(offset, modified, size)| (modified, size, offset))
 }
 
+fn logical_rollout_name(path: &Path) -> Option<String> {
+    rollout::logical_path(path)
+        .file_name()?
+        .to_str()
+        .map(str::to_string)
+}
+
+fn logical_rollout_len(path: &Path, metadata: &fs::Metadata) -> Result<u64, String> {
+    if !rollout::is_compressed(path) {
+        return Ok(metadata.len());
+    }
+    let mut reader = rollout::open_reader(path).map_err(|error| error.to_string())?;
+    std::io::copy(&mut reader, &mut std::io::sink()).map_err(|error| error.to_string())
+}
+
+/// During archive moves, compare decoded lengths rather than compression ratios.
+fn select_rollout_copies(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut selected_by_name: HashMap<String, PathBuf> = HashMap::new();
+    for path in paths {
+        let name = logical_rollout_name(path).ok_or("Invalid rollout filename")?;
+        let replace = if let Some(previous) = selected_by_name.get(&name) {
+            let incoming = fs::metadata(path).map_err(|error| error.to_string())?;
+            let current = fs::metadata(previous).map_err(|error| error.to_string())?;
+            (
+                logical_rollout_len(path, &incoming)?,
+                metadata_modified_nanos(&incoming),
+            ) > (
+                logical_rollout_len(previous, &current)?,
+                metadata_modified_nanos(&current),
+            )
+        } else {
+            true
+        };
+        if replace {
+            selected_by_name.insert(name, path.clone());
+        }
+    }
+    let mut selected = selected_by_name.into_values().collect::<Vec<_>>();
+    selected.sort_by_key(|path| {
+        let identity = rollout_identity(path).expect("grouped rollout has valid identity");
+        (identity.order_key, logical_rollout_name(path))
+    });
+    Ok(selected)
+}
+
 fn sync_segmented_group(
     conn: &mut Connection,
     instance: &UsageInstance,
@@ -975,37 +1043,7 @@ fn sync_segmented_group(
     rollout_index: &RolloutIndex,
     cursors: &mut HashMap<String, (i64, i64, i64)>,
 ) -> Result<FileSyncResult, String> {
-    // A rollout can exist at both live and archived paths while it is moving.
-    // Prefer the larger (then newer) copy and count its filename only once.
-    let mut selected_by_name: HashMap<String, PathBuf> = HashMap::new();
-    for path in paths {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("Invalid rollout filename")?
-            .to_string();
-        let incoming = fs::metadata(path).map_err(|error| error.to_string())?;
-        let replace = selected_by_name.get(&name).is_none_or(|previous| {
-            fs::metadata(previous)
-                .map(|current| {
-                    (incoming.len(), metadata_modified_nanos(&incoming))
-                        > (current.len(), metadata_modified_nanos(&current))
-                })
-                .unwrap_or(true)
-        });
-        if replace {
-            selected_by_name.insert(name, path.clone());
-        }
-    }
-    let mut selected = selected_by_name.into_values().collect::<Vec<_>>();
-    selected.sort_by_key(|path| {
-        let identity = rollout_identity(path).expect("grouped rollout has valid identity");
-        (
-            identity.order_key,
-            path.file_name().map(|name| name.to_os_string()),
-        )
-    });
-
+    let selected = select_rollout_copies(paths)?;
     let segment_ids = selected
         .iter()
         .filter_map(|path| rollout_identity(path).and_then(|identity| identity.segment_id))
@@ -1034,7 +1072,8 @@ fn sync_segmented_group(
     let changed = !root_stats_exist
         || legacy_stats_exist
         || selected.iter().any(|path| {
-            let path_str = path.to_string_lossy();
+            let logical_path = rollout::logical_path(path);
+            let path_str = logical_path.to_string_lossy();
             let Some(&(old_modified, old_size, old_offset)) = cursors.get(path_str.as_ref()) else {
                 return true;
             };
@@ -1097,8 +1136,7 @@ fn sync_segmented_group(
 
     let active_names = selected
         .iter()
-        .filter_map(|path| path.file_name())
-        .map(|name| name.to_string_lossy().to_string())
+        .filter_map(|path| logical_rollout_name(path))
         .collect::<HashSet<_>>();
     let mut old_paths = HashSet::new();
     let mut statement = conn
@@ -1109,19 +1147,15 @@ fn sync_segmented_group(
         .map_err(|error| error.to_string())?;
     for old_path in paths_in_events {
         let old_path = old_path.map_err(|error| error.to_string())?;
-        if Path::new(&old_path)
-            .file_name()
-            .is_some_and(|name| active_names.contains(name.to_string_lossy().as_ref()))
+        if logical_rollout_name(Path::new(&old_path))
+            .is_some_and(|name| active_names.contains(&name))
         {
             old_paths.insert(old_path);
         }
     }
     drop(statement);
     for path in cursors.keys() {
-        if Path::new(path)
-            .file_name()
-            .is_some_and(|name| active_names.contains(name.to_string_lossy().as_ref()))
-        {
+        if logical_rollout_name(Path::new(path)).is_some_and(|name| active_names.contains(&name)) {
             old_paths.insert(path.clone());
         }
     }
@@ -1165,11 +1199,8 @@ fn sync_segmented_group(
     }
     let mut latest_stats = None;
     for (path, parsed, replay_prefix) in &parsed_files {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("Invalid rollout filename")?;
-        let path_str = path.to_string_lossy().to_string();
+        let name = logical_rollout_name(path).ok_or("Invalid rollout filename")?;
+        let path_str = rollout::logical_path(path).to_string_lossy().to_string();
         for (token_offset, event) in parsed.token_events.iter().enumerate() {
             let Some(event_index) = event.event_index else {
                 continue;
@@ -1238,7 +1269,7 @@ fn sync_segmented_group(
     for (path, parsed, _) in parsed_files {
         let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
         cursors.insert(
-            path.to_string_lossy().to_string(),
+            rollout::logical_path(path).to_string_lossy().to_string(),
             (
                 metadata_modified_nanos(&metadata),
                 metadata.len() as i64,
@@ -1256,7 +1287,9 @@ fn sync_single_file(
     rollout_index: &RolloutIndex,
     cursors: &mut HashMap<String, (i64, i64, i64)>,
 ) -> Result<FileSyncResult, String> {
-    let file_path_str = file_path.to_string_lossy().to_string();
+    let file_path_str = rollout::logical_path(file_path)
+        .to_string_lossy()
+        .to_string();
     let metadata =
         fs::metadata(file_path).map_err(|error| format!("无法读取文件元数据: {error}"))?;
     let file_modified = metadata_modified_nanos(&metadata);
@@ -1296,25 +1329,32 @@ fn sync_single_file(
         }
     }
 
-    if file_size < last_size.max(0) as u64 {
-        conn.execute(
-            "DELETE FROM session_usage_events WHERE file_path = ?1",
-            params![file_path_str],
-        )
-        .map_err(|error| format!("清理已重写会话用量失败: {error}"))?;
-    }
-
+    let rewritten = file_size < last_size.max(0) as u64;
     let parsed = parse_codex_file(file_path, thread_id_from_filename(file_path))?;
     if !parsed.has_billable_tokens {
-        upsert_cursor(
-            conn,
-            cursors,
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        if rewritten {
+            tx.execute(
+                "DELETE FROM session_usage_events WHERE file_path = ?1",
+                params![file_path_str],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        upsert_cursor_on_conn(
+            &tx,
             &file_path_str,
             &instance.id,
             file_modified,
             file_size,
             parsed.line_offset,
         )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        cursors.insert(
+            file_path_str,
+            (file_modified, file_size as i64, parsed.line_offset),
+        );
         return Ok(FileSyncResult {
             changed: true,
             ..FileSyncResult::default()
@@ -1409,20 +1449,23 @@ fn sync_single_file(
             }
             continue;
         }
-        if event.line_offset <= last_offset && file_size >= last_size.max(0) as u64 {
+        if event.line_offset <= last_offset && file_size >= last_size.max(0) as u64 && !event.model_backfilled {
             continue;
         }
         to_insert.push((event, event_index));
     }
 
-    if !to_insert.is_empty() {
+    if !to_insert.is_empty() || rewritten {
         let tx = conn
             .unchecked_transaction()
             .map_err(|error| format!("开启会话用量写入事务失败: {error}"))?;
-        if last_offset == 0 {
+        if last_offset == 0 || rewritten {
             // Request indexes change when formerly omitted compaction calls are included.
-            tx.execute("DELETE FROM session_usage_events WHERE file_path = ?1", params![file_path_str])
-                .map_err(|error| error.to_string())?;
+            tx.execute(
+                "DELETE FROM session_usage_events WHERE file_path = ?1",
+                params![file_path_str],
+            )
+            .map_err(|error| error.to_string())?;
         }
         {
             let mut statement = tx
@@ -1439,29 +1482,27 @@ fn sync_single_file(
                         file_path = excluded.file_path, service_tier = excluded.service_tier",
                 )
                 .map_err(|error| format!("准备会话用量写入失败: {error}"))?;
-            for chunk in to_insert.chunks(INSERT_BATCH_SIZE) {
-                for (event, event_index) in chunk {
-                    let request_id = format!("{REQUEST_ID_PREFIX}:{root_thread_id}:{event_index}");
-                    let changed = statement
-                        .execute(params![
-                            request_id,
-                            instance.id,
-                            instance.name,
-                            root_thread_id,
-                            event.model,
-                            event.timestamp.map(|value| value.timestamp()).unwrap_or(0),
-                            event.delta.input as i64,
-                            event.delta.cached_input as i64,
-                            event.delta.output as i64,
-                            file_path_str,
-                            event.service_tier,
-                        ])
-                        .map_err(|error| format!("写入会话用量失败: {error}"))?;
-                    if changed > 0 {
-                        result.imported = result.imported.saturating_add(1);
-                    } else {
-                        result.skipped = result.skipped.saturating_add(1);
-                    }
+            for (event, event_index) in &to_insert {
+                let request_id = format!("{REQUEST_ID_PREFIX}:{root_thread_id}:{event_index}");
+                let changed = statement
+                    .execute(params![
+                        request_id,
+                        instance.id,
+                        instance.name,
+                        root_thread_id,
+                        event.model,
+                        event.timestamp.map(|value| value.timestamp()).unwrap_or(0),
+                        event.delta.input as i64,
+                        event.delta.cached_input as i64,
+                        event.delta.output as i64,
+                        file_path_str,
+                        event.service_tier,
+                    ])
+                    .map_err(|error| format!("写入会话用量失败: {error}"))?;
+                if changed > 0 {
+                    result.imported = result.imported.saturating_add(1);
+                } else {
+                    result.skipped = result.skipped.saturating_add(1);
                 }
             }
         }
@@ -1564,10 +1605,11 @@ fn parse_codex_file_with_state(
     root_thread_id: Option<String>,
     state: &mut TokenParseState,
 ) -> Result<ParsedCodexFile, String> {
-    let file = File::open(file_path).map_err(|error| format!("无法打开文件: {error}"))?;
-    let reader = BufReader::new(file);
+    let reader = rollout::open_reader(file_path).map_err(|error| format!("无法打开文件: {error}"))?;
     let mut root_meta_seen = false;
     let mut root_timestamp = None;
+    let mut is_guardian = false;
+    let mut guardian_model = None;
     let mut parent = ParentResolution::None;
     let mut parent_id = None;
     let mut deferred_reason = None;
@@ -1581,9 +1623,7 @@ fn parse_codex_file_with_state(
 
     for line_result in reader.lines() {
         line_offset += 1;
-        let Ok(line) = line_result else {
-            continue;
-        };
+        let line = line_result.map_err(|error| format!("读取会话记录失败: {error}"))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -1595,7 +1635,8 @@ fn parse_codex_file_with_state(
         if !is_event_msg && !is_turn_context && !is_session_meta && !is_usage_record {
             continue;
         }
-        if is_event_msg && !line.contains("\"token_count\"") && !line.contains("\"thread_settings_applied\"") {
+        if is_event_msg && !["token_count", "thread_settings_applied", "task_started", "task_complete", "turn_aborted"]
+            .iter().any(|kind| line.contains(kind)) {
             continue;
         }
 
@@ -1611,6 +1652,8 @@ fn parse_codex_file_with_state(
                 root_meta_seen = true;
                 root_timestamp = parse_timestamp(value.get("timestamp"));
                 let payload = value.get("payload").unwrap_or(&JsonValue::Null);
+                is_guardian = payload.get("thread_source").and_then(JsonValue::as_str) == Some("guardian_review")
+                    || payload.pointer("/source/subagent/other").and_then(JsonValue::as_str) == Some("guardian");
                 match replay_parent_from_meta(payload) {
                     Ok(None) => {}
                     Ok(Some(parent_thread_id)) => {
@@ -1657,6 +1700,12 @@ fn parse_codex_file_with_state(
                         .and_then(JsonValue::as_str)
                     {
                         state.current_model = normalize_codex_model(model);
+                        if is_guardian && state.current_model != "unknown" {
+                            guardian_model.get_or_insert_with(|| state.current_model.clone());
+                        }
+                        if state.active_model.is_some() {
+                            state.active_model = Some(state.current_model.clone());
+                        }
                     }
                 }
             }
@@ -1665,6 +1714,19 @@ fn parse_codex_file_with_state(
                     continue;
                 };
                 let is_usage_record = event_type == "token_usage_record";
+                if !is_usage_record {
+                    match payload.get("type").and_then(JsonValue::as_str) {
+                        Some("task_started") => {
+                            state.active_model = Some(state.current_model.clone());
+                            continue;
+                        }
+                        Some("task_complete" | "turn_aborted") => {
+                            state.active_model = None;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 if !is_usage_record && payload.get("type").and_then(JsonValue::as_str) == Some("thread_settings_applied") {
                     // Forked histories retain their original settings owner.
                     let owner = payload.get("thread_id").and_then(JsonValue::as_str);
@@ -1718,13 +1780,16 @@ fn parse_codex_file_with_state(
                         None,
                     )
                 };
-                if let Some(model) = payload
+                let explicit_model = payload
                     .get("info")
                     .and_then(|info| info.get("model").or_else(|| info.get("model_name")))
                     .or_else(|| payload.get("model"))
                     .and_then(JsonValue::as_str)
-                {
-                    state.current_model = normalize_codex_model(model);
+                    .map(normalize_codex_model);
+                if state.active_model.is_none() {
+                    if let Some(model) = &explicit_model {
+                        state.current_model.clone_from(model);
+                    }
                 }
 
                 let snapshot_source = token_snapshot_source(payload);
@@ -1796,12 +1861,29 @@ fn parse_codex_file_with_state(
                     signature,
                     delta,
                     event_index: nonzero_index,
-                    model: state.current_model.clone(),
+                    // Persistent settings can change while the active turn keeps its context.
+                    model: explicit_model.unwrap_or_else(|| {
+                        state.active_model.as_ref().filter(|model| model.as_str() != "unknown")
+                            .unwrap_or(&state.current_model).clone()
+                    }),
+                    model_backfilled: false,
                     service_tier: state.current_service_tier.clone(),
                     timestamp: parse_timestamp(value.get("timestamp")),
                 });
             }
             _ => {}
+        }
+    }
+
+    if is_guardian {
+        // Checkpoints can retain usage before their first model context. Only
+        // dedicated review threads may backfill this leading unknown prefix.
+        if let Some(model) = guardian_model.or_else(|| token_events.iter()
+            .find(|event| event.model != "unknown").map(|event| event.model.clone())) {
+            for event in token_events.iter_mut().take_while(|event| event.model == "unknown") {
+                event.model.clone_from(&model);
+                event.model_backfilled = true;
+            }
         }
     }
 
@@ -1838,13 +1920,8 @@ fn resolve_parent_signatures(
         return Err(format!("找不到父 rollout: {parent_id}"));
     };
     let mut signatures = Vec::new();
-    let mut seen_names = HashSet::new();
-    for candidate in candidates {
-        // The same rollout can temporarily exist in sessions and archived_sessions.
-        // Its filename is its stable segment identity across that move.
-        if seen_names.insert(candidate.file_name().map(|name| name.to_os_string())) {
-            signatures.extend(parent_signatures_before(candidate, cutoff)?);
-        }
+    for candidate in select_rollout_copies(candidates)? {
+        signatures.extend(parent_signatures_before(&candidate, cutoff)?);
     }
     if signatures.is_empty() {
         return Err(format!("找不到父 rollout: {parent_id}"));
@@ -2304,6 +2381,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    include!("compressed_tests.rs");
+
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD_ID: &str = "00000000-0000-4000-8000-000000000002";
 
@@ -2605,6 +2684,138 @@ mod tests {
     }
 
     #[test]
+    fn active_turn_model_survives_settings_changes() {
+        let dir = make_temp_dir("codex-usage-active-model");
+        let file = rollout_path(&dir, PARENT_ID);
+        let mut settings = thread_settings(PARENT_ID, None);
+        settings["payload"]["thread_settings"]["model"] = json!("model-b");
+        let mut explicit = usage_record("response-explicit", 30, 10, 3, 130, 90, 13, "2026-07-10T03:00:02Z");
+        explicit["payload"]["model"] = json!("model-c");
+        write_jsonl(&file, &[
+            session_meta(PARENT_ID),
+            json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            turn_context("model-a"),
+            settings,
+            usage_record("response-a", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z"),
+            explicit,
+            json!({"type":"event_msg", "payload":{"type":"task_complete"}}),
+            json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            usage_record("response-b", 50, 40, 5, 180, 130, 18, "2026-07-10T03:00:03Z"),
+        ]);
+        let parsed = parse_codex_file(&file, Some(PARENT_ID.into())).unwrap();
+        assert_eq!(parsed.token_events.iter().map(|event| event.model.as_str()).collect::<Vec<_>>(),
+            vec!["model-a", "model-c", "model-b"]);
+        assert_eq!(nonzero_deltas(&parsed), vec![(100, 80, 10), (30, 10, 3), (50, 40, 5)]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn guardian_leading_usage_uses_its_first_known_model_only() {
+        let dir = make_temp_dir("codex-usage-guardian-model");
+        let file = rollout_path(&dir, PARENT_ID);
+        for (source, expected) in [
+            (json!({"thread_source":"guardian_review"}), "review-model"),
+            (json!({"source":{"subagent":{"other":"guardian"}}}), "review-model"),
+            (json!({"source":"cli"}), "unknown"),
+        ] {
+            let mut meta = session_meta(PARENT_ID);
+            meta["payload"].as_object_mut().unwrap().extend(source.as_object().unwrap().clone());
+            write_jsonl(&file, &[
+                meta,
+                json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+                usage_record("response-early", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z"),
+                turn_context("review-model"),
+                usage_record("response-later", 50, 40, 5, 150, 120, 15, "2026-07-10T03:00:02Z"),
+            ]);
+            let parsed = parse_codex_file(&file, Some(PARENT_ID.into())).unwrap();
+            assert_eq!(parsed.token_events[0].model, expected);
+            assert_eq!(parsed.token_events[1].model, "review-model");
+            assert_eq!(nonzero_deltas(&parsed), vec![(100, 80, 10), (50, 40, 5)]);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn guardian_backfill_uses_context_before_later_persistent_settings() {
+        let dir = make_temp_dir("codex-usage-guardian-context");
+        let file = rollout_path(&dir, PARENT_ID);
+        let mut meta = session_meta(PARENT_ID);
+        meta["payload"]["thread_source"] = json!("guardian_review");
+        let mut settings = thread_settings(PARENT_ID, None);
+        settings["payload"]["thread_settings"]["model"] = json!("future-model");
+        write_jsonl(&file, &[
+            meta,
+            json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            usage_record("response-early", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z"),
+            turn_context("review-model"), settings,
+            json!({"type":"event_msg", "payload":{"type":"task_complete"}}),
+        ]);
+        let parsed = parse_codex_file(&file, Some(PARENT_ID.into())).unwrap();
+        assert_eq!(parsed.token_events[0].model, "review-model");
+        assert_eq!(nonzero_deltas(&parsed), vec![(100, 80, 10)]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn guardian_incremental_sync_repairs_leading_unknown_without_new_usage() {
+        let dir = make_temp_dir("codex-usage-guardian-incremental");
+        let file = rollout_path(&dir.join("sessions"), PARENT_ID);
+        let mut meta = session_meta(PARENT_ID);
+        meta["payload"]["thread_source"] = json!("guardian_review");
+        let mut log = vec![meta,
+            usage_record("response-early", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z")];
+        write_jsonl(&file, &log);
+        let instances = [UsageInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: dir.clone() }];
+        let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
+        store.sync(false, &instances).unwrap();
+        let before = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(before.by_model[0].key, "unknown");
+        log.push(turn_context("review-model"));
+        write_jsonl(&file, &log);
+        store.sync(false, &instances).unwrap();
+        let after = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(after.by_model[0].key, "review-model");
+        assert_eq!(after.totals.request_count, 1);
+        assert_eq!((after.totals.input_tokens, after.totals.output_tokens), (100, 10));
+        assert_eq!(before.session_tokens.unwrap()[0].session_id, after.session_tokens.unwrap()[0].session_id);
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn model_attribution_upgrade_repairs_cached_rows_once() {
+        let dir = make_temp_dir("codex-usage-model-upgrade");
+        let file = rollout_path(&dir.join("sessions"), PARENT_ID);
+        let mut settings = thread_settings(PARENT_ID, None);
+        settings["payload"]["thread_settings"]["model"] = json!("model-b");
+        write_jsonl(&file, &[
+            session_meta(PARENT_ID),
+            json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            turn_context("model-a"), settings,
+            usage_record("response-a", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z"),
+        ]);
+        let instances = [UsageInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: dir.clone() }];
+        let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
+        store.sync(false, &instances).unwrap();
+        let conn = store.open_conn().unwrap();
+        conn.execute("UPDATE session_usage_events SET model='model-b'", []).unwrap();
+        set_meta(&conn, "usage_parser_version", "2").unwrap();
+        drop(conn);
+        // Opening the upgraded cache retains its existing totals until sync succeeds.
+        let stale = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(stale.totals.request_count, 1);
+        assert_eq!(stale.by_model[0].key, "model-b");
+        assert_eq!(stale.last_synced_at, None);
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 1);
+        let repaired = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(repaired.by_model[0].key, "model-a");
+        assert_eq!((repaired.totals.input_tokens, repaired.totals.output_tokens), (100, 10));
+        assert_eq!(repaired.totals.request_count, 1);
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn official_records_include_compaction_and_keep_legacy_prefix_without_double_counting() {
         let dir = make_temp_dir("codex-usage-records");
         let file = rollout_path(&dir, PARENT_ID);
@@ -2842,7 +3053,7 @@ mod tests {
         })
     }
 
-    fn make_temp_dir(prefix: &str) -> PathBuf {
+    pub(super) fn make_temp_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

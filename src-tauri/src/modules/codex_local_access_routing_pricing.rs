@@ -1210,8 +1210,8 @@ const CODEX_LOCAL_ACCESS_PRICE_BOOK: &[CodexLocalAccessPriceBookEntry] = &[
     CodexLocalAccessPriceBookEntry {
         model_id: "codex-auto-review",
         session_long_context: true,
-        standard: codex_price(5.0, 0.5, 30.0),
-        priority: Some(codex_price(10.0, 1.0, 60.0)),
+        standard: codex_price(0.0, 0.0, 0.0),
+        priority: Some(codex_price(0.0, 0.0, 0.0)),
     },
     // https://docs.x.ai/developers/pricing — global token rates; >=200k doubles all rates.
     CodexLocalAccessPriceBookEntry {
@@ -1622,7 +1622,7 @@ fn normalize_model_pricings(
     let mut normalized = Vec::new();
     for pricing in model_pricings {
         let model_id = pricing.model_id.trim().to_string();
-        if model_id.is_empty() {
+        if model_id.is_empty() || model_id.eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL_ID) {
             continue;
         }
         let key = model_id.to_ascii_lowercase();
@@ -1756,7 +1756,9 @@ fn is_superseded_default_56_pricing(pricing: &CodexLocalAccessModelPricing) -> b
         .unwrap_or_else(|| pricing.model_id.trim().to_ascii_lowercase());
     let (input, cached, output, priority_input, priority_cached, priority_output) =
         match model_id.as_str() {
-            "gpt-5.6" | "gpt-5.6-sol" => (5.0, 0.5, 30.0, 10.0, 1.0, 60.0),
+            "gpt-5.5" | "gpt-5.6" | "gpt-5.6-sol" | CODEX_AUTO_REVIEW_MODEL_ID => {
+                (5.0, 0.5, 30.0, 10.0, 1.0, 60.0)
+            }
             "gpt-5.6-terra" => (2.5, 0.25, 15.0, 5.0, 0.5, 30.0),
             "gpt-5.6-luna" => (1.0, 0.1, 6.0, 2.0, 0.2, 12.0),
             _ => return false,
@@ -1918,12 +1920,17 @@ fn resolve_base_model_pricing(
     collection: Option<&CodexLocalAccessCollection>,
     model_id: &str,
 ) -> Option<CodexLocalAccessModelPricing> {
+    let preset = price_book_entry_for_model(model_id);
+    // Internal reviews remain free even when a collection has old custom rates.
+    if preset.is_some_and(|entry| entry.model_id == CODEX_AUTO_REVIEW_MODEL_ID) {
+        return preset.map(price_book_entry_to_model_pricing);
+    }
     if let Some(collection) = collection {
         if let Some(custom) = find_custom_model_pricing(collection, model_id) {
             return Some(custom.clone());
         }
     }
-    price_book_entry_for_model(model_id).map(price_book_entry_to_model_pricing)
+    preset.map(price_book_entry_to_model_pricing)
 }
 
 fn resolve_effective_model_pricing(
@@ -2034,6 +2041,10 @@ pub fn try_estimate_model_token_cost_usd_for_service_tier(
     cached_input_tokens: u64,
     output_tokens: u64,
 ) -> Option<f64> {
+    // Local accounting policy treats all auto-review sessions as free, regardless of tier.
+    if model.trim().eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL_ID) {
+        return Some(0.0);
+    }
     let mut tier = match service_tier.filter(|tier| !tier.trim().is_empty()) {
         Some(tier) => Some(normalize_proxy_service_tier(tier)?),
         None => None,
@@ -2048,7 +2059,7 @@ pub fn try_estimate_model_token_cost_usd_for_service_tier(
         reasoning_tokens: 0,
         token_breakdown: None,
     };
-    if tier == Some("priority") {
+    if tier == Some("priority") && !is_grok_47_pricing_model(model) {
         if !pricing_has_explicit_priority_rates(&base) {
             return None;
         }

@@ -572,6 +572,8 @@ pub struct CodexLocalAccessCollection {
     #[serde(default = "default_model_pricing_version")]
     pub model_pricing_version: u64,
     #[serde(default)]
+    pub auto_review_pricing_migrated: bool,
+    #[serde(default)]
     pub model_pricings: Vec<CodexLocalAccessModelPricing>,
     #[serde(default)]
     pub excluded_models: Vec<String>,

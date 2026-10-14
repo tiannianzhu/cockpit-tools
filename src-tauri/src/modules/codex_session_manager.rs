@@ -6,6 +6,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
+use cockpit_session_usage::rollout;
+pub(crate) use cockpit_session_usage::read_token_stats_from_rollout_uncached;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
@@ -385,8 +387,9 @@ struct ContentSearchCacheKey {
 /// 从 rollout JSONL 文件中读取 token 统计信息
 /// 返回 (input_tokens, output_tokens, total_tokens)
 fn read_token_stats_from_rollout(rollout_path: &Path) -> Option<(u64, u64, u64)> {
-    let metadata = fs::metadata(rollout_path).ok()?;
-    let cache_key = rollout_path.to_path_buf();
+    let resolved_path = rollout::resolve_path(rollout_path).ok()?;
+    let metadata = fs::metadata(&resolved_path).ok()?;
+    let cache_key = resolved_path.clone();
     let file_len = metadata.len();
     let modified_at = metadata.modified().ok();
 
@@ -401,7 +404,7 @@ fn read_token_stats_from_rollout(rollout_path: &Path) -> Option<(u64, u64, u64)>
         }
     }
 
-    let stats = read_token_stats_from_rollout_uncached(rollout_path, file_len);
+    let stats = read_token_stats_from_rollout_uncached(&resolved_path, file_len);
     let mut cache = TOKEN_STATS_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -414,13 +417,6 @@ fn read_token_stats_from_rollout(rollout_path: &Path) -> Option<(u64, u64, u64)>
         },
     );
     stats
-}
-
-pub(crate) fn read_token_stats_from_rollout_uncached(
-    rollout_path: &Path,
-    file_len: u64,
-) -> Option<(u64, u64, u64)> {
-    cockpit_session_usage::read_token_stats_from_rollout_uncached(rollout_path, file_len)
 }
 
 fn byte_before_is_newline(file: &mut File, offset: u64) -> std::io::Result<bool> {
@@ -577,7 +573,8 @@ fn rollout_conversation_contains_query(path: &Path, query: &str) -> Result<bool,
 }
 
 fn content_search_cache_key(path: &Path, query: &str) -> Option<ContentSearchCacheKey> {
-    let metadata = fs::metadata(path).ok()?;
+    let resolved_path = rollout::resolve_path(path).ok()?;
+    let metadata = fs::metadata(&resolved_path).ok()?;
     let modified_at_nanos = metadata
         .modified()
         .ok()
@@ -585,7 +582,7 @@ fn content_search_cache_key(path: &Path, query: &str) -> Option<ContentSearchCac
         .map(|value| value.as_nanos());
 
     Some(ContentSearchCacheKey {
-        rollout_path: path.to_path_buf(),
+        rollout_path: resolved_path,
         query: query.to_string(),
         file_len: metadata.len(),
         modified_at_nanos,
@@ -593,7 +590,7 @@ fn content_search_cache_key(path: &Path, query: &str) -> Option<ContentSearchCac
 }
 
 fn rollout_conversation_contains_query_uncached(path: &Path, query: &str) -> Result<bool, String> {
-    let mut file = fs::File::open(path)
+    let mut file = rollout::open_reader(path)
         .map_err(|error| format!("打开 rollout 文件失败 ({}): {}", path.display(), error))?;
     let query_bytes = query.as_bytes();
     if query_bytes.is_empty() {
@@ -834,7 +831,7 @@ pub fn move_sessions_to_trash_across_instances(
         }
         // Internal review agents may not participate in the official spawn cascade.
         let survivors = snapshots.iter().rev()
-            .filter(|snapshot| family.contains(&snapshot.id) && snapshot.rollout_path.exists())
+            .filter(|snapshot| family.contains(&snapshot.id) && !rollout_is_missing(&snapshot.rollout_path))
             .map(|snapshot| snapshot.id.clone()).collect::<Vec<_>>();
         if !survivors.is_empty() {
             match modules::codex_official_app_server::delete_threads(&instance.data_dir, &survivors) {
@@ -842,7 +839,7 @@ pub fn move_sessions_to_trash_across_instances(
                 Err(error) => failures.push(error),
             }
         }
-        family.retain(|id| snapshots.iter().any(|snapshot| &snapshot.id == id && !snapshot.rollout_path.exists()));
+        family.retain(|id| snapshots.iter().any(|snapshot| &snapshot.id == id && rollout_is_missing(&snapshot.rollout_path)));
         for snapshot in snapshots {
             let entry = trash_root.join(format!(
                 "{}--{}",
@@ -2275,8 +2272,13 @@ fn load_thread_snapshots(instance: &CodexSyncInstance) -> Result<Vec<ThreadSnaps
     for row in modules::codex_session_index::read_sessions(&instance.data_dir)? {
         let mut metadata = json!({"source": row.source});
         if classify_session_kind(&metadata) == "subagent" && parent_thread_id(&metadata).is_none() {
-            if let Some(meta) = read_rollout_session_meta(&row.rollout_path)? {
-                metadata["parentThreadId"] = json!(parent_thread_id(&meta));
+            match read_rollout_session_meta(&row.rollout_path) {
+                Ok(Some(meta)) => metadata["parentThreadId"] = json!(parent_thread_id(&meta)),
+                Ok(None) => {}
+                Err(error) => modules::logger::log_warn(&format!(
+                    "[Codex Session Manager] 无法补全会话 {} 的父子关系: {}",
+                    row.id, error
+                )),
             }
         }
         snapshots.push(ThreadSnapshot {
@@ -2297,9 +2299,8 @@ fn load_thread_snapshots(instance: &CodexSyncInstance) -> Result<Vec<ThreadSnaps
 }
 
 fn read_rollout_session_meta(path: &Path) -> Result<Option<JsonValue>, String> {
-    let file = fs::File::open(path)
+    let reader = rollout::open_reader(path)
         .map_err(|error| format!("打开 rollout 文件失败 ({}): {}", path.display(), error))?;
-    let reader = BufReader::new(file);
     for line in reader.lines() {
         let line =
             line.map_err(|error| format!("读取 rollout 文件失败 ({}): {}", path.display(), error))?;
@@ -2373,8 +2374,11 @@ fn get_session_trash_roots_for_read() -> Result<Vec<TrashRoot>, String> {
     Ok(roots)
 }
 
-/// 把会话文件复制进废纸篓（保留修改时间）。删除动作在官方 app-server 中执行成功时
-/// 会移除原文件；未成功时由 `remove_snapshot_rollout_file` 兜底移除，最终结果与移动一致。
+// Only NotFound confirms deletion; an unreadable rollout remains unconfirmed.
+fn rollout_is_missing(path: &Path) -> bool {
+    rollout::resolve_path(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn finish_delete_backup(entry: &Path, deleted: bool) -> Result<(), String> {
     let path = entry.join("manifest.json");
     let mut manifest: JsonValue =
@@ -2411,16 +2415,13 @@ fn copy_snapshot_rollout_to_trash(
     trash_root: &Path,
     snapshot: &ThreadSnapshot,
 ) -> Result<(), String> {
-    if !snapshot.rollout_path.is_file() {
-        return Err(format!(
-            "会话文件不存在，无法备份，未执行删除: {}",
-            snapshot.rollout_path.display()
-        ));
-    }
+    let resolved_path = rollout::resolve_path(&snapshot.rollout_path).map_err(|error| {
+        format!("无法定位会话文件，无法备份，未执行删除 ({}): {}", snapshot.rollout_path.display(), error)
+    })?;
 
     let source_root = fs::canonicalize(&snapshot.source_root)
         .map_err(|error| format!("无法定位会话根目录: {}", error))?;
-    let source_path = fs::canonicalize(&snapshot.rollout_path)
+    let source_path = fs::canonicalize(&resolved_path)
         .map_err(|error| format!("无法定位会话文件: {}", error))?;
     let relative_path = source_path.strip_prefix(&source_root).map_err(|_| {
         format!(
@@ -2447,7 +2448,7 @@ fn copy_snapshot_rollout_to_trash(
         "instanceId": instance.id,
         "instanceName": instance.name,
         "instanceRoot": instance.data_dir,
-        "originalRolloutPath": snapshot.rollout_path,
+        "originalRolloutPath": resolved_path,
         "relativeRolloutPath": relative_path.to_string_lossy(),
         "sessionIndexEntry": snapshot.session_index_entry,
         "deletedAt": Utc::now().to_rfc3339(),
@@ -2472,11 +2473,11 @@ fn copy_snapshot_rollout_to_trash(
             )
         },
     )?;
-    let modified_at = modules::codex_session_file_time::read_modified_time(&snapshot.rollout_path);
-    fs::copy(&snapshot.rollout_path, &file_target).map_err(|error| {
+    let modified_at = modules::codex_session_file_time::read_modified_time(&source_path);
+    fs::copy(&source_path, &file_target).map_err(|error| {
         format!(
             "复制会话文件到废纸篓失败 ({} -> {}): {}",
-            snapshot.rollout_path.display(),
+            source_path.display(),
             file_target.display(),
             error
         )
@@ -2818,7 +2819,7 @@ fn restore_trashed_session_entry(entry: &TrashedSessionEntry) -> Result<(), Stri
             .ok_or_else(|| format!("官方恢复后缺少会话文件路径: {}", id))?;
         let canonical_root = fs::canonicalize(root)
             .map_err(|error| format!("无法确认 Codex 实例目录: {}", error))?;
-        let canonical_path = fs::canonicalize(&final_path)
+        let canonical_path = rollout::resolve_path(&final_path).and_then(fs::canonicalize)
             .map_err(|error| format!("无法确认恢复后的会话文件: {}", error))?;
         let expected_dir = if archived {
             "archived_sessions"
@@ -2862,7 +2863,11 @@ where
         }
     }
 
-    let target_rollout_path = entry.manifest.original_rollout_path.clone();
+    let target_rollout_path = match rollout::resolve_path(&entry.manifest.original_rollout_path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => entry.manifest.original_rollout_path.clone(),
+        Err(error) => return Err(format!("无法定位会话恢复目标: {error}")),
+    };
     let target_existed_before_restore = target_rollout_path.exists();
 
     if target_existed_before_restore {
@@ -3159,6 +3164,96 @@ fn cleanup_empty_trash_ancestors(entry_dir: &Path) {
 #[cfg(test)]
 mod tests {
     include!("codex_session_transfer_isolated_tests.rs");
+
+    #[test]
+    fn compressed_rollout_inventory_preserves_parent_and_survives_unavailable_metadata() {
+        let home = make_temp_dir("compressed-rollout-inventory");
+        let plain = home.join("sessions/rollout-child.jsonl");
+        let compressed = plain.with_extension("jsonl.zst");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        let metadata = json!({"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent"}});
+        let content = format!("{metadata}\ncompressed search needle\n");
+        let bytes = zstd::stream::encode_all(content.as_bytes(), 0).unwrap();
+        fs::write(&compressed, &bytes).unwrap();
+        let healthy = home.join("sessions/rollout-parent.jsonl");
+        write_rollout(&healthy, "parent", "healthy conversation");
+        let missing = home.join("sessions/rollout-missing.jsonl");
+        let corrupt = home.join("sessions/rollout-corrupt.jsonl");
+        fs::write(corrupt.with_extension("jsonl.zst"), "invalid zstd").unwrap();
+        let database = home.join("state_1.sqlite");
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, rollout_path TEXT, updated_at INTEGER, source TEXT, archived INTEGER);").unwrap();
+        for (id, path, source) in [
+            ("child", &plain, r#"{"subagent":{"other":"guardian"}}"#),
+            ("parent", &healthy, "cli"),
+            ("missing", &missing, r#"{"subagent":"review"}"#),
+            ("corrupt", &corrupt, r#"{"subagent":"review"}"#),
+        ] {
+            db.execute("INSERT INTO threads VALUES (?1,?1,'/project',?2,1,?3,0)",
+                rusqlite::params![id, path.to_str().unwrap(), source]).unwrap();
+        }
+        drop(db);
+        let index_before = fs::read(&database).unwrap();
+        let instance = CodexSyncInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: home.clone(), last_pid: None };
+        let snapshots = load_thread_snapshots(&instance).unwrap();
+        assert_eq!(snapshots.len(), 4);
+        let child = snapshots.iter().find(|snapshot| snapshot.id == "child").unwrap();
+        assert_eq!(child.session_kind, "subagent");
+        assert_eq!(child.parent_thread_id.as_deref(), Some("parent"));
+        assert!(snapshots.iter().any(|snapshot| snapshot.id == "parent"));
+        assert!(rollout_conversation_contains_query_uncached(&plain, "compressed search needle").unwrap());
+        assert!(!rollout_conversation_contains_query_uncached(&compressed, "absent needle").unwrap());
+        assert!(read_rollout_session_meta(&corrupt).is_err());
+        assert!(!plain.exists());
+        assert_eq!(fs::read(&compressed).unwrap(), bytes);
+        assert_eq!(fs::read(&database).unwrap(), index_before);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn compressed_rollout_reads_prefer_plain_and_refresh_search_results() {
+        let home = make_temp_dir("compressed-rollout-precedence");
+        let plain = home.join("rollout-fixture.jsonl");
+        let compressed = plain.with_extension("jsonl.zst");
+        write_rollout(&plain, "plain", "current");
+        let metadata = json!({"type":"session_meta","payload":{"id":"compressed"}});
+        fs::write(&compressed, zstd::stream::encode_all(format!("{metadata}\n").as_bytes(), 0).unwrap()).unwrap();
+        for path in [&plain, &compressed] {
+            assert_eq!(session_meta_id(&read_rollout_session_meta(path).unwrap().unwrap()).as_deref(), Some("plain"));
+        }
+        assert!(!rollout_conversation_contains_query(&compressed, "changed needle").unwrap());
+        write_rollout(&plain, "plain", "changed needle");
+        assert!(rollout_conversation_contains_query(&compressed, "changed needle").unwrap());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn token_stats_cache_tracks_compressed_and_plain_representations() {
+        let home = make_temp_dir("compressed-token-stats-cache");
+        let plain = home.join("rollout-fixture.jsonl");
+        let compressed = plain.with_extension("jsonl.zst");
+        let token_count = |input, output| json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {
+                    "input_tokens": input,
+                    "output_tokens": output,
+                    "total_tokens": input + output
+                }}
+            }
+        }).to_string() + "\n";
+        fs::write(&compressed, zstd::stream::encode_all(token_count(10, 3).as_bytes(), 0).unwrap()).unwrap();
+        assert_eq!(read_token_stats_from_rollout(&plain), Some((10, 3, 13)));
+        assert_eq!(read_token_stats_from_rollout(&compressed), Some((10, 3, 13)));
+        fs::write(&plain, token_count(20, 5)).unwrap();
+        assert_eq!(read_token_stats_from_rollout(&compressed), Some((20, 5, 25)));
+        fs::remove_file(&plain).unwrap();
+        assert_eq!(read_token_stats_from_rollout(&plain), Some((10, 3, 13)));
+        assert!(!plain.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn delete_backup_tracks_confirmed_outcome() {
         for outcome in ["rejected", "uncertain", "deleted"] {

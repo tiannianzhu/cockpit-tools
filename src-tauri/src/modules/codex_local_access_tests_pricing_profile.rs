@@ -624,6 +624,7 @@
 
     #[test]
     fn request_log_db_preserves_api_key_label_error_and_pricing_version() {
+        let pricing_version = DEFAULT_MODEL_PRICING_VERSION + 1;
         let dir = make_temp_dir("codex-local-access-logs");
         let db_path = dir.join("request_logs.sqlite");
         let conn = open_local_access_logs_db_once(&db_path, true).expect("open logs db");
@@ -662,7 +663,7 @@
                 None,
                 None,
             )),
-            7,
+            pricing_version,
             0.0,
         );
 
@@ -684,7 +685,7 @@
         assert_eq!(loaded.0, "Production Key");
         assert_eq!(loaded.1, long_error);
         assert!(loaded.1.contains("tail-marker"));
-        assert_eq!(loaded.2, 7);
+        assert_eq!(loaded.2, pricing_version as i64);
 
         drop(conn);
         let _ = fs::remove_dir_all(dir);
@@ -971,7 +972,7 @@
         insert_local_access_usage_event(&conn, &event).expect("insert request log");
 
         let mut collection = test_local_access_collection(vec!["acc-1".to_string()]);
-        collection.model_pricing_version = 8;
+        collection.model_pricing_version = DEFAULT_MODEL_PRICING_VERSION;
         collection.model_pricings = vec![model_pricing(
             "custom-model",
             None,
@@ -1010,7 +1011,7 @@
             .expect("read repriced request log");
 
         assert!((loaded.0 - 6.95).abs() < 0.000001);
-        assert_eq!(loaded.1, 8);
+        assert_eq!(loaded.1, DEFAULT_MODEL_PRICING_VERSION as i64);
         assert_eq!(loaded.2, 3.0);
         assert_eq!(loaded.3, 9.0);
         assert_eq!(loaded.4, Some(0.25));
@@ -1021,6 +1022,8 @@
 
     #[test]
     fn background_reprice_reads_only_stale_pricing_versions() {
+        let stale_version = DEFAULT_MODEL_PRICING_VERSION;
+        let current_version = stale_version + 1;
         let dir = make_temp_dir("codex-local-access-background-reprice");
         let db_path = dir.join("request_logs.sqlite");
         let conn = open_local_access_logs_db_once(&db_path, true).expect("open logs db");
@@ -1034,8 +1037,8 @@
             token_breakdown: None,
         };
         for (request_id, timestamp, pricing_version) in [
-            ("req-stale", 1_700_000_000_000, 7),
-            ("req-current", 1_700_000_000_001, 8),
+            ("req-stale", 1_700_000_000_000, stale_version),
+            ("req-current", 1_700_000_000_001, current_version),
         ] {
             let event = append_usage_event(
                 &mut events,
@@ -1075,15 +1078,15 @@
 
         let model_ids = vec!["gpt-5.4".to_string()];
         assert_eq!(
-            count_request_logs_for_model_ids(&conn, Some(&model_ids), Some(8))
+            count_request_logs_for_model_ids(&conn, Some(&model_ids), Some(current_version))
                 .expect("count stale rows"),
             1
         );
         let mut cursors = HashMap::from([("gpt-5.4".to_string(), 0_i64)]);
-        let rows = read_request_log_reprice_batch(&conn, &mut cursors, 10, Some(8))
+        let rows = read_request_log_reprice_batch(&conn, &mut cursors, 10, Some(current_version))
             .expect("read stale rows");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].previous_model_pricing_version, 7);
+        assert_eq!(rows[0].previous_model_pricing_version, stale_version);
 
         drop(conn);
         let _ = fs::remove_dir_all(dir);
@@ -1435,6 +1438,220 @@
     }
 
     #[test]
+    fn auto_review_session_cost_is_free_for_all_tiers_and_contexts() {
+        for (tier, context) in [
+            (None, 100),
+            (
+                Some("priority"),
+                CODEX_LOCAL_ACCESS_LONG_CONTEXT_THRESHOLD_TOKENS + 1,
+            ),
+            (Some("ultrafast"), 100),
+            (Some("unrecognized-tier"), 100),
+        ] {
+            assert_eq!(
+                try_estimate_model_token_cost_usd_for_service_tier(
+                    "codex-auto-review",
+                    tier,
+                    context,
+                    1_000_000,
+                    250_000,
+                    100_000,
+                ),
+                Some(0.0),
+                "tier: {tier:?}, context: {context}",
+            );
+        }
+        assert_eq!(
+            super::estimate_known_model_token_cost_usd(
+                "codex-auto-review",
+                1_000_000,
+                250_000,
+                100_000,
+            ),
+            Some(0.0),
+        );
+        assert!(
+            super::estimate_known_model_token_cost_usd(
+                "gpt-6.1-sol", 1_000_000, 250_000, 100_000,
+            ).unwrap() > 0.0
+        );
+    }
+
+    #[test]
+    fn auto_review_pricing_upgrade_removes_paid_preset() {
+        let mut collection = test_local_access_collection(Vec::new());
+        collection.model_pricing_version = 6;
+        let custom = model_pricing(
+            "gpt-5.6-luna",
+            None,
+            codex_price(9.9, 0.9, 19.0),
+            None,
+            None,
+            None,
+        );
+        collection.model_pricings = vec![
+            model_pricing(
+                "codex-auto-review",
+                Some(272_000),
+                codex_price(5.0, 0.5, 30.0),
+                None,
+                Some(codex_price(10.0, 1.0, 60.0)),
+                None,
+            ),
+            custom,
+        ];
+        super::sanitize_collection_structure(&mut collection).unwrap();
+        assert_eq!(collection.model_pricing_version, DEFAULT_MODEL_PRICING_VERSION);
+        assert_eq!(collection.model_pricings.len(), 1);
+        let kept = &collection.model_pricings[0];
+        assert_eq!(kept.model_id, "gpt-5.6-luna");
+        assert_eq!(kept.input_usd_per_million, 9.9);
+        assert_eq!(kept.cached_input_usd_per_million, Some(0.9));
+        assert_eq!(kept.output_usd_per_million, 19.0);
+        let pricing = resolve_base_model_pricing(Some(&collection), "codex-auto-review").unwrap();
+        assert_eq!(
+            calculate_usage_cost_usd_from_tokens(1_000_000, 100_000, 250_000, &pricing),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn auto_review_custom_prices_cannot_charge_gateway_requests() {
+        let mut paid_review = model_pricing(
+            "codex-auto-review", Some(272_000), codex_price(2.0, 0.5, 6.0),
+            Some(codex_price(3.0, 0.7, 9.0)), Some(codex_price(7.0, 2.0, 17.0)), None,
+        );
+        paid_review.standard_long_price_override = true;
+        let control = model_pricing(
+            "paid-fixture", None, codex_price(3.0, 0.25, 9.0), None, None, None,
+        );
+        let mut collection = test_local_access_collection(Vec::new());
+        collection.model_pricings = vec![paid_review, control.clone()];
+        let usage = UsageCapture {
+            input_tokens: 1_000_000, output_tokens: 100_000, total_tokens: 1_100_000,
+            cached_tokens: 250_000, reasoning_tokens: 0, token_breakdown: None,
+        };
+        for (model, tier, input) in [
+            ("codex-auto-review", None, 100),
+            ("codex-auto-review", None, usage.input_tokens),
+            (" CODEX-AUTO-REVIEW ", Some("priority"), usage.input_tokens),
+        ] {
+            let request_usage = UsageCapture { input_tokens: input, ..usage.clone() };
+            let pricing = resolve_effective_model_pricing(
+                Some(&collection), Some(model), Some(&request_usage), tier,
+            ).unwrap();
+            assert_eq!(calculate_usage_cost_usd(Some(&request_usage), Some(&pricing)), 0.0,
+                "model={model}, tier={tier:?}, input={input}");
+            assert_eq!(pricing.input_usd_per_million, 0.0);
+            assert_eq!(pricing.cached_input_usd_per_million, Some(0.0));
+            assert_eq!(pricing.output_usd_per_million, 0.0);
+        }
+        assert_eq!(resolve_base_model_pricing(Some(&collection), "paid-fixture").unwrap(), control);
+        assert!((calculate_usage_cost_usd(Some(&usage), Some(&control)) - 3.2125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn auto_review_custom_prices_upgrade_high_versions_only_once() {
+        for had_override in [true, false] {
+            let mut collection = test_local_access_collection(Vec::new());
+            let old_version = DEFAULT_MODEL_PRICING_VERSION + 12;
+            collection.model_pricing_version = old_version;
+            let control = model_pricing(
+                "paid-fixture", None, codex_price(3.0, 0.25, 9.0), None, None, None,
+            );
+            collection.model_pricings = vec![control.clone()];
+            if had_override {
+                collection.model_pricings.push(model_pricing(
+                    "codex-auto-review", None, codex_price(2.0, 0.5, 6.0), None, None, None,
+                ));
+            } else {
+                // Old configuration cannot reveal its pricing policy from the user version.
+                let mut old_json = serde_json::to_value(&collection).unwrap();
+                old_json.as_object_mut().unwrap().remove("autoReviewPricingMigrated");
+                collection = serde_json::from_value(old_json).unwrap();
+                assert!(!collection.auto_review_pricing_migrated);
+            }
+            super::sanitize_collection_structure(&mut collection).unwrap();
+            assert_eq!(collection.model_pricing_version, old_version + 1, "had_override={had_override}");
+            assert!(collection.auto_review_pricing_migrated);
+            assert_eq!(collection.model_pricings, vec![control]);
+            collection = serde_json::from_value(serde_json::to_value(&collection).unwrap()).unwrap();
+            super::sanitize_collection_structure(&mut collection).unwrap();
+            assert_eq!(collection.model_pricing_version, old_version + 1);
+        }
+    }
+
+    #[test]
+    fn auto_review_custom_prices_reprice_history_without_changing_usage() {
+        let old_version = DEFAULT_MODEL_PRICING_VERSION + 12;
+        let dir = make_temp_dir("codex-auto-review-custom-reprice");
+        let mut conn = open_local_access_logs_db_once(&dir.join("logs.sqlite"), true).unwrap();
+        let usage = UsageCapture {
+            input_tokens: 1_000_000, output_tokens: 100_000, total_tokens: 1_100_000,
+            cached_tokens: 250_000, reasoning_tokens: 0, token_breakdown: None,
+        };
+        let control = model_pricing(
+            "paid-fixture", None, codex_price(3.0, 0.25, 9.0), None, None, None,
+        );
+        let legacy_review = model_pricing(
+            "codex-auto-review", None, codex_price(10.0, 1.0, 45.0), None, None, None,
+        );
+        let mut events = Vec::new();
+        for (request, pricing, tier, cost) in [
+            ("review", &legacy_review, None, 12.25),
+            ("control", &control, None, 3.2125),
+        ] {
+            let mut event = append_usage_event(
+                &mut events, 1_700_000_000_000, Some(request), Some("fixture-account"),
+                None, None, None, None, Some(&pricing.model_id),
+                Some(CodexLocalAccessGatewayMode::Sidecar), CodexLocalAccessRequestKind::Text,
+                tier, None, None, None, true, Some(200), None, None, 1,
+                Some(&usage), Some(pricing), old_version, cost,
+            );
+            // Historical fixture predates the free-pricing enforcement upgrade.
+            event.model_pricing_version = old_version;
+            insert_local_access_usage_event(&conn, &event).unwrap();
+        }
+        let before: (i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(total_tokens), SUM(cached_tokens) FROM request_logs",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        let mut collection = test_local_access_collection(Vec::new());
+        collection.model_pricing_version = old_version;
+        collection.model_pricings = vec![control.clone()];
+        let mut old_json = serde_json::to_value(&collection).unwrap();
+        old_json.as_object_mut().unwrap().remove("autoReviewPricingMigrated");
+        collection = serde_json::from_value(old_json).unwrap();
+        assert!(!collection.auto_review_pricing_migrated);
+        super::sanitize_collection_structure(&mut collection).unwrap();
+        assert!(collection.model_pricing_version > old_version);
+        let review_models = vec!["codex-auto-review".to_string()];
+        assert_eq!(count_request_logs_for_model_ids(
+            &conn, Some(&review_models), Some(collection.model_pricing_version),
+        ).unwrap(), 1);
+        reprice_request_logs_for_collection(&mut conn, &collection).unwrap();
+        let review: (f64, u64, f64, f64, Option<f64>) = conn.query_row(
+            "SELECT estimated_cost_usd, model_pricing_version, input_usd_per_million, output_usd_per_million, cached_input_usd_per_million FROM request_logs WHERE request_id='review'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(review.0, 0.0);
+        assert!(review.1 > old_version);
+        assert_eq!((review.2, review.3, review.4), (0.0, 0.0, Some(0.0)));
+        let control_cost: f64 = conn.query_row(
+            "SELECT estimated_cost_usd FROM request_logs WHERE request_id='control'", [], |row| row.get(0),
+        ).unwrap();
+        assert!((control_cost - 3.2125).abs() < 1e-9);
+        assert_eq!(resolve_base_model_pricing(Some(&collection), "paid-fixture").unwrap(), control);
+        let after = conn.query_row(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(total_tokens), SUM(cached_tokens) FROM request_logs",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(before, after);
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn session_cost_requires_published_context_rates() {
         let threshold = CODEX_LOCAL_ACCESS_LONG_CONTEXT_THRESHOLD_TOKENS;
         let estimate = |model, tier, context| {
@@ -1510,10 +1727,9 @@
                 None,
             ),
         ]);
-        assert_eq!(kept.len(), 2);
+        assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].model_id, "gpt-5.6-luna");
         assert_eq!(kept[0].input_usd_per_million, 9.9);
-        assert_eq!(kept[1].model_id, "gpt-5.5");
 
         let mut upgraded = test_local_access_collection(vec!["account-a".to_string()]);
         upgraded.model_pricing_version = 3;
@@ -2660,6 +2876,13 @@ supports_websockets = false
     }
 
     #[test]
+    fn retired_gpt_55_session_cost_preserves_fast_rates() {
+        assert_eq!(try_estimate_model_token_cost_usd_for_service_tier(
+            "gpt-5.5", Some("priority"), 272_000, 1_000_000, 0, 0,
+        ), Some(12.5));
+    }
+
+    #[test]
     fn grok_47_prices_match_official_inclusive_long_context_and_exact_aliases() {
         for model in ["grok-4.7", "grok-4.7-latest", "xai/grok-4.7", "team/GROK-4.7(high)"] {
             for (input_tokens, rates) in [(199_999, (2.0, 0.5, 6.0)), (200_000, (4.0, 1.0, 12.0)), (200_001, (4.0, 1.0, 12.0))] {
@@ -2669,6 +2892,10 @@ supports_websockets = false
                     assert_eq!((pricing.input_usd_per_million, pricing.cached_input_usd_per_million.unwrap(), pricing.output_usd_per_million), rates, "{model}/{input_tokens}/{tier:?}");
                     let expected = (input_tokens - 100_000) as f64 * rates.0 / 1_000_000.0 + 100_000.0 * rates.1 / 1_000_000.0 + 10_000.0 * rates.2 / 1_000_000.0;
                     assert!((calculate_usage_cost_usd(Some(&usage), Some(&pricing)) - expected).abs() < 1e-10);
+                    let session_cost = try_estimate_model_token_cost_usd_for_service_tier(
+                        model, tier, input_tokens, input_tokens, 100_000, 10_000,
+                    ).expect("published Grok session rates");
+                    assert!((session_cost - expected).abs() < 1e-10);
                 }
             }
         }
@@ -2759,11 +2986,12 @@ supports_websockets = false
         let legacy = price_book_entry_to_model_pricing(
             HISTORICAL_CODEX_MODEL_PRICE_BOOK
                 .iter()
-                .find(|entry| entry.model_id == "gpt-5.4")
+                .find(|entry| entry.model_id == "gpt-5.5")
                 .unwrap(),
         );
         let mut collection = test_local_access_collection(vec![]);
-        collection.model_pricing_version = 4;
+        collection.model_pricing_version = 8;
+        collection.auto_review_pricing_migrated = true;
         let mut customized = legacy.clone();
         customized.model_id = "gpt-5.4-mini".into();
         customized.input_usd_per_million = 99.0;
@@ -2773,6 +3001,7 @@ supports_websockets = false
             collection.model_pricing_version,
             DEFAULT_MODEL_PRICING_VERSION
         );
+        assert!(collection.model_pricing_version > 8);
         assert_eq!(collection.model_pricings.len(), 1);
         assert_eq!(collection.model_pricings[0].input_usd_per_million, 99.0);
         assert_eq!(collection.model_pricings[0].model_id, customized.model_id);

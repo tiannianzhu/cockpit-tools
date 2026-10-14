@@ -28,6 +28,7 @@ fn new_local_access_collection() -> Result<CodexLocalAccessCollection, String> {
         model_aliases: Vec::new(),
         suppress_oauth_model_alias: false,
         model_pricing_version: DEFAULT_MODEL_PRICING_VERSION,
+        auto_review_pricing_migrated: true,
         model_pricings: Vec::new(),
         excluded_models: Vec::new(),
         session_affinity: true,

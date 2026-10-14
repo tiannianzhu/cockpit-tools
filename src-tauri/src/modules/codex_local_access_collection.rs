@@ -1662,11 +1662,9 @@ fn sanitize_collection_structure(
     }
     collection.model_aliases = normalized_model_aliases;
 
+    let previous_pricing_version = collection.model_pricing_version;
     let original_model_pricings = std::mem::take(&mut collection.model_pricings);
     let normalized_model_pricings = normalize_model_pricings(original_model_pricings.clone());
-    if normalized_model_pricings != original_model_pricings {
-        changed = true;
-    }
     collection.model_pricings = if collection.model_pricing_version < DEFAULT_MODEL_PRICING_VERSION {
         drop_superseded_default_56_model_pricings(normalized_model_pricings)
     } else {
@@ -1682,6 +1680,15 @@ fn sanitize_collection_structure(
             collection.model_pricings = Vec::new();
         }
         collection.model_pricing_version = DEFAULT_MODEL_PRICING_VERSION;
+        changed = true;
+    }
+    if !collection.auto_review_pricing_migrated || original_model_pricings.iter().any(|pricing| {
+        pricing.model_id.trim().eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL_ID)
+    }) {
+        // Old custom versions can also contain paid built-in review logs.
+        collection.model_pricing_version = previous_pricing_version
+            .saturating_add(1).max(DEFAULT_MODEL_PRICING_VERSION);
+        collection.auto_review_pricing_migrated = true;
         changed = true;
     }
 
@@ -1955,6 +1962,7 @@ async fn ensure_runtime_loaded_without_start_with_profile_restore(
                 model_aliases: Vec::new(),
                 suppress_oauth_model_alias: false,
                 model_pricing_version: DEFAULT_MODEL_PRICING_VERSION,
+                auto_review_pricing_migrated: true,
                 model_pricings: Vec::new(),
                 excluded_models: Vec::new(),
                 session_affinity: true,
@@ -1990,7 +1998,7 @@ async fn ensure_runtime_loaded_without_start_with_profile_restore(
             // Cold start must not list/decrypt every Codex account before publishing
             // runtime. Membership pruning runs in ensure_collection_account_sanitize_started.
             let changed = sanitize_collection_structure(collection)?;
-            pricing_book_resealed = previous_pricing_version < DEFAULT_MODEL_PRICING_VERSION;
+            pricing_book_resealed = collection.model_pricing_version > previous_pricing_version;
             persist_after_load = persist_after_load || changed;
         }
 
