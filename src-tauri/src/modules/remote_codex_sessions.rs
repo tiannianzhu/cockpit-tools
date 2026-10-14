@@ -543,7 +543,7 @@ pub async fn open_target(server_id: &str, session_id: &str, folder: bool) -> Res
     Ok(())
 }
 
-const USAGE_SOURCES: [(&str, &str); 4] = [
+const USAGE_SOURCES: [(&str, &str); 5] = [
     (
         "Cargo.toml",
         include_str!("../../../crates/cockpit-session-usage/Cargo.toml"),
@@ -559,6 +559,10 @@ const USAGE_SOURCES: [(&str, &str); 4] = [
     (
         "src/main.rs",
         include_str!("../../../crates/cockpit-session-usage/src/main.rs"),
+    ),
+    (
+        "src/rollout.rs",
+        include_str!("../../../crates/cockpit-session-usage/src/rollout.rs"),
     ),
 ];
 
@@ -805,11 +809,14 @@ def safe_dir(path):
     if path.is_symlink(): fail('Symlinked session directory is not allowed')
     return path
 
-def rollout_path(root, thread):
+def rollout_path(root, thread, allow_compressed=False):
     raw = thread.get('path')
     if not isinstance(raw, str) or not raw: fail('Official thread has no rollout path')
     path = pathlib.Path(raw)
     if not path.is_absolute(): fail('Official rollout path is not absolute')
+    if allow_compressed:
+        if path.name.endswith('.jsonl.zst'): path=path.with_suffix('')
+        if not path.is_file() and not path.is_symlink(): path=pathlib.Path(str(path)+'.zst')
     if path.is_symlink(): fail('Symlinked session file is not allowed')
     path = path.resolve(strict=True)
     if root not in path.parents or path.relative_to(root).parts[0] not in ('sessions','archived_sessions'):
@@ -856,8 +863,15 @@ def trash_members(root, sid):
         if backup_session_meta(file).get('id')!=mid: fail('Trash backup session ID mismatch')
     return data,members
 
+def open_rollout(file):
+    if file.name.endswith('.jsonl.zst'):
+        try: from compression import zstd
+        except ImportError: fail('Reading compressed Codex sessions requires Python 3.14 or newer')
+        return zstd.open(file,'rb')
+    return file.open('rb')
+
 def backup_session_meta(file):
-    with file.open('rb') as stream: first=stream.readline(1024*1024)
+    with open_rollout(file) as stream: first=stream.readline(1024*1024)
     try: record=json.loads(first)
     except (ValueError,UnicodeError): return {}
     payload=record.get('payload') if isinstance(record,dict) and record.get('type')=='session_meta' else None
@@ -871,7 +885,11 @@ def trash_group(root,sid):
     return data,members
 
 def backup_originals_intact(root,members):
-    return all(file is not None and relative is not None and (root/relative).is_file() and same_content(file,root/relative) for _,file,relative in members)
+    return all(file is not None and relative is not None and not (root/relative).is_symlink() and (root/relative).is_file() and same_content(file,root/relative) for _,file,relative in members)
+
+def rollout_exists(path):
+    if path.name.endswith('.jsonl.zst'): path=path.with_suffix('')
+    return any(file.exists() or file.is_symlink() for file in (path,pathlib.Path(str(path)+'.zst')))
 
 def trash_rows(root,sid,data,members):
     session_ids=[member['id'] for member,_,_ in members]
@@ -1102,15 +1120,18 @@ def index_threads(root):
             display=next((value.strip() for value in (name,title) if isinstance(value,str) and value.strip()),sid)
             thread={'id':sid,'path':rollout,'name':display,'cwd':cwd,'updatedAt':int(updated),'source':source,'archived':bool(archived)}
             if kind(thread)=='subagent' and not parent_thread_id(thread):
-                meta=backup_session_meta(rollout_path(root,thread))
-                thread['parentThreadId']=parent_thread_id(meta)
+                try:
+                    meta=backup_session_meta(rollout_path(root,thread,allow_compressed=True))
+                    thread['parentThreadId']=parent_thread_id(meta)
+                except Exception as exc:
+                    print('Cannot enrich Codex session '+sid+': '+str(exc),file=sys.stderr)
             threads.append(thread)
         except (ValueError,TypeError) as exc:
             fail('Invalid row in Codex session index '+path.name+': '+str(exc))
     return threads
 
 def session_row(root,thread,archived=None):
-    try: path=rollout_path(root,thread) if thread.get('path') else None
+    try: path=rollout_path(root,thread,allow_compressed=archived is not None) if thread.get('path') else None
     except FileNotFoundError:
         if archived is None: raise
         path=None # The index can retain a session whose rollout was removed.
@@ -1127,20 +1148,20 @@ def raw_scan(root):
         for directory,dirs,files in os.walk(base,followlinks=False):
             dirs[:]=[d for d in dirs if not pathlib.Path(directory,d).is_symlink()]
             for filename in files:
-                if not filename.startswith('rollout-') or not filename.endswith('.jsonl'): continue
+                if not filename.startswith('rollout-') or not filename.endswith(('.jsonl','.jsonl.zst')): continue
                 path=pathlib.Path(directory,filename)
                 if path.is_symlink(): continue
+                if filename.endswith('.jsonl.zst') and path.with_suffix('').is_file(): continue
                 try:
-                    with path.open('rb') as source: row=json.loads(source.readline(1024*1024))
-                    meta=row.get('payload',{}) if row.get('type')=='session_meta' else {}
+                    meta=backup_session_meta(path)
                     sid=session_id(meta.get('id'))
                     found.append((sid,path,meta))
-                except (OSError,ValueError,UnicodeError): continue
+                except Exception: continue # Unreadable metadata must not hide other rollouts.
     return found
 
 def same_content(left,right):
-    if left.stat().st_size!=right.stat().st_size: return False
-    with left.open('rb') as a,right.open('rb') as b:
+    if not any(file.name.endswith('.jsonl.zst') for file in (left,right)) and left.stat().st_size!=right.stat().st_size: return False
+    with open_rollout(left) as a,open_rollout(right) as b:
         while True:
             a_chunk=a.read(1024*1024); b_chunk=b.read(1024*1024)
             if a_chunk!=b_chunk: return False
@@ -1328,9 +1349,10 @@ def main(p):
             ordered=[root_thread]+[selected[key] for key in sorted(selected) if key!=sid]
             members=[]
             for thread in ordered:
-                path=rollout_path(root,thread)
-                row=session_row(root,thread)
-                members.append((dict(id=row['id'],title=row['title'],archived=row['archived'],relativePath=path.relative_to(root).as_posix(),parentThreadId=row['parentThreadId'],sessionKind=row['sessionKind'],cwd=row['cwd']),path))
+                path=rollout_path(root,thread,allow_compressed=True)
+                row=session_row(root,thread,archived=path.relative_to(root).parts[0]=='archived_sessions')
+                logical=path.with_suffix('') if path.name.endswith('.jsonl.zst') else path
+                members.append((dict(id=row['id'],title=row['title'],archived=row['archived'],relativePath=logical.relative_to(root).as_posix(),parentThreadId=row['parentThreadId'],sessionKind=row['sessionKind'],cwd=row['cwd']),path))
             entry=trash_root(root)/sid
             if entry.exists() or entry.is_symlink(): fail('Session already has a trash entry or retained backup; inspect it before retrying')
             entry.mkdir(parents=True)
@@ -1339,9 +1361,11 @@ def main(p):
                 for index,(member,path) in enumerate(members):
                     target=entry/('rollout.jsonl' if index==0 else 'rollout-'+member['id']+'.jsonl')
                     before=path.stat()
-                    shutil.copy2(path,target)
+                    with open_rollout(path) as source,target.open('xb') as destination:
+                        shutil.copyfileobj(source,destination)
+                    shutil.copystat(path,target)
                     after=path.stat()
-                    if (before.st_dev,before.st_ino,before.st_mtime_ns,before.st_size)!=(after.st_dev,after.st_ino,after.st_mtime_ns,after.st_size) or target.stat().st_size!=after.st_size:
+                    if (before.st_dev,before.st_ino,before.st_mtime_ns,before.st_size)!=(after.st_dev,after.st_ino,after.st_mtime_ns,after.st_size) or (not path.name.endswith('.jsonl.zst') and target.stat().st_size!=after.st_size):
                         fail('Remote transcript changed during backup')
                     with target.open('rb') as stream: os.fsync(stream.fileno())
                 atomic_write(entry/'manifest.json',json.dumps(manifest).encode())
@@ -1352,7 +1376,7 @@ def main(p):
             # Remove a rejected operation's backup only after verifying every original.
             try: api.call('thread/delete',{'threadId':sid})
             except Exception as exc:
-                saved=[(m,entry/('rollout.jsonl' if i==0 else 'rollout-'+m['id']+'.jsonl'),relative_path(m['relativePath'])) for i,(m,_) in enumerate(members)]
+                saved=[(m,entry/('rollout.jsonl' if i==0 else 'rollout-'+m['id']+'.jsonl'),path.relative_to(root)) for i,(m,path) in enumerate(members)]
                 if backup_originals_intact(root,saved):
                     shutil.rmtree(entry)
                     fail(str(exc)+'; original files unchanged; temporary backup removed; no fallback was performed')
@@ -1361,10 +1385,10 @@ def main(p):
             # Delete only surviving members of this explicitly identified family.
             errors=[]
             for member,path in reversed(members[1:]):
-                if path.exists():
+                if rollout_exists(path):
                     try: api.call('thread/delete',{'threadId':member['id']})
                     except Exception as exc: errors.append(str(exc))
-            remaining=[member['id'] for member,path in members if path.exists()]
+            remaining=[member['id'] for member,path in members if rollout_exists(path)]
             if errors or remaining:
                 fail('Main session deleted; family cleanup incomplete; backup retained at '+str(entry)+': '+'; '.join(errors+remaining))
             manifest['deletionPending']=False
@@ -1381,9 +1405,10 @@ def main(p):
                 while parent!=root:
                     if parent.is_symlink(): fail('Symlinked restore path is not allowed')
                     parent=parent.parent
-                if target.is_symlink(): fail('Symlinked restore target is not allowed')
-                if target.exists() and (not target.is_file() or not same_content(file,target)):
-                    fail('Restore target already exists with different content')
+                for existing in (target,pathlib.Path(str(target)+'.zst')):
+                    if existing.is_symlink(): fail('Symlinked restore target is not allowed')
+                    if existing.exists() and (not existing.is_file() or not same_content(file,existing)):
+                        fail('Restore target already exists with different content')
                 targets.append((member,file,target))
             # Backups are copied, never moved, so a failed registration stays retryable.
             for member,file,target in targets:

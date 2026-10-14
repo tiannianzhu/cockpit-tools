@@ -143,6 +143,16 @@ fn default_model_pricing_version() -> u64 {
     1
 }
 
+fn deserialize_pricing_defaults_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        // The legacy review-only migration last applied pricing revision 9.
+        serde_json::Value::Bool(migrated) => Ok(if migrated { 9 } else { 0 }),
+        value => serde_json::from_value(value).map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexLocalAccessCustomRoutingRule {
@@ -683,6 +693,12 @@ pub struct CodexLocalAccessCollection {
     pub suppress_oauth_model_alias: bool,
     #[serde(default = "default_model_pricing_version")]
     pub model_pricing_version: u64,
+    #[serde(
+        default,
+        alias = "autoReviewPricingMigrated",
+        deserialize_with = "deserialize_pricing_defaults_version"
+    )]
+    pub model_pricing_defaults_version: u64,
     #[serde(default)]
     pub model_pricings: Vec<CodexLocalAccessModelPricing>,
     #[serde(default)]

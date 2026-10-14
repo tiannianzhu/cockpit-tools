@@ -61,6 +61,17 @@ fn ultrafast_uses_six_times_standard_and_preserves_long_context_boundaries() {
             assert!(super::prices_close(price.input_usd_per_million, expected.0));
             assert!(super::prices_close(price.cached_input_usd_per_million.unwrap(), expected.1));
             assert!(super::prices_close(price.output_usd_per_million, expected.2));
+            let session_cost = super::try_estimate_model_token_cost_usd_for_service_tier(
+                model, Some("ultrafast"), input, 100_000, 20_000, 10_000,
+            ).expect("Ultrafast session pricing");
+            let expected_cost = match (model, input > 272_000) {
+                ("gpt-6.1-sol", false) => 1.572,
+                ("gpt-6.1-sol", true) => 2.844,
+                ("gpt-6-astra", false) => 7.92,
+                ("gpt-6-astra", true) => 14.34,
+                _ => unreachable!(),
+            };
+            assert!(super::prices_close(session_cost, expected_cost));
         }
     }
 }
