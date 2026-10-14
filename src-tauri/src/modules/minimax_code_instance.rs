@@ -330,6 +330,13 @@ pub fn update_instance(params: UpdateInstanceParams) -> Result<InstanceProfile, 
 }
 
 pub fn delete_instance(instance_id: &str) -> Result<(), String> {
+    delete_instance_with(instance_id, modules::instance::delete_instance_directory)
+}
+
+fn delete_instance_with(
+    instance_id: &str,
+    delete_directory: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
     let _creation_guard = crate::modules::instance_storage_cleanup::protect_instance_creation()?;
     let _lock = MINIMAX_CODE_INSTANCE_STORE_LOCK
         .lock()
@@ -344,7 +351,7 @@ pub fn delete_instance(instance_id: &str) -> Result<(), String> {
 
     if !user_data_dir.trim().is_empty() {
         let dir_path = PathBuf::from(&user_data_dir);
-        modules::instance::delete_instance_directory(&dir_path)?;
+        delete_directory(&dir_path)?;
     }
 
     store.instances.remove(index);
@@ -935,9 +942,6 @@ mod minimax_code_instance_tests {
         );
         let instance_dir = root.join(format!("test-{}", Uuid::new_v4().simple()));
 
-        // 先清理可能残留的同名目录，避免守卫误判。
-        let _ = fs::remove_dir_all(&instance_dir);
-
         let instance = create_instance(CreateInstanceParams {
             name: "managed-round-trip".to_string(),
             user_data_dir: instance_dir.to_string_lossy().to_string(),
@@ -960,7 +964,40 @@ mod minimax_code_instance_tests {
             "新实例应写入实例存储"
         );
 
-        delete_instance(&instance.id).expect("delete instance");
+        let marker = "instance contents";
+        fs::write(instance_dir.join("fixture.txt"), marker).expect("write instance contents");
+        let error = delete_instance_with(&instance.id, |path| {
+            modules::instance::delete_instance_directory_with_trash(path, |_| {
+                Err("fixture trash failure".to_string())
+            })
+        })
+        .expect_err("trash failure must propagate");
+        assert_eq!(error, "fixture trash failure");
+        assert!(instance_dir.is_dir(), "失败后应保留实例目录");
+        assert!(
+            load_instance_store()
+                .expect("reload after failure")
+                .instances
+                .iter()
+                .any(|item| item.id == instance.id),
+            "失败后应保留实例登记"
+        );
+
+        // Only replace the OS trash operation; retain ownership checks and store updates.
+        let trash_dir = temp_root.join("trash");
+        fs::create_dir(&trash_dir).expect("create fixture trash");
+        let trashed_instance = trash_dir.join(&instance.id);
+        delete_instance_with(&instance.id, |path| {
+            modules::instance::delete_instance_directory_with_trash(path, |source| {
+                fs::rename(source, &trashed_instance).map_err(|error| error.to_string())
+            })
+        })
+        .expect("delete instance");
+        assert_eq!(
+            fs::read_to_string(trashed_instance.join("fixture.txt"))
+                .expect("read trashed instance contents"),
+            marker
+        );
         assert!(!instance_dir.exists(), "删除实例应移除其 data root");
         assert!(
             !load_instance_store()

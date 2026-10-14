@@ -39,7 +39,7 @@ pub fn resolve_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 /// Stream decoded JSONL. Retry only missing-file races during Codex representation changes.
-pub fn open_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
+pub fn open_reader(path: &Path) -> io::Result<Box<dyn BufRead + Send>> {
     open_reader_with(path, |resolved| File::open(resolved), std::thread::sleep)
 }
 
@@ -47,7 +47,7 @@ fn open_reader_with(
     path: &Path,
     mut open_file: impl FnMut(&Path) -> io::Result<File>,
     mut wait: impl FnMut(Duration),
-) -> io::Result<Box<dyn BufRead>> {
+) -> io::Result<Box<dyn BufRead + Send>> {
     for attempt in 0..4 {
         // A missing logical rollout is not a publication race. Only retry if
         // the physical file disappeared after it was successfully resolved.

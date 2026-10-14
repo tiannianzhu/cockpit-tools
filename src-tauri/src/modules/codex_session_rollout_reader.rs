@@ -8,7 +8,8 @@ const METADATA_LIMIT: u64 = 1024 * 1024;
 
 // Detect the frame itself: restore/import staging files deliberately use .tmp.
 pub(super) fn open(path: &Path) -> io::Result<Box<dyn Read>> {
-    let mut input = BufReader::new(File::open(path)?);
+    let path = cockpit_session_usage::rollout::resolve_path(path)?;
+    let mut input = BufReader::new(File::open(&path)?);
     let magic = input.fill_buf()?;
     let compressed = magic.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
     if compressed || path.extension().is_some_and(|extension| extension == "zst") {

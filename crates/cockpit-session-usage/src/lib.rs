@@ -19,6 +19,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 pub mod rollout;
+pub mod usage_rollup;
+include!("checkpoint.rs");
+include!("parent_index.rs");
+include!("rewrite.rs");
+include!("rollup.rs");
+include!("segmented.rs");
 
 #[cfg(test)]
 const DEFAULT_INSTANCE_ID: &str = "__default__";
@@ -26,9 +32,11 @@ const DEFAULT_INSTANCE_ID: &str = "__default__";
 const DEFAULT_INSTANCE_NAME: &str = "默认实例";
 const REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
 const SEGMENT_REQUEST_ID_PREFIX: &str = "codex_session:thread-v2";
-const INSERT_BATCH_SIZE: usize = 500;
 const LONG_CONTEXT_THRESHOLD_TOKENS: u64 = 272_000;
-const USAGE_PARSER_VERSION: i64 = 2;
+const USAGE_PARSER_VERSION: i64 = 5;
+const INSERT_BATCH_SIZE: usize = 32;
+const BATCH_BYTES: u64 = 2 * 1024 * 1024;
+const BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(25);
 
 static REPLAY_CACHE: OnceLock<Mutex<ReplayCaches>> = OnceLock::new();
 
@@ -182,7 +190,7 @@ impl CodexSessionTokenStats {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CumulativeTokens {
     input: u64,
     cached_input: u64,
@@ -202,7 +210,7 @@ impl DeltaTokens {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct TokenCountersSignature {
     input: Option<u64>,
     cached_input: Option<u64>,
@@ -211,34 +219,10 @@ struct TokenCountersSignature {
     total: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct TokenUsageSignature {
     total: Option<TokenCountersSignature>,
     last: Option<TokenCountersSignature>,
-}
-
-#[derive(Debug, Clone)]
-struct TimestampedTokenSignature {
-    timestamp: DateTime<Utc>,
-    signature: TokenUsageSignature,
-}
-
-#[derive(Debug, Default)]
-struct ParentTokenTimeline {
-    events: Vec<TimestampedTokenSignature>,
-    has_token_without_timestamp: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ParentFileStamp {
-    modified_nanos: i64,
-    size: u64,
-}
-
-#[derive(Debug)]
-struct CachedParentTimeline {
-    stamp: ParentFileStamp,
-    timeline: ParentTokenTimeline,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,11 +241,10 @@ struct PendingEntry {
 
 #[derive(Debug, Default)]
 struct ReplayCaches {
-    parent_timelines: HashMap<PathBuf, CachedParentTimeline>,
     pending: HashMap<PathBuf, PendingEntry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ParentResolution {
     None,
     Parent,
@@ -281,6 +264,7 @@ struct ParsedTokenEvent {
 
 #[derive(Debug)]
 struct ParsedCodexFile {
+    checkpoint: ParserCheckpoint,
     root_thread_id: Option<String>,
     root_meta_seen: bool,
     root_timestamp: Option<DateTime<Utc>>,
@@ -292,12 +276,15 @@ struct ParsedCodexFile {
     has_billable_tokens: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct TokenParseState {
     current_model: String,
+    active_model: Option<String>,
     current_service_tier: Option<String>,
     usage_record_ids: HashSet<String>,
+    has_usage_records: bool,
     total_high_water: Option<CumulativeTokens>,
+    #[serde(with = "signature_map")]
     last_signature_by_source: HashMap<Option<String>, TokenUsageSignature>,
     previous_token_signature: Option<TokenUsageSignature>,
     event_index: u32,
@@ -312,6 +299,7 @@ struct RolloutIdentity {
 
 #[derive(Debug, Default)]
 struct FileSyncResult {
+    more: bool,
     imported: u32,
     skipped: u32,
     deferred: bool,
@@ -379,6 +367,7 @@ impl SessionUsageStore {
             ",
         )
         .map_err(|error| format!("初始化会话用量库失败: {error}"))?;
+        ensure_checkpoint_schema(&conn)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
@@ -393,15 +382,30 @@ impl SessionUsageStore {
                 .map_err(|error| error.to_string())?;
         }
         if !has_tier || get_meta_i64(&tx, "usage_parser_version") != Some(USAGE_PARSER_VERSION) {
-            // Reparse once after changing the usage source; retain totals until sync succeeds.
+            // Reparse once after parser changes; retain totals until sync succeeds.
             tx.execute_batch("
                 DELETE FROM session_log_sync;
+                DELETE FROM session_parser_checkpoints;
                 DELETE FROM session_usage_meta WHERE key = 'last_synced_at';")
                 .map_err(|error| error.to_string())?;
             set_meta(&tx, "usage_parser_version", &USAGE_PARSER_VERSION.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())?;
+        if !conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo('session_usage_events') WHERE name='context_band')", [], |r|r.get::<_,bool>(0)).map_err(|e|e.to_string())? {
+            conn.execute_batch("ALTER TABLE session_usage_events ADD COLUMN context_band TEXT GENERATED ALWAYS AS (CASE WHEN input_tokens>272000 THEN 'long' ELSE 'short' END) VIRTUAL;").map_err(|e|e.to_string())?;
+        }
+        ensure_checkpoint_schema(&conn)?;
+        ensure_rewrite_schema(&conn)?;
+        ensure_group_schema(&conn)?;
+        SESSION_USAGE_ROLLUP.ensure(&conn).map_err(|e| e.to_string())?;
         Ok(conn)
+    }
+
+    pub fn maintenance_batch(&self) -> Result<bool, String> {
+        let conn = self.open_conn()?;
+        if !cleanup_response_ids_batch(&conn)? { return Ok(false); }
+        if !cleanup_rewrite_batch(&conn)? { return Ok(false); }
+        SESSION_USAGE_ROLLUP.batch(&conn).map_err(|e| e.to_string())
     }
 
     pub fn sync(
@@ -409,28 +413,47 @@ impl SessionUsageStore {
         rebuild: bool,
         instances: &[UsageInstance],
     ) -> Result<CodexSessionUsageSyncResult, String> {
-        self.sync_with_logical_root(rebuild, instances)
+        self.sync_with_batch_control(rebuild, instances, || Some(()))
     }
 
-    fn sync_with_logical_root(
+    /// Acquire a host resource guard before each bounded parser/write batch.
+    /// Returning None cancels between committed batches without updating the
+    /// completed-sync timestamp. Rewrites retain their previous report (including
+    /// session totals) until the full replacement is published; fresh imports
+    /// expose their committed progress. A later sync resumes from disk.
+    /// Explicit rebuild acquires control before clearing its cache; after that
+    /// initial reset, cancellation may expose a partial rebuild until resumed.
+    pub fn sync_with_batch_control<G>(
         &self,
         rebuild: bool,
         instances: &[UsageInstance],
+        mut acquire: impl FnMut() -> Option<G>,
     ) -> Result<CodexSessionUsageSyncResult, String> {
         let mut conn = self.open_conn()?;
         if rebuild {
+            let Some(rebuild_guard) = acquire() else {
+                return Ok(CodexSessionUsageSyncResult::default());
+            };
             conn.execute_batch(
                 "
                 DELETE FROM session_usage_events;
                 DELETE FROM session_log_sync;
+                DELETE FROM session_parser_checkpoints;
                 DELETE FROM session_usage_meta WHERE key != 'usage_parser_version';
                 DELETE FROM session_token_stats;
+                DELETE FROM session_response_ids;
+                DELETE FROM session_group_sync; DELETE FROM session_group_events;
+                DELETE FROM session_parser_checkpoints; DELETE FROM session_parent_sync; DELETE FROM session_parent_signatures; DELETE FROM session_rewrite_events; DELETE FROM session_rewrite_state;
                 ",
             )
             .map_err(|error| format!("清空会话用量缓存失败: {error}"))?;
             if let Ok(mut caches) = replay_caches().lock() {
                 *caches = ReplayCaches::default();
             }
+            if let Ok(mut readers) = decoded_readers().lock() {
+                readers.clear();
+            }
+            drop(rebuild_guard);
         }
 
         let mut cursors = load_cursors(&conn)?;
@@ -455,101 +478,132 @@ impl SessionUsageStore {
                             if !handled_groups.insert(root_id.clone()) {
                                 continue;
                             }
-                            match sync_segmented_group(
-                                &mut conn,
-                                instance,
-                                &root_id,
-                                group,
-                                &rollout_index,
-                                &mut cursors,
-                            ) {
-                                Ok(group_result) => {
-                                    result.imported =
-                                        result.imported.saturating_add(group_result.imported);
-                                    result.skipped =
-                                        result.skipped.saturating_add(group_result.skipped);
-                                    if group_result.changed {
-                                        result.files_changed =
-                                            result.files_changed.saturating_add(group.len() as u32);
+                            loop {
+                                let Some(guard) = acquire() else {
+                                    return Ok(result);
+                                };
+                                let batch = sync_segmented_group(
+                                    &mut conn,
+                                    instance,
+                                    &root_id,
+                                    group,
+                                    &rollout_index,
+                                    &mut cursors,
+                                );
+                                drop(guard);
+                                match batch {
+                                    Ok(group_result) => {
+                                        result.imported =
+                                            result.imported.saturating_add(group_result.imported);
+                                        result.skipped =
+                                            result.skipped.saturating_add(group_result.skipped);
+                                        if group_result.more {
+                                            continue;
+                                        }
+                                        if group_result.changed {
+                                            result.files_changed = result
+                                                .files_changed
+                                                .saturating_add(group.len() as u32);
+                                        }
+                                        if group_result.deferred {
+                                            result.deferred_files = result
+                                                .deferred_files
+                                                .saturating_add(group.len() as u32);
+                                        }
                                     }
-                                    if group_result.deferred {
-                                        result.deferred_files = result
-                                            .deferred_files
-                                            .saturating_add(group.len() as u32);
+                                    Err(error) => {
+                                        eprintln!(
+                                            "[CODEX-SESSION-USAGE] 解析失败 {}: {error}",
+                                            file_path.display()
+                                        );
+                                        if result.errors.len() < 20 {
+                                            result
+                                                .errors
+                                                .push(format!("{}: {error}", file_path.display()));
+                                        }
                                     }
                                 }
-                                Err(error) => {
-                                    eprintln!(
-                                        "[CODEX-SESSION-USAGE] 解析失败 {}: {error}",
-                                        file_path.display()
-                                    );
-                                    if result.errors.len() < 20 {
-                                        result
-                                            .errors
-                                            .push(format!("{}: {error}", file_path.display()));
-                                    }
-                                }
+                                break;
                             }
                             continue;
                         }
                     }
                 }
-                match sync_single_file(&mut conn, instance, file_path, &rollout_index, &mut cursors)
-                {
-                    Ok(file_result) => {
-                        if let Some(id) = thread_id_from_filename(file_path) {
-                            let missing_stats = conn
-                                .query_row(
-                                    "SELECT 1 FROM session_token_stats WHERE session_id = ?1",
-                                    params![id],
-                                    |_| Ok(()),
-                                )
-                                .optional()
-                                .map_err(|error| error.to_string())?
-                                .is_none();
-                            if file_result.changed || missing_stats {
-                                let stats = fs::metadata(file_path).ok().and_then(|metadata| {
-                                    read_token_stats_from_rollout_uncached(
-                                        file_path,
-                                        metadata.len(),
+                loop {
+                    let Some(guard) = acquire() else {
+                        return Ok(result);
+                    };
+                    let batch = sync_single_file(
+                        &mut conn,
+                        instance,
+                        file_path,
+                        &rollout_index,
+                        &mut cursors,
+                    );
+                    drop(guard);
+                    match batch {
+                        Ok(file_result) => {
+                            if file_result.more {
+                                result.imported =
+                                    result.imported.saturating_add(file_result.imported);
+                                result.skipped = result.skipped.saturating_add(file_result.skipped);
+                                continue;
+                            }
+                            if let Some(id) = thread_id_from_filename(file_path) {
+                                let missing_stats = conn
+                                    .query_row(
+                                        "SELECT 1 FROM session_token_stats WHERE session_id = ?1",
+                                        params![id],
+                                        |_| Ok(()),
                                     )
-                                });
-                                conn.execute(
-                                    "INSERT INTO session_token_stats VALUES (?1, ?2, ?3, ?4)
+                                    .optional()
+                                    .map_err(|error| error.to_string())?
+                                    .is_none();
+                                if file_result.changed || missing_stats {
+                                    let stats = fs::metadata(file_path).ok().and_then(|metadata| {
+                                        read_token_stats_from_rollout_uncached(
+                                            file_path,
+                                            metadata.len(),
+                                        )
+                                    });
+                                    conn.execute(
+                                        "INSERT INTO session_token_stats VALUES (?1, ?2, ?3, ?4)
                                      ON CONFLICT(session_id) DO UPDATE SET
                                        input_tokens = excluded.input_tokens,
                                        output_tokens = excluded.output_tokens,
                                        total_tokens = excluded.total_tokens",
-                                    params![
-                                        id,
-                                        stats.map(|item| item.0 as i64),
-                                        stats.map(|item| item.1 as i64),
-                                        stats.map(|item| item.2 as i64)
-                                    ],
-                                )
-                                .map_err(|error| error.to_string())?;
+                                        params![
+                                            id,
+                                            stats.map(|item| item.0 as i64),
+                                            stats.map(|item| item.1 as i64),
+                                            stats.map(|item| item.2 as i64)
+                                        ],
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                }
+                            }
+                            result.imported = result.imported.saturating_add(file_result.imported);
+                            result.skipped = result.skipped.saturating_add(file_result.skipped);
+                            if file_result.imported > 0 || file_result.skipped > 0 {
+                                result.files_changed = result.files_changed.saturating_add(1);
+                            }
+                            if file_result.deferred {
+                                result.deferred_files = result.deferred_files.saturating_add(1);
                             }
                         }
-                        result.imported = result.imported.saturating_add(file_result.imported);
-                        result.skipped = result.skipped.saturating_add(file_result.skipped);
-                        if file_result.imported > 0 || file_result.skipped > 0 {
-                            result.files_changed = result.files_changed.saturating_add(1);
-                        }
-                        if file_result.deferred {
-                            result.deferred_files = result.deferred_files.saturating_add(1);
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "[CODEX-SESSION-USAGE] 解析失败 {}: {error}",
-                            file_path.display()
-                        );
-                        if result.errors.len() < 20 {
-                            result
-                                .errors
-                                .push(format!("{}: {error}", file_path.display()));
+                        Err(error) => {
+                            eprintln!(
+                                "[CODEX-SESSION-USAGE] 解析失败 {}: {error}",
+                                file_path.display()
+                            );
+                            if result.errors.len() < 20 {
+                                result
+                                    .errors
+                                    .push(format!("{}: {error}", file_path.display()));
+                            }
                         }
                     }
+                    break;
                 }
             }
         }
@@ -569,7 +623,9 @@ impl SessionUsageStore {
         query: &CodexSessionUsageQuery,
         instances: &[UsageInstance],
     ) -> Result<CodexSessionUsageReport, String> {
-        let conn = self.open_conn()?;
+        let mut conn = self.open_conn()?;
+        // All report sections observe one publication, even if import proceeds.
+        let conn = conn.transaction().map_err(|e| e.to_string())?;
         let instance_names = instances
             .iter()
             .map(|instance| (instance.id.clone(), instance.name.clone()))
@@ -615,7 +671,7 @@ impl SessionUsageStore {
             .unwrap_or(0)
             .max(0) as u64;
         let event_count = conn
-            .query_row("SELECT COUNT(*) FROM session_usage_events", [], |row| {
+            .query_row(&format!("SELECT COALESCE(SUM(request_count),0) FROM ({})",session_report_source(&conn,0,i64::MAX/2)), [], |row| {
                 row.get::<_, i64>(0)
             })
             .unwrap_or(0)
@@ -672,12 +728,13 @@ fn query_pricing_breakdown(
     params: &[rusqlite::types::Value],
     key_column: &str,
 ) -> Result<Vec<(String, CodexSessionUsageBreakdownRow)>, String> {
+    let source = report_source_for_filter(conn, where_sql, params);
     let sql = format!(
-        "SELECT {key_column}, model, service_tier, MAX(input_tokens),
-                SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens), COUNT(*)
-         FROM session_usage_events {where_sql}
-         GROUP BY {key_column}, model, service_tier, input_tokens > {LONG_CONTEXT_THRESHOLD_TOKENS}
-         ORDER BY {key_column}, model, service_tier, MAX(input_tokens)"
+        "SELECT {key_column}, model, service_tier, MAX(context_input_tokens),
+                SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens), SUM(request_count)
+         FROM ({source}) {where_sql}
+         GROUP BY {key_column}, model, service_tier, context_band
+         ORDER BY {key_column}, model, service_tier, MAX(context_input_tokens)"
     );
     let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
@@ -686,7 +743,7 @@ fn query_pricing_breakdown(
             row.get::<_, String>(1)?,
             CodexSessionUsagePricingGroup {
                 model: None,
-                service_tier: row.get(2)?,
+                service_tier: row.get::<_,Option<String>>(2)?.filter(|v|!v.is_empty()),
                 context_input_tokens: row.get::<_, i64>(3)?.max(0) as u64,
                 input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
                 cached_input_tokens: row.get::<_, i64>(5)?.max(0) as u64,
@@ -718,7 +775,24 @@ pub fn read_token_stats_from_rollout_uncached(
     rollout_path: &Path,
     file_len: u64,
 ) -> Option<(u64, u64, u64)> {
-    let mut file = File::open(rollout_path).ok()?;
+    let resolved = rollout::resolve_path(rollout_path).ok()?;
+    if rollout::is_compressed(&resolved) {
+        let mut latest = None;
+        for line in rollout::open_reader(&resolved).ok()?.lines() {
+            // Do not report a partial tail when decoding fails later in the frame.
+            let line = line.ok()?;
+            if let Some(stats) = parse_token_stats_lines(line.as_bytes()) {
+                latest = Some(stats);
+            }
+        }
+        return latest;
+    }
+    let mut file = File::open(&resolved).ok()?;
+    let file_len = if resolved == rollout_path {
+        file_len
+    } else {
+        file.metadata().ok()?.len()
+    };
     let mut offset = file_len;
     let mut pending_prefix = Vec::new();
 
@@ -833,6 +907,10 @@ fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // A cold file can briefly have both representations during publication.
+    files.retain(|path| {
+        path.is_file() && (!rollout::is_compressed(path) || !rollout::logical_path(path).is_file())
+    });
     files.sort();
     files
 }
@@ -867,7 +945,10 @@ fn thread_id_from_filename(path: &Path) -> Option<String> {
 
 fn rollout_identity(path: &Path) -> Option<RolloutIdentity> {
     let file_name = path.file_name()?.to_str()?;
-    let stem = file_name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let plain_name = file_name.strip_suffix(".zst").unwrap_or(file_name);
+    let stem = plain_name
+        .strip_prefix("rollout-")?
+        .strip_suffix(".jsonl")?;
     // UUIDs contain dashes, so use the fixed 36-byte suffix.
     let trailing = stem.get(stem.len().checked_sub(36)?..)?;
     let trailing_id = uuid::Uuid::parse_str(trailing)
@@ -907,11 +988,7 @@ fn build_rollout_index(files: &[PathBuf]) -> RolloutIndex {
     for paths in index.values_mut() {
         paths.sort_by_key(|path| {
             let identity = rollout_identity(path).expect("indexed rollout has a valid name");
-            (
-                identity.order_key,
-                path.file_name().map(|name| name.to_os_string()),
-                path.clone(),
-            )
+            (identity.order_key, logical_rollout_name(path), path.clone())
         });
     }
     index
@@ -955,7 +1032,7 @@ fn inherit_archived_cursor(
     {
         return None;
     }
-    let file_name = file_path.file_name()?.to_str()?;
+    let file_name = logical_rollout_name(file_path)?;
     let slash_suffix = format!("/{file_name}");
     let backslash_suffix = format!("\\{file_name}");
     cursors
@@ -969,32 +1046,39 @@ fn inherit_archived_cursor(
         .map(|(offset, modified, size)| (modified, size, offset))
 }
 
-fn sync_segmented_group(
-    conn: &mut Connection,
-    instance: &UsageInstance,
-    root_id: &str,
-    paths: &[PathBuf],
-    rollout_index: &RolloutIndex,
-    cursors: &mut HashMap<String, (i64, i64, i64)>,
-) -> Result<FileSyncResult, String> {
-    // A rollout can exist at both live and archived paths while it is moving.
-    // Prefer the larger (then newer) copy and count its filename only once.
+fn logical_rollout_name(path: &Path) -> Option<String> {
+    rollout::logical_path(path)
+        .file_name()?
+        .to_str()
+        .map(str::to_string)
+}
+
+fn logical_rollout_len(path: &Path, metadata: &fs::Metadata) -> Result<u64, String> {
+    if !rollout::is_compressed(path) {
+        return Ok(metadata.len());
+    }
+    let mut reader = rollout::open_reader(path).map_err(|error| error.to_string())?;
+    std::io::copy(&mut reader, &mut std::io::sink()).map_err(|error| error.to_string())
+}
+
+/// During archive moves, compare decoded lengths rather than compression ratios.
+fn select_rollout_copies(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let mut selected_by_name: HashMap<String, PathBuf> = HashMap::new();
     for path in paths {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("Invalid rollout filename")?
-            .to_string();
-        let incoming = fs::metadata(path).map_err(|error| error.to_string())?;
-        let replace = selected_by_name.get(&name).is_none_or(|previous| {
-            fs::metadata(previous)
-                .map(|current| {
-                    (incoming.len(), metadata_modified_nanos(&incoming))
-                        > (current.len(), metadata_modified_nanos(&current))
-                })
-                .unwrap_or(true)
-        });
+        let name = logical_rollout_name(path).ok_or("Invalid rollout filename")?;
+        let replace = if let Some(previous) = selected_by_name.get(&name) {
+            let incoming = fs::metadata(path).map_err(|error| error.to_string())?;
+            let current = fs::metadata(previous).map_err(|error| error.to_string())?;
+            (
+                logical_rollout_len(path, &incoming)?,
+                metadata_modified_nanos(&incoming),
+            ) > (
+                logical_rollout_len(previous, &current)?,
+                metadata_modified_nanos(&current),
+            )
+        } else {
+            true
+        };
         if replace {
             selected_by_name.insert(name, path.clone());
         }
@@ -1002,253 +1086,9 @@ fn sync_segmented_group(
     let mut selected = selected_by_name.into_values().collect::<Vec<_>>();
     selected.sort_by_key(|path| {
         let identity = rollout_identity(path).expect("grouped rollout has valid identity");
-        (
-            identity.order_key,
-            path.file_name().map(|name| name.to_os_string()),
-        )
+        (identity.order_key, logical_rollout_name(path))
     });
-
-    let segment_ids = selected
-        .iter()
-        .filter_map(|path| rollout_identity(path).and_then(|identity| identity.segment_id))
-        .collect::<Vec<_>>();
-    let mut legacy_stats_exist = false;
-    for segment_id in &segment_ids {
-        legacy_stats_exist |= conn
-            .query_row(
-                "SELECT 1 FROM session_token_stats WHERE session_id = ?1",
-                params![segment_id],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .is_some();
-    }
-    let root_stats_exist = conn
-        .query_row(
-            "SELECT 1 FROM session_token_stats WHERE session_id = ?1",
-            params![root_id],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .is_some();
-    let changed = !root_stats_exist
-        || legacy_stats_exist
-        || selected.iter().any(|path| {
-            let path_str = path.to_string_lossy();
-            let Some(&(old_modified, old_size, old_offset)) = cursors.get(path_str.as_ref()) else {
-                return true;
-            };
-            fs::metadata(path)
-                .map(|metadata| {
-                    metadata.len() != old_size.max(0) as u64
-                        || metadata_modified_nanos(&metadata) != old_modified
-                        || old_offset == 0
-                })
-                .unwrap_or(true)
-        });
-    if !changed {
-        return Ok(FileSyncResult::default());
-    }
-
-    let mut state = TokenParseState::default();
-    let mut parsed_files = Vec::with_capacity(selected.len());
-    for path in &selected {
-        let parsed = parse_codex_file_with_state(path, Some(root_id.to_string()), &mut state)?;
-        if !parsed.root_meta_seen && parsed.has_billable_tokens {
-            return Ok(FileSyncResult {
-                deferred: true,
-                ..FileSyncResult::default()
-            });
-        }
-        let replay_prefix = match parsed.parent {
-            ParentResolution::None => 0,
-            ParentResolution::Deferred => {
-                return Ok(FileSyncResult {
-                    deferred: true,
-                    ..FileSyncResult::default()
-                });
-            }
-            ParentResolution::Parent => {
-                let Some(parent_id) = parsed.parent_id.as_deref() else {
-                    return Ok(FileSyncResult {
-                        deferred: true,
-                        ..FileSyncResult::default()
-                    });
-                };
-                let Some(cutoff) = parsed.root_timestamp else {
-                    return Ok(FileSyncResult {
-                        deferred: true,
-                        ..FileSyncResult::default()
-                    });
-                };
-                match resolve_parent_signatures(parent_id, cutoff, rollout_index) {
-                    Ok(signatures) => matching_replay_prefix(&parsed.token_events, &signatures),
-                    Err(_) => {
-                        return Ok(FileSyncResult {
-                            deferred: true,
-                            ..FileSyncResult::default()
-                        })
-                    }
-                }
-            }
-        };
-        parsed_files.push((path, parsed, replay_prefix));
-    }
-
-    let active_names = selected
-        .iter()
-        .filter_map(|path| path.file_name())
-        .map(|name| name.to_string_lossy().to_string())
-        .collect::<HashSet<_>>();
-    let mut old_paths = HashSet::new();
-    let mut statement = conn
-        .prepare("SELECT DISTINCT file_path FROM session_usage_events WHERE session_id = ?1")
-        .map_err(|error| error.to_string())?;
-    let paths_in_events = statement
-        .query_map(params![root_id], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?;
-    for old_path in paths_in_events {
-        let old_path = old_path.map_err(|error| error.to_string())?;
-        if Path::new(&old_path)
-            .file_name()
-            .is_some_and(|name| active_names.contains(name.to_string_lossy().as_ref()))
-        {
-            old_paths.insert(old_path);
-        }
-    }
-    drop(statement);
-    for path in cursors.keys() {
-        if Path::new(path)
-            .file_name()
-            .is_some_and(|name| active_names.contains(name.to_string_lossy().as_ref()))
-        {
-            old_paths.insert(path.clone());
-        }
-    }
-    let mut existing_ids = HashSet::new();
-    let mut statement = conn
-        .prepare("SELECT request_id FROM session_usage_events WHERE session_id = ?1")
-        .map_err(|error| error.to_string())?;
-    for id in statement
-        .query_map(params![root_id], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?
-    {
-        existing_ids.insert(id.map_err(|error| error.to_string())?);
-    }
-    drop(statement);
-
-    let mut result = FileSyncResult {
-        changed: true,
-        ..FileSyncResult::default()
-    };
-    let tx = conn.transaction().map_err(|error| error.to_string())?;
-    // v1 keyed tail token statistics by the continuation UUID. Remove those
-    // only after the full group has passed parsing and metadata validation.
-    for segment_id in &segment_ids {
-        tx.execute(
-            "DELETE FROM session_token_stats WHERE session_id = ?1",
-            params![segment_id],
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    for old_path in &old_paths {
-        tx.execute(
-            "DELETE FROM session_usage_events WHERE file_path = ?1",
-            params![old_path],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "DELETE FROM session_log_sync WHERE file_path = ?1",
-            params![old_path],
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    let mut latest_stats = None;
-    for (path, parsed, replay_prefix) in &parsed_files {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("Invalid rollout filename")?;
-        let path_str = path.to_string_lossy().to_string();
-        for (token_offset, event) in parsed.token_events.iter().enumerate() {
-            let Some(event_index) = event.event_index else {
-                continue;
-            };
-            if token_offset < *replay_prefix {
-                continue;
-            }
-            let request_id = format!("{SEGMENT_REQUEST_ID_PREFIX}:{root_id}:{name}:{event_index}");
-            tx.execute(
-                "INSERT INTO session_usage_events (
-                    request_id, instance_id, instance_name, session_id, model,
-                    timestamp, input_tokens, cached_input_tokens, output_tokens, file_path, service_tier
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    request_id,
-                    instance.id,
-                    instance.name,
-                    root_id,
-                    event.model,
-                    event.timestamp.map(|value| value.timestamp()).unwrap_or(0),
-                    event.delta.input as i64,
-                    event.delta.cached_input as i64,
-                    event.delta.output as i64,
-                    path_str,
-                    event.service_tier,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            if existing_ids.contains(&request_id) {
-                result.skipped += 1;
-            } else {
-                result.imported += 1;
-            }
-        }
-        let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-        upsert_cursor_on_conn(
-            &tx,
-            &path_str,
-            &instance.id,
-            metadata_modified_nanos(&metadata),
-            metadata.len(),
-            parsed.line_offset,
-        )?;
-        if let Some(stats) = read_token_stats_from_rollout_uncached(path, metadata.len()) {
-            latest_stats = Some(stats);
-        }
-    }
-    tx.execute(
-        "INSERT INTO session_token_stats VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(session_id) DO UPDATE SET
-           input_tokens = excluded.input_tokens,
-           output_tokens = excluded.output_tokens,
-           total_tokens = excluded.total_tokens",
-        params![
-            root_id,
-            latest_stats.map(|item| item.0 as i64),
-            latest_stats.map(|item| item.1 as i64),
-            latest_stats.map(|item| item.2 as i64)
-        ],
-    )
-    .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())?;
-    for old_path in old_paths {
-        cursors.remove(&old_path);
-    }
-    for (path, parsed, _) in parsed_files {
-        let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-        cursors.insert(
-            path.to_string_lossy().to_string(),
-            (
-                metadata_modified_nanos(&metadata),
-                metadata.len() as i64,
-                parsed.line_offset,
-            ),
-        );
-    }
-    Ok(result)
+    Ok(selected)
 }
 
 fn sync_single_file(
@@ -1258,7 +1098,9 @@ fn sync_single_file(
     rollout_index: &RolloutIndex,
     cursors: &mut HashMap<String, (i64, i64, i64)>,
 ) -> Result<FileSyncResult, String> {
-    let file_path_str = file_path.to_string_lossy().to_string();
+    let file_path_str = rollout::logical_path(file_path)
+        .to_string_lossy()
+        .to_string();
     let metadata =
         fs::metadata(file_path).map_err(|error| format!("无法读取文件元数据: {error}"))?;
     let file_modified = metadata_modified_nanos(&metadata);
@@ -1270,7 +1112,21 @@ fn sync_single_file(
         .or_else(|| inherit_archived_cursor(file_path, cursors))
         .unwrap_or((0, 0, 0));
 
-    if file_size == last_size.max(0) as u64 && file_modified <= last_modified && last_offset > 0 {
+    let checkpoint = if last_modified > 0
+        && file_modified != last_modified
+        && file_size == last_size.max(0) as u64
+    {
+        None
+    } else {
+        load_parser_checkpoint(conn, file_path, file_size, last_size)?
+    };
+    if file_size >= last_size.max(0) as u64
+        && file_modified <= last_modified
+        && last_offset > 0
+        && checkpoint.as_ref().is_none_or(|c| {
+            c.complete && (c.guardian_prefix_end.is_none() || c.guardian_repair_complete)
+        })
+    {
         return Ok(FileSyncResult::default());
     }
 
@@ -1298,26 +1154,80 @@ fn sync_single_file(
         }
     }
 
-    if file_size < last_size.max(0) as u64 {
-        conn.execute(
-            "DELETE FROM session_usage_events WHERE file_path = ?1",
-            params![file_path_str],
+    let prior_offset = checkpoint.as_ref().map(|c| c.byte_offset).unwrap_or(0);
+    let rewrite = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_rewrite_state WHERE file_path=?1)",
+            [&file_path_str],
+            |r| r.get::<_, bool>(0),
         )
-        .map_err(|error| format!("清理已重写会话用量失败: {error}"))?;
+        .map_err(|e| e.to_string())?
+        || (checkpoint.is_none()
+            && conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_usage_events WHERE file_path=?1)",
+                    [&file_path_str],
+                    |r| r.get::<_, bool>(0),
+                )
+                .map_err(|e| e.to_string())?)
+        || (last_offset > 0 && checkpoint.is_none())
+        || file_size < last_size.max(0) as u64
+        || (checkpoint.is_none()
+            && conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_parser_checkpoints WHERE file_path=?1)",
+                    [&file_path_str],
+                    |r| r.get::<_, bool>(0),
+                )
+                .map_err(|e| e.to_string())?);
+    let last_offset = if rewrite { 0 } else { last_offset };
+    let mut parsed = parse_codex_file_batch_on_conn(
+        conn,
+        file_path,
+        thread_id_from_filename(file_path),
+        checkpoint,
+    )?;
+    if rewrite && !prepare_rewrite_batch(conn, &file_path_str)? {
+        return Ok(FileSyncResult {
+            more: true,
+            ..Default::default()
+        });
     }
-
-    let parsed = parse_codex_file(file_path, thread_id_from_filename(file_path))?;
+    let mut more = !parsed.checkpoint.complete && parsed.checkpoint.byte_offset > prior_offset;
+    let cursor_modified = if parsed.checkpoint.complete {
+        file_modified
+    } else {
+        0
+    };
     if !parsed.has_billable_tokens {
-        upsert_cursor(
-            conn,
-            cursors,
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        upsert_cursor_on_conn(
+            &tx,
             &file_path_str,
             &instance.id,
-            file_modified,
+            cursor_modified,
             file_size,
             parsed.line_offset,
         )?;
+        more |= backfill_guardian_batch(
+            &tx,
+            "session_usage_events",
+            &file_path_str,
+            &format!(
+                "{REQUEST_ID_PREFIX}:{}:",
+                parsed.root_thread_id.as_deref().unwrap_or_default()
+            ),
+            &mut parsed.checkpoint,
+        )?;
+        save_parser_checkpoint(&tx, file_path, &parsed.checkpoint)?;
+        publish_rewrite(&tx, &file_path_str, parsed.checkpoint.complete && !more)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        cursors.insert(
+            file_path_str,
+            (cursor_modified, file_size as i64, parsed.line_offset),
+        );
         return Ok(FileSyncResult {
+            more,
             changed: true,
             ..FileSyncResult::default()
         });
@@ -1340,57 +1250,76 @@ fn sync_single_file(
         ));
     }
 
-    let replay_prefix = match parsed.parent {
-        ParentResolution::None => 0,
-        ParentResolution::Deferred => {
-            return Ok(mark_deferred(
-                file_path,
-                file_modified,
-                file_size,
-                PendingReason::Stable(
-                    parsed
-                        .deferred_reason
-                        .unwrap_or_else(|| "分叉会话元数据不完整".to_string()),
-                ),
-            ));
-        }
-        ParentResolution::Parent => {
-            let Some(parent_id) = parsed.parent_id.as_deref() else {
-                return Ok(mark_deferred(
-                    file_path,
-                    file_modified,
-                    file_size,
-                    PendingReason::Stable("分叉会话缺少父会话 ID".to_string()),
-                ));
-            };
-            let Some(cutoff) = parsed.root_timestamp else {
+    let replay_prefix = if parsed.checkpoint.replay_closed {
+        0
+    } else {
+        match parsed.parent {
+            ParentResolution::None => 0,
+            ParentResolution::Deferred => {
                 return Ok(mark_deferred(
                     file_path,
                     file_modified,
                     file_size,
                     PendingReason::Stable(
-                        "parented rollout 的 root meta 缺少有效 timestamp".to_string(),
+                        parsed
+                            .deferred_reason
+                            .unwrap_or_else(|| "分叉会话元数据不完整".to_string()),
                     ),
                 ));
-            };
-            match resolve_parent_signatures(parent_id, cutoff, rollout_index) {
-                Ok(signatures) => matching_replay_prefix(&parsed.token_events, &signatures),
-                Err(reason) => {
-                    let pending_reason = if rollout_index.contains_key(parent_id) {
-                        PendingReason::Retryable(reason)
-                    } else {
-                        PendingReason::MissingParent(parent_id.to_string())
-                    };
+            }
+            ParentResolution::Parent => {
+                let Some(parent_id) = parsed.parent_id.as_deref() else {
                     return Ok(mark_deferred(
                         file_path,
                         file_modified,
                         file_size,
-                        pending_reason,
+                        PendingReason::Stable("分叉会话缺少父会话 ID".to_string()),
                     ));
+                };
+                let Some(cutoff) = parsed.root_timestamp else {
+                    return Ok(mark_deferred(
+                        file_path,
+                        file_modified,
+                        file_size,
+                        PendingReason::Stable(
+                            "parented rollout 的 root meta 缺少有效 timestamp".to_string(),
+                        ),
+                    ));
+                };
+                match resolve_parent_replay(
+                    conn,
+                    parent_id,
+                    cutoff,
+                    rollout_index,
+                    &parsed.token_events,
+                    &mut parsed.checkpoint,
+                ) {
+                    Ok(ParentReplay::Pending) => {
+                        return Ok(FileSyncResult {
+                            more: true,
+                            ..Default::default()
+                        })
+                    }
+                    Ok(ParentReplay::Matched(count)) => count,
+                    Err(reason) => {
+                        let pending_reason = if rollout_index.contains_key(parent_id) {
+                            PendingReason::Retryable(reason)
+                        } else {
+                            PendingReason::MissingParent(parent_id.to_string())
+                        };
+                        return Ok(mark_deferred(
+                            file_path,
+                            file_modified,
+                            file_size,
+                            pending_reason,
+                        ));
+                    }
                 }
             }
         }
     };
+    parsed.checkpoint.replay_closed |=
+        parsed.parent == ParentResolution::None || replay_prefix < parsed.token_events.len();
 
     if let Ok(mut caches) = replay_caches().lock() {
         caches.pending.remove(file_path);
@@ -1398,6 +1327,7 @@ fn sync_single_file(
 
     let mut to_insert = Vec::new();
     let mut result = FileSyncResult {
+        more,
         changed: true,
         ..FileSyncResult::default()
     };
@@ -1417,28 +1347,20 @@ fn sync_single_file(
         to_insert.push((event, event_index));
     }
 
-    if !to_insert.is_empty() {
+    {
         let tx = conn
             .unchecked_transaction()
             .map_err(|error| format!("开启会话用量写入事务失败: {error}"))?;
-        if last_offset == 0 {
-            // Request indexes change when formerly omitted compaction calls are included.
-            tx.execute("DELETE FROM session_usage_events WHERE file_path = ?1", params![file_path_str])
-                .map_err(|error| error.to_string())?;
-        }
         {
             let mut statement = tx
                 .prepare_cached(
                     "INSERT INTO session_usage_events (
-                        request_id, instance_id, instance_name, session_id, model,
-                        timestamp, input_tokens, cached_input_tokens, output_tokens, file_path, service_tier
+                        request_id, instance_id, instance_name, session_id, model, service_tier,
+                        timestamp, input_tokens, cached_input_tokens, output_tokens, file_path
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                    ON CONFLICT(request_id) DO UPDATE SET
-                        model = excluded.model, timestamp = excluded.timestamp,
-                        input_tokens = excluded.input_tokens,
-                        cached_input_tokens = excluded.cached_input_tokens,
-                        output_tokens = excluded.output_tokens,
-                        file_path = excluded.file_path, service_tier = excluded.service_tier",
+                    ON CONFLICT(request_id) DO UPDATE SET model=excluded.model, service_tier=excluded.service_tier,
+                    timestamp=excluded.timestamp, input_tokens=excluded.input_tokens,
+                    cached_input_tokens=excluded.cached_input_tokens,output_tokens=excluded.output_tokens,file_path=excluded.file_path",
                 )
                 .map_err(|error| format!("准备会话用量写入失败: {error}"))?;
             for chunk in to_insert.chunks(INSERT_BATCH_SIZE) {
@@ -1451,12 +1373,12 @@ fn sync_single_file(
                             instance.name,
                             root_thread_id,
                             event.model,
-                            event.timestamp.map(|value| value.timestamp()).unwrap_or(0),
+                            event.service_tier,
+                            event.timestamp.map(|t| t.timestamp()).unwrap_or(0),
                             event.delta.input as i64,
                             event.delta.cached_input as i64,
                             event.delta.output as i64,
                             file_path_str,
-                            event.service_tier,
                         ])
                         .map_err(|error| format!("写入会话用量失败: {error}"))?;
                     if changed > 0 {
@@ -1471,28 +1393,31 @@ fn sync_single_file(
             &tx,
             &file_path_str,
             &instance.id,
-            file_modified,
+            cursor_modified,
             file_size,
             parsed.line_offset,
         )?;
+        more |= backfill_guardian_batch(
+            &tx,
+            "session_usage_events",
+            &file_path_str,
+            &format!(
+                "{REQUEST_ID_PREFIX}:{}:",
+                parsed.root_thread_id.as_deref().unwrap_or_default()
+            ),
+            &mut parsed.checkpoint,
+        )?;
+        save_parser_checkpoint(&tx, file_path, &parsed.checkpoint)?;
+        publish_rewrite(&tx, &file_path_str, parsed.checkpoint.complete && !more)?;
         tx.commit()
             .map_err(|error| format!("提交会话用量写入失败: {error}"))?;
         cursors.insert(
             file_path_str,
-            (file_modified, file_size as i64, parsed.line_offset),
+            (cursor_modified, file_size as i64, parsed.line_offset),
         );
-    } else {
-        upsert_cursor(
-            conn,
-            cursors,
-            &file_path_str,
-            &instance.id,
-            file_modified,
-            file_size,
-            parsed.line_offset,
-        )?;
     }
 
+    result.more = more;
     Ok(result)
 }
 
@@ -1514,20 +1439,6 @@ fn mark_deferred(
         deferred: true,
         ..FileSyncResult::default()
     }
-}
-
-fn upsert_cursor(
-    conn: &Connection,
-    cursors: &mut HashMap<String, (i64, i64, i64)>,
-    file_path: &str,
-    instance_id: &str,
-    modified: i64,
-    size: u64,
-    line_offset: i64,
-) -> Result<(), String> {
-    upsert_cursor_on_conn(conn, file_path, instance_id, modified, size, line_offset)?;
-    cursors.insert(file_path.to_string(), (modified, size as i64, line_offset));
-    Ok(())
 }
 
 fn upsert_cursor_on_conn(
@@ -1553,6 +1464,7 @@ fn upsert_cursor_on_conn(
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_codex_file(
     file_path: &Path,
     root_thread_id: Option<String>,
@@ -1561,31 +1473,57 @@ fn parse_codex_file(
     parse_codex_file_with_state(file_path, root_thread_id, &mut state)
 }
 
-fn parse_codex_file_with_state(
+#[cfg(test)]
+fn parse_codex_file_with_state(file_path: &Path, root_thread_id: Option<String>, state: &mut TokenParseState) -> Result<ParsedCodexFile, String> {
+    parse_codex_file_batch_state(file_path, root_thread_id, state, None, false, None)
+}
+#[cfg(test)]
+fn parse_codex_file_batch(file_path: &Path, root_thread_id: Option<String>, checkpoint: Option<ParserCheckpoint>) -> Result<ParsedCodexFile, String> {
+    let mut state = checkpoint.as_ref().map(|c| c.state.clone()).unwrap_or_default();
+    parse_codex_file_batch_state(file_path, root_thread_id, &mut state, checkpoint, true, None)
+}
+fn parse_codex_file_batch_on_conn(conn:&Connection,file_path:&Path,root_thread_id:Option<String>,checkpoint:Option<ParserCheckpoint>)->Result<ParsedCodexFile,String>{
+    let mut state=checkpoint.as_ref().map(|c|c.state.clone()).unwrap_or_default();
+    parse_codex_file_batch_state(file_path,root_thread_id,&mut state,checkpoint,true,Some(conn))
+}
+
+fn parse_codex_file_batch_state(
     file_path: &Path,
     root_thread_id: Option<String>,
     state: &mut TokenParseState,
+    checkpoint: Option<ParserCheckpoint>,
+    bounded: bool,
+    ledger_conn: Option<&Connection>,
 ) -> Result<ParsedCodexFile, String> {
-    let file = File::open(file_path).map_err(|error| format!("无法打开文件: {error}"))?;
-    let reader = BufReader::new(file);
-    let mut root_meta_seen = false;
-    let mut root_timestamp = None;
-    let mut parent = ParentResolution::None;
-    let mut parent_id = None;
-    let mut deferred_reason = None;
+    let previous = checkpoint.unwrap_or_default();
+    let mut reader = open_checkpoint_reader(file_path, previous.byte_offset)?;
+    let mut byte_offset = previous.byte_offset;
+    let mut root_meta_seen = previous.root_meta_seen.clone();
+    let mut root_timestamp = previous.root_timestamp.clone();
+    let mut is_guardian = previous.is_guardian.clone();
+    let mut guardian_model = previous.guardian_model.clone();
+    let mut guardian_prefix_end = previous.guardian_prefix_end;
+    let mut parent = previous.parent.clone();
+    let mut parent_id = previous.parent_id.clone();
+    let mut deferred_reason = previous.deferred_reason.clone();
     if state.current_model.is_empty() {
         state.current_model = "unknown".to_string();
     }
-    let mut boundary_pending = true;
+    let mut boundary_pending = previous.boundary_pending;
     let mut token_events = Vec::new();
-    let mut line_offset = 0i64;
-    let mut has_billable_tokens = false;
+    let mut line_offset = previous.line_offset;
+    let mut has_billable_tokens = previous.has_billable_tokens;
 
-    for line_result in reader.lines() {
+    let started = std::time::Instant::now();
+    let mut complete = false;
+    let mut reader_reusable = true;
+    loop {
+        if bounded && byte_offset > previous.byte_offset &&
+            (byte_offset - previous.byte_offset >= BATCH_BYTES || token_events.len() >= INSERT_BATCH_SIZE || started.elapsed() >= BATCH_TIME) { break; }
+        let Some((line, bytes, terminated)) = read_usage_line(&mut *reader)? else { complete = true; break; };
+        if !terminated && !line.is_empty() { reader_reusable = false; break; }
+        byte_offset += bytes;
         line_offset += 1;
-        let Ok(line) = line_result else {
-            continue;
-        };
         if line.trim().is_empty() {
             continue;
         }
@@ -1597,7 +1535,8 @@ fn parse_codex_file_with_state(
         if !is_event_msg && !is_turn_context && !is_session_meta && !is_usage_record {
             continue;
         }
-        if is_event_msg && !line.contains("\"token_count\"") && !line.contains("\"thread_settings_applied\"") {
+        if is_event_msg && !["token_count", "thread_settings_applied", "task_started", "task_complete", "turn_aborted"]
+            .iter().any(|kind| line.contains(kind)) {
             continue;
         }
 
@@ -1613,6 +1552,8 @@ fn parse_codex_file_with_state(
                 root_meta_seen = true;
                 root_timestamp = parse_timestamp(value.get("timestamp"));
                 let payload = value.get("payload").unwrap_or(&JsonValue::Null);
+                is_guardian = payload.get("thread_source").and_then(JsonValue::as_str) == Some("guardian_review")
+                    || payload.pointer("/source/subagent/other").and_then(JsonValue::as_str) == Some("guardian");
                 match replay_parent_from_meta(payload) {
                     Ok(None) => {}
                     Ok(Some(parent_thread_id)) => {
@@ -1659,6 +1600,15 @@ fn parse_codex_file_with_state(
                         .and_then(JsonValue::as_str)
                     {
                         state.current_model = normalize_codex_model(model);
+                        if is_guardian && state.current_model != "unknown" {
+                            if guardian_model.is_none() {
+                                guardian_model = Some(state.current_model.clone());
+                                guardian_prefix_end = Some(state.event_index);
+                            }
+                        }
+                        if state.active_model.is_some() {
+                            state.active_model = Some(state.current_model.clone());
+                        }
                     }
                 }
             }
@@ -1667,6 +1617,19 @@ fn parse_codex_file_with_state(
                     continue;
                 };
                 let is_usage_record = event_type == "token_usage_record";
+                if !is_usage_record {
+                    match payload.get("type").and_then(JsonValue::as_str) {
+                        Some("task_started") => {
+                            state.active_model = Some(state.current_model.clone());
+                            continue;
+                        }
+                        Some("task_complete" | "turn_aborted") => {
+                            state.active_model = None;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 if !is_usage_record && payload.get("type").and_then(JsonValue::as_str) == Some("thread_settings_applied") {
                     // Forked histories retain their original settings owner.
                     let owner = payload.get("thread_id").and_then(JsonValue::as_str);
@@ -1702,7 +1665,7 @@ fn parse_codex_file_with_state(
                     )
                 } else {
                     if payload.get("type").and_then(JsonValue::as_str) != Some("token_count")
-                        || !state.usage_record_ids.is_empty()
+                        || state.has_usage_records || !state.usage_record_ids.is_empty()
                     {
                         // Official records precede the UI snapshots of the same requests.
                         continue;
@@ -1720,13 +1683,16 @@ fn parse_codex_file_with_state(
                         None,
                     )
                 };
-                if let Some(model) = payload
+                let explicit_model = payload
                     .get("info")
                     .and_then(|info| info.get("model").or_else(|| info.get("model_name")))
                     .or_else(|| payload.get("model"))
                     .and_then(JsonValue::as_str)
-                {
-                    state.current_model = normalize_codex_model(model);
+                    .map(normalize_codex_model);
+                if state.active_model.is_none() {
+                    if let Some(model) = &explicit_model {
+                        state.current_model.clone_from(model);
+                    }
                 }
 
                 let snapshot_source = token_snapshot_source(payload);
@@ -1749,13 +1715,18 @@ fn parse_codex_file_with_state(
                 }
                 let has_total_snapshot = total.is_some();
                 let duplicate_snapshot = if let Some(response_id) = response_id {
-                    !state.usage_record_ids.insert(response_id)
+                    state.has_usage_records = true;
+                    let persisted = if let Some(conn)=ledger_conn {
+                        conn.query_row("SELECT EXISTS(SELECT 1 FROM session_response_ids WHERE ledger=?1 AND response_id=?2)",params![previous.ledger,response_id],|r|r.get::<_,bool>(0)).map_err(|e|e.to_string())?
+                    } else { false };
+                    !state.usage_record_ids.insert(response_id) || persisted
                 } else {
                     has_total_snapshot
                         && (state.last_signature_by_source.get(&snapshot_source) == Some(&signature)
                             || state.previous_token_signature.as_ref() == Some(&signature))
                 };
                 if has_total_snapshot {
+                    if !state.last_signature_by_source.contains_key(&snapshot_source) && state.last_signature_by_source.len()>=1024 {return Err("usage snapshot source count exceeds checkpoint budget".into());}
                     state
                         .last_signature_by_source
                         .insert(snapshot_source, signature.clone());
@@ -1798,7 +1769,11 @@ fn parse_codex_file_with_state(
                     signature,
                     delta,
                     event_index: nonzero_index,
-                    model: state.current_model.clone(),
+                    // Persistent settings can change while the active turn keeps its context.
+                    model: explicit_model.unwrap_or_else(|| {
+                        state.active_model.as_ref().filter(|model| model.as_str() != "unknown")
+                            .unwrap_or(&state.current_model).clone()
+                    }),
                     service_tier: state.current_service_tier.clone(),
                     timestamp: parse_timestamp(value.get("timestamp")),
                 });
@@ -1807,7 +1782,32 @@ fn parse_codex_file_with_state(
         }
     }
 
-    Ok(ParsedCodexFile {
+    if is_guardian {
+        if guardian_model.is_none() {
+            if let Some(first)=token_events.iter().find(|e|e.model!="unknown") {
+                guardian_model=Some(first.model.clone());
+                guardian_prefix_end=Some(first.event_index.unwrap_or(state.event_index).saturating_sub(1));
+            }
+        }
+        if let Some(model)=&guardian_model {
+            for event in &mut token_events {
+                if event.model=="unknown" && event.event_index.is_some_and(|index|guardian_prefix_end.is_some_and(|end|index<=end)) {
+                    event.model.clone_from(model);
+                }
+            }
+        }
+    }
+
+    let anchor=finish_checkpoint_reader(file_path,byte_offset,&mut reader)?;
+    if reader_reusable {cache_checkpoint_reader(file_path,byte_offset,reader);}
+    let checkpoint = ParserCheckpoint {
+        byte_offset, line_offset, root_meta_seen, root_timestamp, parent, parent_id: parent_id.clone(),
+        deferred_reason: deferred_reason.clone(), is_guardian, guardian_model, guardian_prefix_end, boundary_pending,
+        state: state.clone(), has_billable_tokens, complete,
+        anchor,
+        ..previous
+    };
+    Ok(ParsedCodexFile { checkpoint,
         root_thread_id,
         root_meta_seen,
         root_timestamp,
@@ -1829,112 +1829,6 @@ fn replay_parent_from_meta(payload: &JsonValue) -> Result<Option<String>, String
     uuid::Uuid::parse_str(&parent)
         .map(|value| Some(value.hyphenated().to_string()))
         .map_err(|_| format!("forked_from_id 不是有效 UUID: {parent}"))
-}
-
-fn resolve_parent_signatures(
-    parent_id: &str,
-    cutoff: DateTime<Utc>,
-    rollout_index: &RolloutIndex,
-) -> Result<Vec<TokenUsageSignature>, String> {
-    let Some(candidates) = rollout_index.get(parent_id) else {
-        return Err(format!("找不到父 rollout: {parent_id}"));
-    };
-    let mut signatures = Vec::new();
-    let mut seen_names = HashSet::new();
-    for candidate in candidates {
-        // The same rollout can temporarily exist in sessions and archived_sessions.
-        // Its filename is its stable segment identity across that move.
-        if seen_names.insert(candidate.file_name().map(|name| name.to_os_string())) {
-            signatures.extend(parent_signatures_before(candidate, cutoff)?);
-        }
-    }
-    if signatures.is_empty() {
-        return Err(format!("找不到父 rollout: {parent_id}"));
-    }
-    Ok(signatures)
-}
-
-fn parent_signatures_before(
-    parent_path: &Path,
-    cutoff: DateTime<Utc>,
-) -> Result<Vec<TokenUsageSignature>, String> {
-    let metadata = fs::metadata(parent_path)
-        .map_err(|error| format!("无法读取父 rollout {}: {error}", parent_path.display()))?;
-    let stamp = ParentFileStamp {
-        modified_nanos: metadata_modified_nanos(&metadata),
-        size: metadata.len(),
-    };
-    if let Ok(caches) = replay_caches().lock() {
-        if let Some(cached) = caches
-            .parent_timelines
-            .get(parent_path)
-            .filter(|entry| entry.stamp == stamp)
-        {
-            return signatures_before(&cached.timeline, parent_path, cutoff);
-        }
-    }
-
-    let parsed = parse_codex_file(parent_path, thread_id_from_filename(parent_path))?;
-    let mut events = Vec::new();
-    let mut has_token_without_timestamp = false;
-    for event in parsed.token_events {
-        let Some(timestamp) = event.timestamp else {
-            has_token_without_timestamp = true;
-            continue;
-        };
-        events.push(TimestampedTokenSignature {
-            timestamp,
-            signature: event.signature,
-        });
-    }
-
-    let timeline = ParentTokenTimeline {
-        events,
-        has_token_without_timestamp,
-    };
-    let result = signatures_before(&timeline, parent_path, cutoff);
-    if let Ok(mut caches) = replay_caches().lock() {
-        caches.parent_timelines.insert(
-            parent_path.to_path_buf(),
-            CachedParentTimeline { stamp, timeline },
-        );
-    }
-    result
-}
-
-fn signatures_before(
-    timeline: &ParentTokenTimeline,
-    parent_path: &Path,
-    cutoff: DateTime<Utc>,
-) -> Result<Vec<TokenUsageSignature>, String> {
-    if timeline.has_token_without_timestamp {
-        return Err(format!(
-            "父 rollout {} 的用量记录缺少有效 timestamp",
-            parent_path.display()
-        ));
-    }
-    Ok(timeline
-        .events
-        .iter()
-        .filter(|event| event.timestamp <= cutoff)
-        .map(|event| event.signature.clone())
-        .collect())
-}
-
-fn matching_replay_prefix(child: &[ParsedTokenEvent], parent: &[TokenUsageSignature]) -> usize {
-    let mut parent_offset = 0usize;
-    let mut matched = 0usize;
-    for event in child {
-        let Some(relative_match) = parent[parent_offset..]
-            .iter()
-            .position(|signature| signature == &event.signature)
-        else {
-            break;
-        };
-        parent_offset += relative_match + 1;
-        matched += 1;
-    }
-    matched
 }
 
 fn normalize_codex_model(raw: &str) -> String {
@@ -2109,13 +2003,14 @@ fn query_totals(
     where_sql: &str,
     params: &[rusqlite::types::Value],
 ) -> Result<CodexSessionUsageTotals, String> {
+    let source = report_source_for_filter(conn, where_sql, params);
     let sql = format!(
         "SELECT
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(cached_input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
-            COALESCE(COUNT(*), 0)
-         FROM session_usage_events {where_sql}"
+            COALESCE(SUM(request_count), 0)
+         FROM ({source}) {where_sql}"
     );
     conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
         let input = row.get::<_, i64>(0)?.max(0) as u64;
@@ -2149,6 +2044,7 @@ fn query_breakdown(
         return Ok(rows);
     }
     let label_sql = label_column.unwrap_or(key_column);
+    let source = report_source_for_filter(conn, where_sql, params);
     let sql = format!(
         "SELECT
             {key_column},
@@ -2156,8 +2052,8 @@ fn query_breakdown(
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(cached_input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
-            COALESCE(COUNT(*), 0)
-         FROM session_usage_events {where_sql}
+            COALESCE(SUM(request_count), 0)
+         FROM ({source}) {where_sql}
          GROUP BY {key_column}
          ORDER BY SUM(input_tokens + output_tokens) DESC, {key_column} ASC"
     );
@@ -2203,9 +2099,10 @@ fn query_day_breakdown(
     where_sql: &str,
     params: &[rusqlite::types::Value],
 ) -> Result<Vec<CodexSessionUsageBreakdownRow>, String> {
+    let source = report_source_for_filter(conn, where_sql, params);
     let sql = format!(
-        "SELECT timestamp, model, service_tier, input_tokens, cached_input_tokens, output_tokens
-         FROM session_usage_events {where_sql}"
+        "SELECT timestamp, model, service_tier, input_tokens, cached_input_tokens, output_tokens, request_count, context_input_tokens
+         FROM ({source}) {where_sql}"
     );
     let mut statement = conn
         .prepare(&sql)
@@ -2215,10 +2112,12 @@ fn query_day_breakdown(
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(2)?.filter(|v|!v.is_empty()),
                 row.get::<_, i64>(3)?.max(0) as u64,
                 row.get::<_, i64>(4)?.max(0) as u64,
                 row.get::<_, i64>(5)?.max(0) as u64,
+                row.get::<_, i64>(6)?.max(0) as u64,
+                row.get::<_, i64>(7)?.max(0) as u64,
             ))
         })
         .map_err(|error| format!("遍历会话用量日期失败: {error}"))?;
@@ -2229,7 +2128,7 @@ fn query_day_breakdown(
         CodexSessionUsagePricingGroup,
     >::new();
     for row in rows {
-        let (timestamp, model, service_tier, input, cached, output) =
+        let (timestamp, model, service_tier, input, cached, output, requests, context) =
             row.map_err(|error| format!("解析会话用量日期失败: {error}"))?;
         let key = local_day_key(timestamp);
         let day = days
@@ -2251,7 +2150,7 @@ fn query_day_breakdown(
         day.total_tokens = day
             .total_tokens
             .saturating_add(input.saturating_add(output));
-        day.request_count = day.request_count.saturating_add(1);
+        day.request_count = day.request_count.saturating_add(requests);
 
         // Match model/session grouping: summed tokens cannot select context rates.
         let group = groups
@@ -2259,7 +2158,7 @@ fn query_day_breakdown(
                 key,
                 model.clone(),
                 service_tier.clone(),
-                input > LONG_CONTEXT_THRESHOLD_TOKENS,
+                context > LONG_CONTEXT_THRESHOLD_TOKENS,
             ))
             .or_insert_with(|| CodexSessionUsagePricingGroup {
                 model: Some(model),
@@ -2269,7 +2168,7 @@ fn query_day_breakdown(
                 cached_input_tokens: 0,
                 output_tokens: 0,
             });
-        group.context_input_tokens = group.context_input_tokens.max(input);
+        group.context_input_tokens = group.context_input_tokens.max(context);
         group.input_tokens = group.input_tokens.saturating_add(input);
         group.cached_input_tokens = group.cached_input_tokens.saturating_add(cached);
         group.output_tokens = group.output_tokens.saturating_add(output);
@@ -2305,6 +2204,9 @@ fn local_day_key(timestamp: i64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    include!("checkpoint_tests.rs");
+
+    include!("compressed_tests.rs");
 
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD_ID: &str = "00000000-0000-4000-8000-000000000002";
@@ -2583,6 +2485,8 @@ mod tests {
         let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
         assert_eq!(store.sync(false, &instances).unwrap().imported, 1);
         let conn = store.open_conn().unwrap();
+        // Reconstruct the pre-tier cache, including the absence of newer projections.
+        drop_session_rollup(&conn);
         conn.execute_batch("ALTER TABLE session_usage_events DROP COLUMN service_tier;").unwrap();
         drop(conn);
 
@@ -2604,6 +2508,138 @@ mod tests {
             "type": "thread_settings_applied", "thread_id": thread_id,
             "thread_settings": {"model": "fixture-model", "service_tier": service_tier},
         }})
+    }
+
+    #[test]
+    fn active_turn_model_survives_settings_changes() {
+        let dir = make_temp_dir("codex-usage-active-model");
+        let file = rollout_path(&dir, PARENT_ID);
+        let mut settings = thread_settings(PARENT_ID, None);
+        settings["payload"]["thread_settings"]["model"] = json!("model-b");
+        let mut explicit = usage_record("response-explicit", 30, 10, 3, 130, 90, 13, "2026-07-10T03:00:02Z");
+        explicit["payload"]["model"] = json!("model-c");
+        write_jsonl(&file, &[
+            session_meta(PARENT_ID),
+            json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            turn_context("model-a"),
+            settings,
+            usage_record("response-a", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z"),
+            explicit,
+            json!({"type":"event_msg", "payload":{"type":"task_complete"}}),
+            json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            usage_record("response-b", 50, 40, 5, 180, 130, 18, "2026-07-10T03:00:03Z"),
+        ]);
+        let parsed = parse_codex_file(&file, Some(PARENT_ID.into())).unwrap();
+        assert_eq!(parsed.token_events.iter().map(|event| event.model.as_str()).collect::<Vec<_>>(),
+            vec!["model-a", "model-c", "model-b"]);
+        assert_eq!(nonzero_deltas(&parsed), vec![(100, 80, 10), (30, 10, 3), (50, 40, 5)]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn guardian_leading_usage_uses_its_first_known_model_only() {
+        let dir = make_temp_dir("codex-usage-guardian-model");
+        let file = rollout_path(&dir, PARENT_ID);
+        for (source, expected) in [
+            (json!({"thread_source":"guardian_review"}), "review-model"),
+            (json!({"source":{"subagent":{"other":"guardian"}}}), "review-model"),
+            (json!({"source":"cli"}), "unknown"),
+        ] {
+            let mut meta = session_meta(PARENT_ID);
+            meta["payload"].as_object_mut().unwrap().extend(source.as_object().unwrap().clone());
+            write_jsonl(&file, &[
+                meta,
+                json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+                usage_record("response-early", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z"),
+                turn_context("review-model"),
+                usage_record("response-later", 50, 40, 5, 150, 120, 15, "2026-07-10T03:00:02Z"),
+            ]);
+            let parsed = parse_codex_file(&file, Some(PARENT_ID.into())).unwrap();
+            assert_eq!(parsed.token_events[0].model, expected);
+            assert_eq!(parsed.token_events[1].model, "review-model");
+            assert_eq!(nonzero_deltas(&parsed), vec![(100, 80, 10), (50, 40, 5)]);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn guardian_backfill_uses_context_before_later_persistent_settings() {
+        let dir = make_temp_dir("codex-usage-guardian-context");
+        let file = rollout_path(&dir, PARENT_ID);
+        let mut meta = session_meta(PARENT_ID);
+        meta["payload"]["thread_source"] = json!("guardian_review");
+        let mut settings = thread_settings(PARENT_ID, None);
+        settings["payload"]["thread_settings"]["model"] = json!("future-model");
+        write_jsonl(&file, &[
+            meta,
+            json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            usage_record("response-early", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z"),
+            turn_context("review-model"), settings,
+            json!({"type":"event_msg", "payload":{"type":"task_complete"}}),
+        ]);
+        let parsed = parse_codex_file(&file, Some(PARENT_ID.into())).unwrap();
+        assert_eq!(parsed.token_events[0].model, "review-model");
+        assert_eq!(nonzero_deltas(&parsed), vec![(100, 80, 10)]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn guardian_incremental_sync_repairs_leading_unknown_without_new_usage() {
+        let dir = make_temp_dir("codex-usage-guardian-incremental");
+        let file = rollout_path(&dir.join("sessions"), PARENT_ID);
+        let mut meta = session_meta(PARENT_ID);
+        meta["payload"]["thread_source"] = json!("guardian_review");
+        let mut log = vec![meta,
+            usage_record("response-early", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z")];
+        write_jsonl(&file, &log);
+        let instances = [UsageInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: dir.clone() }];
+        let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
+        store.sync(false, &instances).unwrap();
+        let before = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(before.by_model[0].key, "unknown");
+        log.push(turn_context("review-model"));
+        write_jsonl(&file, &log);
+        store.sync(false, &instances).unwrap();
+        let after = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(after.by_model[0].key, "review-model");
+        assert_eq!(after.totals.request_count, 1);
+        assert_eq!((after.totals.input_tokens, after.totals.output_tokens), (100, 10));
+        assert_eq!(before.session_tokens.unwrap()[0].session_id, after.session_tokens.unwrap()[0].session_id);
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn model_attribution_upgrade_repairs_cached_rows_once() {
+        let dir = make_temp_dir("codex-usage-model-upgrade");
+        let file = rollout_path(&dir.join("sessions"), PARENT_ID);
+        let mut settings = thread_settings(PARENT_ID, None);
+        settings["payload"]["thread_settings"]["model"] = json!("model-b");
+        write_jsonl(&file, &[
+            session_meta(PARENT_ID),
+            json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            turn_context("model-a"), settings,
+            usage_record("response-a", 100, 80, 10, 100, 80, 10, "2026-07-10T03:00:01Z"),
+        ]);
+        let instances = [UsageInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: dir.clone() }];
+        let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
+        store.sync(false, &instances).unwrap();
+        let conn = store.open_conn().unwrap();
+        conn.execute("UPDATE session_usage_events SET model='model-b'", []).unwrap();
+        set_meta(&conn, "usage_parser_version", "2").unwrap();
+        drop(conn);
+        // Opening the upgraded cache retains its existing totals until sync succeeds.
+        let stale = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(stale.totals.request_count, 1);
+        assert_eq!(stale.by_model[0].key, "model-b");
+        assert_eq!(stale.last_synced_at, None);
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 1);
+        let repaired = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!(repaired.by_model[0].key, "model-a");
+        assert_eq!((repaired.totals.input_tokens, repaired.totals.output_tokens), (100, 10));
+        assert_eq!(repaired.totals.request_count, 1);
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 0);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2844,7 +2880,7 @@ mod tests {
         })
     }
 
-    fn make_temp_dir(prefix: &str) -> PathBuf {
+    pub(super) fn make_temp_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3281,6 +3317,100 @@ mod tests {
         assert_eq!(card.output_tokens, report.totals.output_tokens);
         assert_eq!(card.total_tokens, 253);
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn continuation_replay_prefix_repairs_version_4_cache() {
+        const SEGMENT: &str = "10000000-0000-4000-8000-000000000006";
+        let dir = make_temp_dir("codex-usage-replayed-segment");
+        let home = dir.join("home");
+        let sessions = home.join("sessions");
+        let base = rollout_path(&sessions, PARENT_ID);
+        let continuation = sessions.join(format!(
+            "rollout-2026-07-10T03-10-00-{PARENT_ID}_{SEGMENT}.jsonl"
+        ));
+        let first = token_count_with_last(100, 0, 10, 100, 0, 10, "codex", "2026-07-10T03:00:02Z");
+        let second = token_count_with_last(200, 0, 20, 100, 0, 10, "codex", "2026-07-10T03:00:03Z");
+        write_jsonl(&base, &[session_meta(PARENT_ID), first.clone(), second.clone()]);
+        write_jsonl(&continuation, &[
+            session_meta_at(PARENT_ID, None, "2026-07-10T03:10:00Z"),
+            first, second,
+            token_count_with_last(250, 0, 25, 50, 0, 5, "codex", "2026-07-10T03:10:02Z"),
+        ]);
+        let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
+        let instances = [UsageInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: home }];
+        let sync = store.sync(false, &instances).unwrap();
+        assert!(sync.errors.is_empty(), "{:?}", sync.errors);
+        assert_eq!(sync.deferred_files, 0);
+        let report = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!((report.totals.input_tokens, report.totals.output_tokens, report.totals.request_count), (250, 25, 3));
+        let sessions = report.session_tokens.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, PARENT_ID);
+        assert_eq!(store.sync(false, &instances).unwrap().files_changed, 0);
+
+        // Version 4 counted the two replayed requests again. Leave source files
+        // and their cursors unchanged to exercise the one-time cache upgrade.
+        let conn = store.open_conn().unwrap();
+        for id in ["old-replay-one", "old-replay-two"] {
+            conn.execute(
+                "INSERT INTO session_usage_events (
+                     request_id, instance_id, instance_name, session_id, model,
+                     timestamp, input_tokens, cached_input_tokens, output_tokens, file_path, service_tier)
+                 SELECT ?1, instance_id, instance_name, session_id, model, timestamp,
+                        100, 0, 10, file_path, service_tier
+                 FROM session_usage_events LIMIT 1", [id],
+            ).unwrap();
+        }
+        set_meta(&conn, "usage_parser_version", "4").unwrap();
+        drop(conn);
+        let cached = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!((cached.totals.input_tokens, cached.totals.request_count), (450, 5));
+        assert_eq!(cached.last_synced_at, None);
+        assert!(store.sync(false, &instances).unwrap().files_changed > 0);
+        for rebuild in [false, true, false] {
+            let sync = store.sync(rebuild, &instances).unwrap();
+            assert!(sync.errors.is_empty(), "{:?}", sync.errors);
+            let report = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+            assert_eq!((report.totals.input_tokens, report.totals.output_tokens, report.totals.request_count), (250, 25, 3));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn continuation_post_meta_counter_reset_keeps_repeated_signature() {
+        const SEGMENT: &str = "10000000-0000-4000-8000-000000000007";
+        let dir = make_temp_dir("codex-usage-segment-reset");
+        let home = dir.join("home");
+        let sessions = home.join("sessions");
+        write_jsonl(&rollout_path(&sessions, PARENT_ID), &[
+            session_meta(PARENT_ID),
+            token_count_with_last(100, 0, 10, 100, 0, 10, "codex", "2026-07-10T03:00:02Z"),
+            token_count_with_last(200, 0, 20, 100, 0, 10, "codex", "2026-07-10T03:00:03Z"),
+        ]);
+        write_jsonl(&sessions.join(format!(
+            "rollout-2026-07-10T03-10-00-{PARENT_ID}_{SEGMENT}.jsonl"
+        )), &[
+            session_meta_at(PARENT_ID, None, "2026-07-10T03:10:00Z"),
+            // Same counters as the root's first request, but this is new usage
+            // after the segment began rather than a copied historical prefix.
+            token_count_with_last(100, 0, 10, 100, 0, 10, "codex", "2026-07-10T03:10:02Z"),
+            token_count_with_last(150, 0, 15, 50, 0, 5, "codex", "2026-07-10T03:10:03Z"),
+        ]);
+        let store = SessionUsageStore::open_path(dir.join("usage.sqlite"));
+        let instances = [UsageInstance { id: "fixture".into(), name: "Fixture".into(), data_dir: home }];
+        let sync = store.sync(false, &instances).unwrap();
+        assert!(sync.errors.is_empty(), "{:?}", sync.errors);
+        assert_eq!(sync.deferred_files, 0);
+        let report = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!((report.totals.input_tokens, report.totals.output_tokens, report.totals.request_count), (350, 35, 4));
+        // With no root file, a continuation has no earlier replay evidence.
+        fs::remove_file(rollout_path(&sessions, PARENT_ID)).unwrap();
+        let sync = store.sync(true, &instances).unwrap();
+        assert_eq!(sync.deferred_files, 0);
+        let orphan = store.query(&CodexSessionUsageQuery::default(), &instances).unwrap();
+        assert_eq!((orphan.totals.input_tokens, orphan.totals.output_tokens, orphan.totals.request_count), (150, 15, 2));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -1,17 +1,16 @@
 // Rewritten rollouts keep their previous numeric snapshot visible until the
 // replacement parser reaches EOF. Backup and removal both use bounded batches.
-const SESSION_REWRITE_ROLLUP: crate::modules::usage_rollup::Rollup =
-    crate::modules::usage_rollup::Rollup {
-        source: "session_rewrite_events",
-        prefix: "session_rewrite_v1",
-        width: 60,
-        dimensions: &["instance_id", "instance_name", "model", "file_path"],
-        metrics: SESSION_USAGE_ROLLUP.metrics,
-    };
+const SESSION_REWRITE_ROLLUP: usage_rollup::Rollup = usage_rollup::Rollup {
+    source: "session_rewrite_events",
+    prefix: "session_rewrite_v2",
+    width: 60,
+    dimensions: SESSION_USAGE_ROLLUP.dimensions,
+    metrics: SESSION_USAGE_ROLLUP.metrics,
+};
 
 fn ensure_rewrite_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS session_rewrite_state(file_path TEXT PRIMARY KEY,cursor INTEGER NOT NULL DEFAULT 0,phase INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS session_rewrite_events(request_id TEXT PRIMARY KEY,instance_id TEXT NOT NULL,instance_name TEXT NOT NULL,session_id TEXT NOT NULL,model TEXT NOT NULL,timestamp INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,file_path TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS session_rewrite_events(request_id TEXT PRIMARY KEY,instance_id TEXT NOT NULL,instance_name TEXT NOT NULL,session_id TEXT NOT NULL,model TEXT NOT NULL,service_tier TEXT,timestamp INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,file_path TEXT NOT NULL,context_band TEXT GENERATED ALWAYS AS (CASE WHEN input_tokens>272000 THEN 'long' ELSE 'short' END) VIRTUAL);
         CREATE INDEX IF NOT EXISTS idx_rewrite_file ON session_rewrite_events(file_path);
         CREATE INDEX IF NOT EXISTS idx_rewrite_time ON session_rewrite_events(timestamp);").map_err(|e|e.to_string())?;
     SESSION_REWRITE_ROLLUP
@@ -19,7 +18,7 @@ fn ensure_rewrite_schema(conn: &Connection) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     // This table is created empty and every insert is covered by its triggers.
     conn.execute(
-        "UPDATE session_rewrite_v1_state SET complete=1 WHERE id=1 AND complete=0",
+        "UPDATE session_rewrite_v2_state SET complete=1 WHERE id=1 AND complete=0",
         [],
     )
     .map_err(|e| e.to_string())?;
@@ -58,7 +57,7 @@ fn prepare_rewrite_batch(conn: &Connection, path: &str) -> Result<bool, String> 
         0 => {
             let next:Option<i64>=tx.query_row("SELECT MAX(source_id) FROM (SELECT rowid AS source_id FROM session_usage_events WHERE file_path=?1 AND rowid>?2 ORDER BY rowid LIMIT 32)",params![path,cursor],|r|r.get(0)).map_err(|e|e.to_string())?;
             if let Some(next) = next {
-                tx.execute("INSERT OR IGNORE INTO session_rewrite_events SELECT * FROM session_usage_events WHERE file_path=?1 AND rowid>?2 AND rowid<=?3",params![path,cursor,next]).map_err(|e|e.to_string())?;
+                tx.execute("INSERT OR IGNORE INTO session_rewrite_events(request_id,instance_id,instance_name,session_id,model,service_tier,timestamp,input_tokens,cached_input_tokens,output_tokens,file_path) SELECT request_id,instance_id,instance_name,session_id,model,service_tier,timestamp,input_tokens,cached_input_tokens,output_tokens,file_path FROM session_usage_events WHERE file_path=?1 AND rowid>?2 AND rowid<=?3",params![path,cursor,next]).map_err(|e|e.to_string())?;
                 tx.execute(
                     "UPDATE session_rewrite_state SET cursor=?1 WHERE file_path=?2",
                     params![next, path],

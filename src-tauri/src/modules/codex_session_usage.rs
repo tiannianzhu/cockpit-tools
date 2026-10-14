@@ -17,9 +17,21 @@ const DB_FILE_NAME: &str = "codex_session_usage.sqlite";
 static SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn usage_store() -> Result<SessionUsageStore, String> {
-    Ok(SessionUsageStore::open_path(
-        account::get_data_dir()?.join(DB_FILE_NAME),
-    ))
+    let path = account::get_data_dir()?.join(DB_FILE_NAME);
+    #[cfg(not(test))]
+    {
+        let maintenance_path = path.clone();
+        crate::modules::background_maintenance::schedule(
+            format!("session-rollup:{}", path.display()),
+            move || {
+                let Ok(_guard) = SYNC_LOCK.get_or_init(|| Mutex::new(())).try_lock() else {
+                    return Ok(false);
+                };
+                SessionUsageStore::open_path(maintenance_path.clone()).maintenance_batch()
+            },
+        );
+    }
+    Ok(SessionUsageStore::open_path(path))
 }
 
 fn collect_usage_instances() -> Result<Vec<UsageInstance>, String> {
@@ -84,11 +96,19 @@ pub fn sync_session_usage(
 ) -> Result<CodexSessionUsageSyncResult, String> {
     let _guard = SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .try_lock()
+        .map_err(|_| crate::modules::background_maintenance::busy_message())?;
     let store = usage_store()?;
     let instances = collect_usage_instances()?;
-    let mut result = store.sync(rebuild, &instances)?;
+    let mut result = store.sync_with_batch_control(rebuild, &instances, || loop {
+        if crate::modules::app_lifecycle::is_shutdown_started() {
+            return None;
+        }
+        if let Some(resource) = crate::modules::background_maintenance::try_resource() {
+            return Some(resource);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    })?;
     let mut report = store.query(&query, &instances)?;
     apply_report_cost(&mut report);
     result.report = Some(report);
